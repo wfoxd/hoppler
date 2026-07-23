@@ -1,0 +1,17 @@
+[package]
+name = "rust_lib_hoppler"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+flutter_rust_bridge = "=2.12.0"
+prost = "0.14.4"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }
+
+[build-dependencies]
+prost-build = "0.14.4"

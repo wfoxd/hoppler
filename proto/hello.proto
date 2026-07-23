@@ -1,0 +1,9 @@
+syntax = "proto3";
+
+package hoppler.v0;
+
+// Placeholder schema proving the protobuf toolchain end-to-end (T03).
+// Real wire messages arrive with the envelope work in T04.
+message PingFrame {
+  uint64 nonce = 1;
+}
