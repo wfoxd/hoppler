@@ -4,14 +4,28 @@ version = "0.1.0"
 edition = "2021"
 
 [lib]
-crate-type = ["cdylib", "staticlib"]
+# rlib in addition to the mobile artefact types so doctests (incl. compile_fail
+# guards on secret types) actually run under `cargo test`.
+crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
+blake3 = "1.8.5"
+chacha20poly1305 = "0.11.0"
+ed25519-dalek = { version = "3.0.0", features = ["zeroize"] }
 flutter_rust_bridge = "=2.12.0"
+getrandom = "0.4.3"
+hkdf = "0.13.0"
 prost = "0.14.4"
+sha2 = "0.11.0"
+x25519-dalek = { version = "3.0.0", features = ["static_secrets", "zeroize"] }
+zeroize = "1.9.0"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }
 
 [build-dependencies]
 prost-build = "0.14.4"
+
+[dev-dependencies]
+hex = "0.4.3"
+proptest = "1.11.0"

@@ -1,0 +1,12 @@
+syntax = "proto3";
+
+package hoppler.v0;
+
+// Generic wire envelope (tech spec §2). The full wire format is:
+//   [1 version byte][Envelope protobuf bytes]
+// The version byte lives OUTSIDE the protobuf so unknown versions can be
+// rejected before any parsing. Assembly/parsing: rust/src/crypto/envelope.rs.
+message Envelope {
+  uint32 frame_type = 1;
+  bytes payload = 2;
+}
