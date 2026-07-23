@@ -141,4 +141,16 @@ mod tests {
             Err(CryptoError::SignatureInvalid)
         );
     }
+
+    #[test]
+    fn wrong_public_key_rejected() {
+        let signer = SigningKeyPair::generate();
+        let other = SigningKeyPair::generate();
+        let sig = signer.sign(b"hoppler");
+        // A valid signature must not verify under an unrelated public key.
+        assert_eq!(
+            verify(&other.public(), b"hoppler", &sig),
+            Err(CryptoError::SignatureInvalid)
+        );
+    }
 }

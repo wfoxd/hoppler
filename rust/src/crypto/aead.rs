@@ -38,6 +38,11 @@ pub fn random_nonce() -> [u8; NONCE_LEN] {
 
 /// Encrypt-and-authenticate. Output is `ciphertext || tag` (`TAG_LEN` longer
 /// than the plaintext). `aad` is authenticated but not encrypted.
+///
+/// The caller supplies `nonce` and MUST NOT reuse one with the same `key` —
+/// keystream reuse is catastrophic for a stream-cipher AEAD. Use
+/// [`random_nonce`] unless a protocol layer derives nonces deterministically
+/// (e.g. a message-key ratchet).
 pub fn seal(key: &AeadKey, nonce: &[u8; NONCE_LEN], aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
     let cipher = XChaCha20Poly1305::new((&*key.0).into());
     cipher

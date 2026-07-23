@@ -3,7 +3,7 @@
 use x25519_dalek::{PublicKey as XPublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
-use super::rng;
+use super::{rng, CryptoError};
 
 pub const SECRET_LEN: usize = 32;
 pub const PUBLIC_LEN: usize = 32;
@@ -29,7 +29,7 @@ pub struct DhPublic(pub [u8; PUBLIC_LEN]);
 /// ```compile_fail
 /// let a = rust_lib_hoppler::crypto::dh::DhSecret::generate();
 /// let b = rust_lib_hoppler::crypto::dh::DhSecret::generate();
-/// let s = a.diffie_hellman(&b.public());
+/// let s = a.diffie_hellman(&b.public()).unwrap();
 /// println!("{:?}", s); // SharedSecret must not implement Debug
 /// ```
 pub struct SharedSecret(Zeroizing<[u8; SHARED_LEN]>);
@@ -37,7 +37,9 @@ pub struct SharedSecret(Zeroizing<[u8; SHARED_LEN]>);
 impl DhSecret {
     /// Generate a fresh secret from the OS RNG.
     pub fn generate() -> Self {
-        Self::from_bytes(&rng::random_array::<SECRET_LEN>())
+        // Wrap the raw bytes so the temporary is wiped once copied into StaticSecret.
+        let seed = Zeroizing::new(rng::random_array::<SECRET_LEN>());
+        Self::from_bytes(&seed)
     }
 
     /// Deterministic construction (clamping applied internally); any bytes valid.
@@ -51,9 +53,19 @@ impl DhSecret {
         DhPublic(XPublicKey::from(&self.inner).to_bytes())
     }
 
-    pub fn diffie_hellman(&self, their_public: &DhPublic) -> SharedSecret {
+    /// Compute the shared secret with `their_public`.
+    ///
+    /// Rejects non-contributory exchanges: a low-order (small-subgroup) peer
+    /// public forces the shared secret to a fixed all-zero value that the peer
+    /// knows without holding any secret. Because `crypto/` is the only door to
+    /// the primitive, this guard cannot be re-added downstream — so it lives
+    /// here, constant-time via `was_contributory`.
+    pub fn diffie_hellman(&self, their_public: &DhPublic) -> Result<SharedSecret, CryptoError> {
         let shared = self.inner.diffie_hellman(&XPublicKey::from(their_public.0));
-        SharedSecret(Zeroizing::new(shared.to_bytes()))
+        if !shared.was_contributory() {
+            return Err(CryptoError::InvalidPublicKey);
+        }
+        Ok(SharedSecret(Zeroizing::new(shared.to_bytes())))
     }
 }
 
@@ -91,8 +103,14 @@ mod tests {
         );
 
         let expected = hex32("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742");
-        assert_eq!(alice.diffie_hellman(&bob.public()).as_bytes(), &expected);
-        assert_eq!(bob.diffie_hellman(&alice.public()).as_bytes(), &expected);
+        assert_eq!(
+            alice.diffie_hellman(&bob.public()).unwrap().as_bytes(),
+            &expected
+        );
+        assert_eq!(
+            bob.diffie_hellman(&alice.public()).unwrap().as_bytes(),
+            &expected
+        );
     }
 
     #[test]
@@ -100,8 +118,36 @@ mod tests {
         let a = DhSecret::generate();
         let b = DhSecret::generate();
         assert_eq!(
-            a.diffie_hellman(&b.public()).as_bytes(),
-            b.diffie_hellman(&a.public()).as_bytes()
+            a.diffie_hellman(&b.public()).unwrap().as_bytes(),
+            b.diffie_hellman(&a.public()).unwrap().as_bytes()
         );
+    }
+
+    #[test]
+    fn low_order_public_keys_are_rejected() {
+        let secret = DhSecret::generate();
+        // Canonical Curve25519 small-order points (all force a non-contributory
+        // exchange → all-zero shared secret). From the x25519-dalek test suite.
+        let low_order = [
+            [0u8; 32],
+            {
+                let mut p = [0u8; 32];
+                p[0] = 1;
+                p
+            },
+            hex32("e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800"),
+            hex32("5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157"),
+        ];
+        for point in low_order {
+            // SharedSecret has no Debug, so match rather than unwrap_err.
+            assert!(
+                matches!(
+                    secret.diffie_hellman(&DhPublic(point)),
+                    Err(CryptoError::InvalidPublicKey)
+                ),
+                "low-order point {} must be rejected",
+                hex::encode(point)
+            );
+        }
     }
 }

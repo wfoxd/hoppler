@@ -59,6 +59,18 @@ mod tests {
     }
 
     #[test]
+    fn golden_wire_bytes() {
+        // Pins the exact on-wire layout so a field-number or version-byte
+        // regression is caught here rather than as a cross-language break with
+        // the generated Dart side. Layout: [version][field1 tag=0x08][varint 7]
+        // [field2 tag=0x12][len 0x04]["ping"].
+        assert_eq!(
+            encode(7, b"ping"),
+            [0x00, 0x08, 0x07, 0x12, 0x04, b'p', b'i', b'n', b'g']
+        );
+    }
+
+    #[test]
     fn empty_wire_rejected() {
         assert_eq!(decode(&[]), Err(CryptoError::EmptyWire));
     }

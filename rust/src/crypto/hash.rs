@@ -1,22 +1,27 @@
 //! BLAKE3 — hashing, keyed hashing, and context key derivation.
 //! (Chunk-tree transfer hashing arrives with T16 and will build on this.)
 
+use zeroize::Zeroizing;
+
 pub const HASH_LEN: usize = 32;
 
-/// Plain hash.
+/// Plain hash. Output is a public digest.
 pub fn hash(data: &[u8]) -> [u8; HASH_LEN] {
     *blake3::hash(data).as_bytes()
 }
 
-/// Keyed hash (MAC-like).
+/// Keyed hash (MAC-like). Output is a tag, not key material.
 pub fn keyed_hash(key: &[u8; HASH_LEN], data: &[u8]) -> [u8; HASH_LEN] {
     *blake3::keyed_hash(key, data).as_bytes()
 }
 
 /// Derive a key from `key_material` in a named context.
 /// `context` must be a hardcoded, versioned constant (BLAKE3 rules).
-pub fn derive_key(context: &str, key_material: &[u8]) -> [u8; HASH_LEN] {
-    blake3::derive_key(context, key_material)
+///
+/// Returns key material, so the output zeroizes on drop (matching
+/// [`super::kdf::derive_32`]).
+pub fn derive_key(context: &str, key_material: &[u8]) -> Zeroizing<[u8; HASH_LEN]> {
+    Zeroizing::new(blake3::derive_key(context, key_material))
 }
 
 #[cfg(test)]
@@ -50,8 +55,8 @@ mod tests {
     #[test]
     fn derive_key_context_separation() {
         assert_ne!(
-            derive_key("hoppler/test/v1", b"material"),
-            derive_key("hoppler/test/v2", b"material")
+            *derive_key("hoppler/test/v1", b"material"),
+            *derive_key("hoppler/test/v2", b"material")
         );
     }
 }

@@ -13,8 +13,14 @@ pub mod kdf;
 pub mod rng;
 pub mod sign;
 
-/// Errors across the suite. Deliberately coarse: callers get "it failed",
-/// never why, so error surfaces can't become oracles.
+/// Errors across the suite.
+///
+/// The two secret-dependent outcomes are deliberately coarse — every AEAD
+/// failure is one `AeadOpenFailed`, every signature failure one
+/// `SignatureInvalid` — so neither can become a padding/verification oracle.
+/// The wire-framing variants distinguish parse stages, but only over public,
+/// pre-decryption bytes; callers exposing crypto over a network MUST NOT map
+/// distinct framing variants onto distinct wire responses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CryptoError {
     /// A public key failed validation.
@@ -98,9 +104,11 @@ mod tests {
             }
         }
 
+        // Substring match: catches `use` imports and any other reference
+        // (path, macro, even a comment) to a primitive crate outside crypto/.
         assert!(
             offenders.is_empty(),
-            "primitive crates imported outside src/crypto/ — use the crypto wrappers instead:\n{}",
+            "primitive crates referenced outside src/crypto/ — use the crypto wrappers instead:\n{}",
             offenders.join("\n")
         );
     }

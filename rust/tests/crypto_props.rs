@@ -54,8 +54,10 @@ proptest! {
     fn dh_commutes(a in any::<[u8; 32]>(), b in any::<[u8; 32]>()) {
         let sa = dh::DhSecret::from_bytes(&a);
         let sb = dh::DhSecret::from_bytes(&b);
-        let ab = sa.diffie_hellman(&sb.public());
-        let ba = sb.diffie_hellman(&sa.public());
+        // Random 32-byte scalars yield full-order public keys, so the
+        // contributory check always passes here.
+        let ab = sa.diffie_hellman(&sb.public()).unwrap();
+        let ba = sb.diffie_hellman(&sa.public()).unwrap();
         prop_assert_eq!(ab.as_bytes(), ba.as_bytes());
     }
 
