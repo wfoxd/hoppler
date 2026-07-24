@@ -132,20 +132,32 @@ class _HomePageState extends State<HomePage> {
           IconButton(
             icon: const Icon(Icons.waving_hand_outlined),
             tooltip: 'Ping',
-            onPressed: () => ping(deviceId: d.deviceId),
+            onPressed: () => _run(() => ping(deviceId: d.deviceId)),
           ),
           IconButton(
             icon: const Icon(Icons.chat_bubble_outline),
             tooltip: 'Chat',
-            onPressed: () => sendChat(deviceId: d.deviceId, text: 'Hey ${d.name}!'),
+            onPressed: () => _run(() => sendChat(deviceId: d.deviceId, text: 'Hey ${d.name}!')),
           ),
           IconButton(
             icon: const Icon(Icons.upload_file_outlined),
             tooltip: 'Drop',
-            onPressed: () => offerDrop(deviceId: d.deviceId, name: 'photo.jpg', size: BigInt.from(5000000)),
+            onPressed: () => _run(
+              () => offerDrop(deviceId: d.deviceId, name: 'photo.jpg', size: BigInt.from(5000000)),
+            ),
           ),
         ],
       ),
     );
+  }
+
+  /// Run an API call, surfacing any failure in the log instead of leaving an
+  /// unhandled async error.
+  Future<void> _run(Future<Object?> Function() call) async {
+    try {
+      await call();
+    } catch (e) {
+      if (mounted) setState(() => _log.insert(0, 'Error: $e'));
+    }
   }
 }

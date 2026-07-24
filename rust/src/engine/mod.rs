@@ -77,6 +77,9 @@ pub fn init(support_dir: String) -> Result<PersonaDto, String> {
         Ok(s) => s,
         Err(_) if !had_master && db.exists() => {
             reset_stale_db(&db)?;
+            // The file store is keyed by the same (now absent) master, so its
+            // ciphertext is likewise unrecoverable — clear it too.
+            let _ = std::fs::remove_dir_all(&files);
             Store::open(keystore, &db, &files).map_err(stringify)?
         }
         Err(e) => return Err(stringify(e)),

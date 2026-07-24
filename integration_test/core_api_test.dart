@@ -15,14 +15,19 @@ import 'package:integration_test/integration_test.dart';
 void main() {
   IntegrationTestWidgetsFlutterBinding.ensureInitialized();
 
+  // One event stream registered once — each fresh coreEventStream() would
+  // replace the Rust-side sink and race the async registration.
+  late Stream<CoreEvent> events;
+
   setUpAll(() async {
     await RustLib.init();
     final dir = Directory.systemTemp.createTempSync('hoppler-it');
     await coreInit(supportDir: dir.path);
+    events = coreEventStream().asBroadcastStream();
   });
 
   test('discovery toggle emits DiscoveryUpdated with nearby devices', () async {
-    final next = coreEventStream().firstWhere((e) => e is CoreEvent_DiscoveryUpdated);
+    final next = events.firstWhere((e) => e is CoreEvent_DiscoveryUpdated);
     await setDiscovery(enabled: true);
     final event = await next as CoreEvent_DiscoveryUpdated;
     expect(event.devices, isNotEmpty);
@@ -30,7 +35,7 @@ void main() {
   });
 
   test('send_chat stores the message and emits a reply', () async {
-    final reply = coreEventStream().firstWhere((e) => e is CoreEvent_MessageReceived);
+    final reply = events.firstWhere((e) => e is CoreEvent_MessageReceived);
     final sent = await sendChat(deviceId: 'fake-sam', text: 'hello');
     expect(sent.outgoing, isTrue);
     final event = await reply as CoreEvent_MessageReceived;
@@ -38,7 +43,7 @@ void main() {
   });
 
   test('offer_drop completes over the event stream', () async {
-    final done = coreEventStream().firstWhere((e) => e is CoreEvent_TransferCompleted);
+    final done = events.firstWhere((e) => e is CoreEvent_TransferCompleted);
     await offerDrop(deviceId: 'fake-sam', name: 'photo.jpg', size: BigInt.from(1000));
     final event = await done as CoreEvent_TransferCompleted;
     expect(event.success, isTrue);
