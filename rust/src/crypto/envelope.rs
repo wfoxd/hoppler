@@ -36,6 +36,15 @@ pub fn encode(frame_type: u32, payload: &[u8]) -> Vec<u8> {
     wire.push(WIRE_VERSION_V0);
     body.encode(&mut wire)
         .expect("encoding into a Vec cannot fail");
+    // Keep encode/decode symmetric: never emit a frame decode would reject on
+    // size. Control-plane payloads are far under the cap, so this only fires on
+    // a caller bug. debug_assert keeps release builds branch-free.
+    debug_assert!(
+        wire.len() <= MAX_WIRE_LEN,
+        "envelope exceeds MAX_WIRE_LEN ({} > {})",
+        wire.len(),
+        MAX_WIRE_LEN
+    );
     wire
 }
 

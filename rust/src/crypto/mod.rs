@@ -62,7 +62,12 @@ mod tests {
     use std::path::Path;
 
     fn visit_rs_files(dir: &Path, out: &mut Vec<(std::path::PathBuf, String)>) {
-        for entry in std::fs::read_dir(dir).expect("readable src dir") {
+        // Optional roots (e.g. examples/, benches/) may not exist — skip them
+        // rather than panic, so the guard stays correct as roots are added.
+        if !dir.exists() {
+            return;
+        }
+        for entry in std::fs::read_dir(dir).expect("readable dir") {
             let path = entry.expect("dir entry").path();
             if path.is_dir() {
                 visit_rs_files(&path, out);
@@ -74,11 +79,12 @@ mod tests {
     }
 
     /// The G-3 / R0-N5 confinement rule: primitive crates are an
-    /// implementation detail of `crypto/`. Everything else uses the wrappers.
+    /// implementation detail of `crypto/`. Everything else — including tests —
+    /// uses the wrappers.
     #[test]
     fn primitive_crates_are_confined_to_this_module() {
-        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let crypto_dir = src.join("crypto");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let crypto_dir = root.join("src").join("crypto");
         let forbidden = [
             "ed25519_dalek",
             "x25519_dalek",
@@ -89,8 +95,13 @@ mod tests {
             "getrandom::",
         ];
 
+        // Scan every Rust root except the crate's own build artefacts. `tests/`
+        // is included so the "anything outside crypto/ fails the build" claim
+        // actually holds; `src/crypto/` is the one allowed home.
         let mut files = Vec::new();
-        visit_rs_files(&src, &mut files);
+        for sub in ["src", "tests", "examples", "benches"] {
+            visit_rs_files(&root.join(sub), &mut files);
+        }
 
         let mut offenders = Vec::new();
         for (path, contents) in files {
