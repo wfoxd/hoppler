@@ -68,7 +68,14 @@ impl<'a> FileStore<'a> {
             f.write_all(&out).map_err(|_| StoreError::FileIo)?;
             f.sync_all().map_err(|_| StoreError::FileIo)?;
         }
-        std::fs::rename(&tmp, &path).map_err(|_| StoreError::FileIo)
+        std::fs::rename(&tmp, &path).map_err(|_| StoreError::FileIo)?;
+        // fsync the directory so the rename itself is durable across power loss.
+        // Best-effort: opening a directory as a file is Unix-only (all Ring 0
+        // targets), and a failure here doesn't corrupt the just-written file.
+        if let Ok(dir) = std::fs::File::open(self.dir) {
+            let _ = dir.sync_all();
+        }
+        Ok(())
     }
 
     /// Read and open the file under `id`. The returned plaintext zeroizes on

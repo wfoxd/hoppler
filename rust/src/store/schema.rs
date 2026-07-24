@@ -39,6 +39,8 @@ const MIGRATIONS: &[&str] = &[
         created_at INTEGER NOT NULL
     );
     CREATE INDEX idx_messages_thread_seq ON messages(thread_id, seq);
+    CREATE INDEX idx_messages_thread_dir_seq ON messages(thread_id, direction, seq);
+    CREATE INDEX idx_messages_state ON messages(state);
     CREATE TABLE blocklist (
         pseudonym       BLOB PRIMARY KEY,
         created_at      INTEGER NOT NULL,
