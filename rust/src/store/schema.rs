@@ -99,12 +99,12 @@ pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
         let applied = conn
             .execute_batch(step)
             .and_then(|()| conn.execute_batch(&format!("PRAGMA user_version = {next};")));
-        match applied {
-            Ok(()) => conn.execute_batch("COMMIT;")?,
-            Err(e) => {
-                let _ = conn.execute_batch("ROLLBACK;");
-                return Err(e.into());
-            }
+        let committed = applied.and_then(|()| conn.execute_batch("COMMIT;"));
+        if let Err(e) = committed {
+            // Roll back on either a failed step or a failed COMMIT, so the
+            // connection is never left with an open transaction.
+            let _ = conn.execute_batch("ROLLBACK;");
+            return Err(e.into());
         }
         version = next;
     }

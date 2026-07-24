@@ -184,6 +184,12 @@ fn blob32(v: Vec<u8>) -> Result<[u8; 32], StoreError> {
         .map_err(|_| StoreError::Db("expected 32-byte blob".into()))
 }
 
+/// Convert a stored `i64` back to `u32`, rejecting out-of-range values rather
+/// than wrapping — defensive against a corrupt row.
+fn u32_from_i64(v: i64) -> Result<u32, StoreError> {
+    u32::try_from(v).map_err(|_| StoreError::Db(format!("value {v} out of u32 range")))
+}
+
 impl Store {
     // ── contacts ────────────────────────────────────────────────────────────
 
@@ -337,18 +343,21 @@ impl Store {
         rows.map(|r| r?).collect()
     }
 
-    /// The next per-sender `seq` to assign in a thread (max existing + 1).
-    pub fn next_seq(&self, thread_id: i64) -> Result<i64, StoreError> {
+    /// The next `seq` to assign for one sender's stream in a thread (max seq in
+    /// that direction + 1). Per-sender because incoming and outgoing number
+    /// independently (tech spec §8).
+    pub fn next_seq(&self, thread_id: i64, direction: Direction) -> Result<i64, StoreError> {
         let max: Option<i64> = self.conn.query_row(
-            "SELECT max(seq) FROM messages WHERE thread_id = ?1",
-            params![thread_id],
+            "SELECT max(seq) FROM messages WHERE thread_id = ?1 AND direction = ?2",
+            params![thread_id, direction.to_i64()],
             |r| r.get(0),
         )?;
         Ok(max.unwrap_or(0) + 1)
     }
 
-    /// Messages of a thread, ordered by per-sender `seq` (tech spec §8: order by
-    /// seq, never by arrival).
+    /// Messages of a thread, ordered by the stored `(seq, id)`. `seq` is
+    /// per-sender (tech spec §8), so a display layer filters or merges by
+    /// direction; this returns the raw rows.
     pub fn messages_for_thread(&self, thread_id: i64) -> Result<Vec<Message>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, thread_id, seq, msg_id, body, direction, state, created_at
@@ -550,8 +559,8 @@ fn map_contact(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Contact, StoreE
             l1_pub: blob32(l1)?,
             l2_pub: blob32(l2)?,
             name,
-            colour: colour as u32,
-            persona_version: persona_version as u32,
+            colour: u32_from_i64(colour)?,
+            persona_version: u32_from_i64(persona_version)?,
             paired_at,
         })
     })())
@@ -701,8 +710,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 3, 5]
         );
-        assert_eq!(s.next_seq(t).unwrap(), 6);
-        assert_eq!(s.next_seq(999).unwrap(), 1); // empty thread starts at 1
+        // Per-sender: incoming seq continues from 5, outgoing starts fresh.
+        assert_eq!(s.next_seq(t, Direction::Incoming).unwrap(), 6);
+        assert_eq!(s.next_seq(t, Direction::Outgoing).unwrap(), 1);
+        assert_eq!(s.next_seq(999, Direction::Incoming).unwrap(), 1); // empty thread starts at 1
     }
 
     #[test]
