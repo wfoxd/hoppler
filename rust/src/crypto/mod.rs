@@ -2,8 +2,9 @@
 //!
 //! Every primitive the core uses goes through these wrappers; no module
 //! outside `crypto/` may import a primitive crate directly. That rule is
-//! enforced by the `primitive_crates_are_confined` test below. There is
-//! deliberately no algorithm agility: one suite, version-byte on the wire.
+//! enforced by the `primitive_crates_are_confined_to_this_module` test below.
+//! There is deliberately no algorithm agility: one suite, version-byte on the
+//! wire.
 
 pub mod aead;
 pub mod dh;
