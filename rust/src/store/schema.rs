@@ -75,19 +75,37 @@ pub fn current_version(conn: &Connection) -> rusqlite::Result<i64> {
 /// to run against a database newer than this build understands.
 pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-    let mut version = current_version(conn)? as usize;
+
+    // user_version is a signed integer; a negative value is corrupt, not a
+    // valid version to cast into usize.
+    let current = current_version(conn)?;
+    if current < 0 {
+        return Err(StoreError::Db(format!("invalid schema version {current}")));
+    }
+    let mut version = current as usize;
     if version > MIGRATIONS.len() {
         return Err(StoreError::Db(format!(
             "database schema v{version} is newer than this build (v{})",
             MIGRATIONS.len()
         )));
     }
+
     while version < MIGRATIONS.len() {
         let step = MIGRATIONS[version];
         let next = version + 1;
-        conn.execute_batch(&format!(
-            "BEGIN;\n{step}\nPRAGMA user_version = {next};\nCOMMIT;"
-        ))?;
+        // Roll back explicitly if a step fails mid-batch, so the connection is
+        // never left with an open transaction.
+        conn.execute_batch("BEGIN;")?;
+        let applied = conn
+            .execute_batch(step)
+            .and_then(|()| conn.execute_batch(&format!("PRAGMA user_version = {next};")));
+        match applied {
+            Ok(()) => conn.execute_batch("COMMIT;")?,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                return Err(e.into());
+            }
+        }
         version = next;
     }
     Ok(())
