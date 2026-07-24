@@ -10,10 +10,32 @@
 //! stable toward a given counterpart, unlinkable across counterparts, and
 //! unchanged when *we* rotate our own Layer-2.
 //!
-//! Known limit (Ring 0 has no rotation flow, so it is latent): the pseudonym a
-//! peer presents to us is keyed on *our* Layer-2 public, so if we ever rotate
-//! our own Layer-2, every inbound pseudonym changes and a prior block stops
-//! matching. Any future Layer-2 rotation must therefore migrate the block list.
+//! Known limits (all inherent to deterministic pseudonyms; Ring 0 has no
+//! rotation flow, so they are latent):
+//! - Rotating *our own* Layer-2 changes every inbound pseudonym a peer presents
+//!   to us, so a prior block stops matching — a future Layer-2 rotation must
+//!   migrate the block list.
+//! - Because pseudonyms are a pure function of our Layer-1 and public
+//!   counterpart Layer-2 keys, a blocked user who rotates Layer-1 gets fresh
+//!   pseudonyms everywhere (block evasion), and a Layer-1 compromise lets an
+//!   attacker recompute every past and future pseudonym (retroactive linkage).
+//!   These are the accepted price of block *persistence* (R0-F10).
+//!
+//! Notes for downstream tasks:
+//! - **Blocks bind to the pseudonym, never the persona.** A persona record is
+//!   public and replayable, so anyone can rebroadcast our name/colour paired
+//!   with a pseudonym from *their* Layer-1. §5 pairing MUST prove possession of
+//!   the Layer-2 private key and bind that key to the pseudonym it will later
+//!   recognise; block lists key on the (robust) pseudonym, not the (spoofable)
+//!   persona.
+//! - Persona-record bytes are non-canonical (proto3: unknown/duplicate fields,
+//!   non-minimal varints). Verification is still sound — the signature covers
+//!   the exact carried bytes — but downstream MUST key off `verified.l2_pub`,
+//!   never raw record bytes, as a cache/dedup/identity key.
+//! - The pseudonym secret is the Noise static key (§5). Its DH uses MUST route
+//!   through `crypto::dh::diffie_hellman` so the contributory check rejects a
+//!   malicious low-order peer point; `DhSecret` deliberately has no byte export,
+//!   so §5 hand-rolls Noise on `crypto::dh` (consistent with crypto confinement).
 
 pub mod keystore;
 
@@ -26,6 +48,16 @@ use crate::proto::v0::{PersonaBody, SignedPersona};
 /// Domain-separation label for the pseudonym KDF. Versioned: changing it is a
 /// wire-protocol break, so it is frozen for compatible builds.
 const PSEUDONYM_LABEL: &[u8] = b"hoppler/pseudonym/v1";
+
+/// Hard cap on an untrusted persona record's wire size (parallels
+/// `crypto::envelope::MAX_WIRE_LEN`). A record is ~200 bytes; this is slack.
+const MAX_PERSONA_RECORD_LEN: usize = 4096;
+
+/// Hard cap on a persona name, in bytes.
+const MAX_PERSONA_NAME_LEN: usize = 64;
+
+/// Colour is a packed 0xRRGGBB value; the top byte is not meaningful.
+const COLOUR_MASK: u32 = 0x00ff_ffff;
 
 /// The mutable, public-facing half of an identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -122,6 +154,19 @@ impl Identity {
         &self.persona
     }
 
+    /// Replace the displayed persona and bump its version. The Layer-2 key is
+    /// unchanged, so pairings and pseudonyms survive — only the name/colour
+    /// shown in Discovery change. This is T07's edit-persona path; it avoids
+    /// round-tripping Layer-1 secret material through the caller. Colour is
+    /// normalised to 24 bits.
+    pub fn update_persona(&mut self, name: impl Into<String>, colour: u32) {
+        self.persona = Persona {
+            name: name.into(),
+            colour: colour & COLOUR_MASK,
+            version: self.persona.version.saturating_add(1),
+        };
+    }
+
     /// Layer-1 seed, for sealing into the keystore. Never serialise it anywhere
     /// else — this is the one exception to "Layer-1 stays on device".
     pub fn layer1_seed(&self) -> Zeroizing<[u8; sign::SEED_LEN]> {
@@ -153,12 +198,13 @@ impl Identity {
     /// The private pseudonym secret toward a counterpart — the Noise static key
     /// for a session with them (tech spec §5).
     ///
-    /// Derivation: `HKDF(ikm = our Layer-1 seed, salt = label, info = their
-    /// Layer-2 public)`. The label domain-separates this use of the seed; the
-    /// counterpart key makes it per-counterparty.
+    /// Derivation: `HKDF(ikm = our Layer-1 seed, salt = their Layer-2 public,
+    /// info = label)`. The counterpart key (salt) makes it per-counterparty;
+    /// the versioned label (info) domain-separates this use of the seed —
+    /// matching `kdf`'s convention that `info` carries the label.
     pub fn pseudonym_secret_toward(&self, counterpart_l2: &sign::PublicKey) -> dh::DhSecret {
         let seed = self.layer1.to_seed();
-        let scalar = kdf::derive_32(&*seed, PSEUDONYM_LABEL, &counterpart_l2.0);
+        let scalar = kdf::derive_32(&*seed, &counterpart_l2.0, PSEUDONYM_LABEL);
         dh::DhSecret::from_bytes(&scalar)
     }
 
@@ -176,9 +222,18 @@ impl Identity {
 /// controls this persona — not that the persona belongs to any particular
 /// person (identity is the key, by design).
 pub fn verify_persona_record(wire: &[u8]) -> Result<VerifiedPersona, IdentityError> {
+    // Bound untrusted input before parsing, matching envelope::decode's
+    // discipline — records arrive from unpaired peers over Discovery/Pings.
+    if wire.len() > MAX_PERSONA_RECORD_LEN {
+        return Err(IdentityError::MalformedRecord);
+    }
     let signed = SignedPersona::decode(wire).map_err(|_| IdentityError::MalformedRecord)?;
     let body =
         PersonaBody::decode(signed.body.as_slice()).map_err(|_| IdentityError::MalformedRecord)?;
+
+    if body.name.len() > MAX_PERSONA_NAME_LEN {
+        return Err(IdentityError::MalformedRecord);
+    }
 
     let l2_bytes: [u8; sign::PUBLIC_KEY_LEN] = body
         .l2_pub
@@ -199,7 +254,7 @@ pub fn verify_persona_record(wire: &[u8]) -> Result<VerifiedPersona, IdentityErr
     Ok(VerifiedPersona {
         l2_pub,
         name: body.name,
-        colour: body.colour,
+        colour: body.colour & COLOUR_MASK,
         version: body.version,
     })
 }
@@ -279,6 +334,85 @@ mod tests {
         let bob = Identity::generate("bob", 0).layer2_public();
         let carol = Identity::generate("carol", 0).layer2_public();
         assert_ne!(me.pseudonym_toward(&bob).0, me.pseudonym_toward(&carol).0);
+    }
+
+    #[test]
+    fn pseudonym_golden_vector() {
+        // Freezes the exact derivation (KDF arg order + label). A silent change
+        // to the wire-visible pseudonym — or the block guarantee's stability
+        // across versions — fails here, where the relational tests would not.
+        let me = Identity::from_parts(
+            &[1u8; 32],
+            &[9u8; 32],
+            Persona {
+                name: "x".into(),
+                colour: 0,
+                version: 1,
+            },
+        );
+        let peer = sign::SigningKeyPair::from_seed(&[2u8; 32]).public();
+        assert_eq!(
+            hex::encode(me.pseudonym_toward(&peer).0),
+            "7d34ee21203bd1b041db35ff34f9eaf579fec233b74242ceb6ef0eb3b31c846d"
+        );
+    }
+
+    #[test]
+    fn persona_record_golden_bytes() {
+        // Ed25519 signatures are deterministic, so a fixed identity + fields
+        // yields fixed record bytes — guards field numbers and the signing
+        // input against drift with the generated Dart types.
+        let id = Identity::from_parts(
+            &[1u8; 32],
+            &[2u8; 32],
+            Persona {
+                name: "Al".into(),
+                colour: 0x11_2233,
+                version: 1,
+            },
+        );
+        assert_eq!(
+            hex::encode(id.persona_record()),
+            "0a2c0a208139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b3941202416c18b3c444200112405980c0b297ad871a3d17791c37b3fa3d0c8e59ad256a1b785e19b1aea7a044a7fbbb6d26d2e83217ef9929762ca3d5a1e5420ebb80972fc8d92bb85d94375f00"
+        );
+    }
+
+    #[test]
+    fn pseudonym_secret_completes_a_dh() {
+        // Exercises the secret half directly (T10's Noise static-key path):
+        // it must be a usable X25519 secret whose DH commutes.
+        let me = Identity::generate("me", 0);
+        let peer = Identity::generate("peer", 0).layer2_public();
+        let my_secret = me.pseudonym_secret_toward(&peer);
+        let other = dh::DhSecret::generate();
+        let s1 = my_secret.diffie_hellman(&other.public()).unwrap();
+        let s2 = other.diffie_hellman(&my_secret.public()).unwrap();
+        assert_eq!(s1.as_bytes(), s2.as_bytes());
+    }
+
+    #[test]
+    fn update_persona_bumps_version_masks_colour_keeps_l2() {
+        let mut id = Identity::generate("Alice", 1);
+        let l2_before = id.layer2_public().0;
+        id.update_persona("Alicia", 0xAA_BBCCDD);
+        assert_eq!(id.persona().name, "Alicia");
+        assert_eq!(id.persona().colour, 0x00_BBCCDD); // top byte masked off
+        assert_eq!(id.persona().version, 2);
+        assert_eq!(id.layer2_public().0, l2_before); // key unchanged: pairings survive
+    }
+
+    #[test]
+    fn oversized_and_overlong_records_rejected() {
+        assert_eq!(
+            verify_persona_record(&vec![0u8; MAX_PERSONA_RECORD_LEN + 1]),
+            Err(IdentityError::MalformedRecord)
+        );
+        // A validly-signed record whose name exceeds the cap is still rejected.
+        let id = Identity::generate(&"n".repeat(MAX_PERSONA_NAME_LEN + 1), 0);
+        assert_eq!(
+            verify_persona_record(&id.persona_record()),
+            Err(IdentityError::MalformedRecord)
+        );
     }
 
     #[test]

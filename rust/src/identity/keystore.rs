@@ -11,6 +11,13 @@
 //! On mobile the seeds are sealed by hardware; "hardware-held" there means the
 //! enclave guards a master key that wraps these seeds (the enclave's own curve
 //! is not Ed25519, so it cannot hold the signing key directly).
+//!
+//! Trait-shape limit to revisit with the hardware backend: [`Keystore::unseal`]
+//! returns the raw seed, so even a hardware backend can only wrap/unwrap it and
+//! the seed lands in process RAM at unseal time. A future backend that keeps
+//! the seed sealed would need operation methods (sign-in-enclave,
+//! derive-in-enclave) rather than export — deferred until that backend exists
+//! to shape the API against.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -70,18 +77,21 @@ impl SoftwareKeystore {
 
 impl Keystore for SoftwareKeystore {
     fn seal(&self, label: &str, secret: &[u8]) -> Result<(), KeystoreError> {
-        let mut entries = self.entries.lock().map_err(|_| KeystoreError::Backend)?;
+        // Recover from a poisoned lock: these critical sections only touch the
+        // map, so its invariants can't be broken by a panic elsewhere, and
+        // recovering keeps wipe/unseal available after such a panic.
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         entries.insert(label.to_owned(), Zeroizing::new(secret.to_vec()));
         Ok(())
     }
 
     fn unseal(&self, label: &str) -> Result<Zeroizing<Vec<u8>>, KeystoreError> {
-        let entries = self.entries.lock().map_err(|_| KeystoreError::Backend)?;
+        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         entries.get(label).cloned().ok_or(KeystoreError::NotFound)
     }
 
     fn wipe(&self, label: &str) -> Result<(), KeystoreError> {
-        let mut entries = self.entries.lock().map_err(|_| KeystoreError::Backend)?;
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         entries.remove(label);
         Ok(())
     }
@@ -119,6 +129,30 @@ mod tests {
         ks.wipe("k").unwrap();
         assert_eq!(ks.unseal("k").unwrap_err(), KeystoreError::NotFound);
         ks.wipe("k").unwrap(); // absent label is fine
+    }
+
+    #[test]
+    fn concurrent_access_is_safe() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let ks = Arc::new(SoftwareKeystore::new());
+        let handles: Vec<_> = (0..8u8)
+            .map(|i| {
+                let ks = Arc::clone(&ks);
+                thread::spawn(move || {
+                    let label = format!("k{i}");
+                    for _ in 0..200 {
+                        ks.seal(&label, &[i; 32]).unwrap();
+                        let _ = ks.unseal(&label);
+                        ks.wipe(&label).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 
     #[test]

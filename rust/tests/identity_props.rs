@@ -54,9 +54,10 @@ proptest! {
     }
 
     // A record generated from arbitrary persona fields always verifies back to
-    // exactly those fields.
+    // exactly those fields. Name is printable-ASCII bounded to the byte cap;
+    // colour is 24-bit (the top byte is normalised away on read).
     #[test]
-    fn persona_record_round_trips(name in ".{0,64}", colour in any::<u32>()) {
+    fn persona_record_round_trips(name in "[ -~]{0,64}", colour in 0u32..=0x00ff_ffff) {
         let id = identity_from([1u8; 32], [2u8; 32], name.clone(), colour);
         let verified = verify_persona_record(&id.persona_record()).unwrap();
         prop_assert_eq!(verified.name, name);
