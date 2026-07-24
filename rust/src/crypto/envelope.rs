@@ -11,6 +11,14 @@ use crate::proto::v0::Envelope;
 /// The only wire version this build speaks.
 pub const WIRE_VERSION_V0: u8 = 0x00;
 
+/// Hard cap on a single envelope's wire size. Envelopes carry control-plane
+/// frames (Ping, Chat, transfer negotiation) — all small; bulk data never
+/// travels as one envelope. This bounds decode memory to the actual input
+/// (prost already rejects a length field that exceeds the buffer, so this is
+/// defense-in-depth for genuinely large input). A transport MAY impose a
+/// lower cap; it must never need a higher one at this ring.
+pub const MAX_WIRE_LEN: usize = 1 << 20; // 1 MiB
+
 /// A parsed envelope.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct DecodedEnvelope {
@@ -34,6 +42,9 @@ pub fn encode(frame_type: u32, payload: &[u8]) -> Vec<u8> {
 /// Parse wire bytes. Strict: empty input, unknown version byte, and malformed
 /// protobuf are all distinct, non-panicking failures.
 pub fn decode(wire: &[u8]) -> Result<DecodedEnvelope, CryptoError> {
+    if wire.len() > MAX_WIRE_LEN {
+        return Err(CryptoError::MalformedEnvelope);
+    }
     let (&version, body) = wire.split_first().ok_or(CryptoError::EmptyWire)?;
     if version != WIRE_VERSION_V0 {
         return Err(CryptoError::UnsupportedWireVersion(version));
@@ -73,6 +84,15 @@ mod tests {
     #[test]
     fn empty_wire_rejected() {
         assert_eq!(decode(&[]), Err(CryptoError::EmptyWire));
+    }
+
+    #[test]
+    fn oversized_wire_rejected() {
+        let too_big = vec![WIRE_VERSION_V0; MAX_WIRE_LEN + 1];
+        assert_eq!(decode(&too_big), Err(CryptoError::MalformedEnvelope));
+        // A frame right at the cap is still parsed (not rejected on size).
+        let at_cap = encode(1, &vec![0u8; MAX_WIRE_LEN - 16]);
+        assert!(at_cap.len() <= MAX_WIRE_LEN && decode(&at_cap).is_ok());
     }
 
     #[test]
