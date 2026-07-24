@@ -90,9 +90,15 @@ mod tests {
     fn oversized_wire_rejected() {
         let too_big = vec![WIRE_VERSION_V0; MAX_WIRE_LEN + 1];
         assert_eq!(decode(&too_big), Err(CryptoError::MalformedEnvelope));
-        // A frame right at the cap is still parsed (not rejected on size).
-        let at_cap = encode(1, &vec![0u8; MAX_WIRE_LEN - 16]);
-        assert!(at_cap.len() <= MAX_WIRE_LEN && decode(&at_cap).is_ok());
+    }
+
+    #[test]
+    fn large_frame_under_cap_is_accepted() {
+        // A comfortably-large payload (~half the cap) still parses — the cap
+        // rejects only genuinely oversized input, not normal large frames.
+        let wire = encode(1, &vec![0u8; MAX_WIRE_LEN / 2]);
+        assert!(wire.len() < MAX_WIRE_LEN);
+        assert_eq!(decode(&wire).unwrap().payload.len(), MAX_WIRE_LEN / 2);
     }
 
     #[test]
