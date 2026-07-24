@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package hoppler.v0;
+
+// The signable body of a persona record (tech spec §3). These four fields are
+// what the Layer-2 key signs; the encoded bytes are signed verbatim.
+message PersonaBody {
+  bytes  l2_pub  = 1; // Ed25519 Layer-2 public key (32 bytes)
+  string name    = 2;
+  uint32 colour  = 3; // packed 0xRRGGBB
+  uint32 version = 4;
+}
+
+// A PersonaBody plus a self-signature by the l2_pub it contains. The signature
+// covers `body` exactly as carried, so verification never re-encodes.
+message SignedPersona {
+  bytes body      = 1; // encoded PersonaBody
+  bytes signature = 2; // Ed25519 signature over `body` by body.l2_pub
+}

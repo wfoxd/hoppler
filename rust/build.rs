@@ -1,6 +1,10 @@
 fn main() {
     prost_build::compile_protos(
-        &["../proto/hello.proto", "../proto/envelope.proto"],
+        &[
+            "../proto/hello.proto",
+            "../proto/envelope.proto",
+            "../proto/identity.proto",
+        ],
         &["../proto"],
     )
     .expect("protobuf compilation failed — is protoc installed?");
