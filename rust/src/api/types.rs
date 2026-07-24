@@ -19,6 +19,13 @@ pub struct NearbyDevice {
     pub paired: bool,
 }
 
+/// A conversation, for the UI's thread list.
+pub struct ThreadSummary {
+    pub thread_id: i64,
+    pub name: String,
+    pub colour: u32,
+}
+
 /// A stored chat message, as the UI sees it.
 pub struct ChatMessageDto {
     pub msg_id: String,

@@ -8,7 +8,9 @@ use std::sync::Mutex;
 use rust_lib_hoppler::api::core::core_init;
 use rust_lib_hoppler::api::discovery::{nearby_devices, set_discovery};
 use rust_lib_hoppler::api::identity::{current_persona, update_persona};
-use rust_lib_hoppler::api::messaging::{ping, send_chat, thread_messages};
+use rust_lib_hoppler::api::messaging::{
+    list_threads, ping, send_chat, thread_for_device, thread_messages,
+};
 use rust_lib_hoppler::api::transfers::offer_drop;
 
 static LOCK: Mutex<()> = Mutex::new(());
@@ -45,6 +47,38 @@ fn chat_round_trips_through_the_store() {
     assert_eq!(msgs.len(), 2);
     assert!(msgs.iter().any(|m| m.outgoing && m.text == "hi"));
     assert!(msgs.iter().any(|m| !m.outgoing && m.text.contains("hi")));
+}
+
+#[test]
+fn thread_messages_are_chronological_and_threads_reused() {
+    let _g = LOCK.lock().unwrap();
+    let _d = fresh();
+    // Three sends to the same device: one contact, one thread, six messages in
+    // send→reply order (chronological, not seq-interleaved).
+    send_chat("fake-sam".into(), "one".into()).unwrap();
+    send_chat("fake-sam".into(), "two".into()).unwrap();
+    let out = send_chat("fake-sam".into(), "three".into()).unwrap();
+
+    // thread_for_device finds the reused thread without sending again.
+    assert_eq!(
+        thread_for_device("fake-sam".into()).unwrap(),
+        Some(out.thread_id)
+    );
+    assert_eq!(list_threads().unwrap().len(), 1);
+
+    let msgs = thread_messages(out.thread_id).unwrap();
+    assert_eq!(msgs.len(), 6);
+    // Causal insertion order: each send immediately followed by its reply.
+    let pattern: Vec<bool> = msgs.iter().map(|m| m.outgoing).collect();
+    assert_eq!(pattern, vec![true, false, true, false, true, false]);
+}
+
+#[test]
+fn ping_unknown_device_errors() {
+    let _g = LOCK.lock().unwrap();
+    let _d = fresh();
+    assert!(ping("no-such-device".into()).is_err());
+    ping("fake-sam".into()).unwrap();
 }
 
 #[test]

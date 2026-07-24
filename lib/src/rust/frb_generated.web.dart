@@ -39,6 +39,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   bool dco_decode_bool(dynamic raw);
 
   @protected
+  PlatformInt64 dco_decode_box_autoadd_i_64(dynamic raw);
+
+  @protected
   ChatMessageDto dco_decode_chat_message_dto(dynamic raw);
 
   @protected
@@ -57,10 +60,19 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   Uint8List dco_decode_list_prim_u_8_strict(dynamic raw);
 
   @protected
+  List<ThreadSummary> dco_decode_list_thread_summary(dynamic raw);
+
+  @protected
   NearbyDevice dco_decode_nearby_device(dynamic raw);
 
   @protected
+  PlatformInt64? dco_decode_opt_box_autoadd_i_64(dynamic raw);
+
+  @protected
   PersonaDto dco_decode_persona_dto(dynamic raw);
+
+  @protected
+  ThreadSummary dco_decode_thread_summary(dynamic raw);
 
   @protected
   int dco_decode_u_32(dynamic raw);
@@ -89,6 +101,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   bool sse_decode_bool(SseDeserializer deserializer);
 
   @protected
+  PlatformInt64 sse_decode_box_autoadd_i_64(SseDeserializer deserializer);
+
+  @protected
   ChatMessageDto sse_decode_chat_message_dto(SseDeserializer deserializer);
 
   @protected
@@ -111,10 +126,21 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   Uint8List sse_decode_list_prim_u_8_strict(SseDeserializer deserializer);
 
   @protected
+  List<ThreadSummary> sse_decode_list_thread_summary(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   NearbyDevice sse_decode_nearby_device(SseDeserializer deserializer);
 
   @protected
+  PlatformInt64? sse_decode_opt_box_autoadd_i_64(SseDeserializer deserializer);
+
+  @protected
   PersonaDto sse_decode_persona_dto(SseDeserializer deserializer);
+
+  @protected
+  ThreadSummary sse_decode_thread_summary(SseDeserializer deserializer);
 
   @protected
   int sse_decode_u_32(SseDeserializer deserializer);
@@ -150,6 +176,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_bool(bool self, SseSerializer serializer);
 
   @protected
+  void sse_encode_box_autoadd_i_64(
+    PlatformInt64 self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_chat_message_dto(
     ChatMessageDto self,
     SseSerializer serializer,
@@ -180,10 +212,25 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_list_thread_summary(
+    List<ThreadSummary> self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_nearby_device(NearbyDevice self, SseSerializer serializer);
 
   @protected
+  void sse_encode_opt_box_autoadd_i_64(
+    PlatformInt64? self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_persona_dto(PersonaDto self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_thread_summary(ThreadSummary self, SseSerializer serializer);
 
   @protected
   void sse_encode_u_32(int self, SseSerializer serializer);

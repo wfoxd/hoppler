@@ -137,3 +137,28 @@ class PersonaDto {
           colour == other.colour &&
           version == other.version;
 }
+
+/// A conversation, for the UI's thread list.
+class ThreadSummary {
+  final PlatformInt64 threadId;
+  final String name;
+  final int colour;
+
+  const ThreadSummary({
+    required this.threadId,
+    required this.name,
+    required this.colour,
+  });
+
+  @override
+  int get hashCode => threadId.hashCode ^ name.hashCode ^ colour.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ThreadSummary &&
+          runtimeType == other.runtimeType &&
+          threadId == other.threadId &&
+          name == other.name &&
+          colour == other.colour;
+}

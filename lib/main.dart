@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:hoppler/src/rust/api/core.dart';
 import 'package:hoppler/src/rust/api/discovery.dart';
@@ -43,11 +45,18 @@ class _HomePageState extends State<HomePage> {
   List<NearbyDevice> _devices = [];
   final List<String> _log = [];
   double? _transfer; // 0..1 while a Drop is in flight
+  StreamSubscription<CoreEvent>? _events;
 
   @override
   void initState() {
     super.initState();
-    coreEventStream().listen(_onEvent);
+    _events = coreEventStream().listen(_onEvent);
+  }
+
+  @override
+  void dispose() {
+    _events?.cancel();
+    super.dispose();
   }
 
   void _onEvent(CoreEvent event) {

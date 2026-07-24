@@ -11,8 +11,8 @@ import 'types.dart';
 Future<void> ping({required String deviceId}) =>
     RustLib.instance.api.crateApiMessagingPing(deviceId: deviceId);
 
-/// Send a chat message to a device, returning the stored outgoing message. A
-/// reply arrives asynchronously as a `message.received` event.
+/// Send a chat message to a device, returning the stored outgoing message. The
+/// reply arrives later as a `message.received` event (not before this returns).
 Future<ChatMessageDto> sendChat({
   required String deviceId,
   required String text,
@@ -21,7 +21,16 @@ Future<ChatMessageDto> sendChat({
   text: text,
 );
 
-/// All messages on a thread, ordered as stored.
+/// All messages on a thread, in chronological display order.
 Future<List<ChatMessageDto>> threadMessages({
   required PlatformInt64 threadId,
 }) => RustLib.instance.api.crateApiMessagingThreadMessages(threadId: threadId);
+
+/// The existing thread with a device, if any (open a conversation without
+/// sending first).
+Future<PlatformInt64?> threadForDevice({required String deviceId}) =>
+    RustLib.instance.api.crateApiMessagingThreadForDevice(deviceId: deviceId);
+
+/// All conversations, for the thread list.
+Future<List<ThreadSummary>> listThreads() =>
+    RustLib.instance.api.crateApiMessagingListThreads();
