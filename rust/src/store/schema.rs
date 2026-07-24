@@ -7,6 +7,8 @@
 
 use rusqlite::Connection;
 
+use super::StoreError;
+
 /// Forward-only migration steps. Index `i` upgrades the DB from version `i` to
 /// `i + 1`. Append only — editing a shipped entry corrupts existing databases.
 const MIGRATIONS: &[&str] = &[
@@ -69,10 +71,17 @@ pub fn current_version(conn: &Connection) -> rusqlite::Result<i64> {
 }
 
 /// Apply every pending migration. Each step and its version bump commit
-/// atomically, so an interruption never leaves a half-applied version.
-pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+/// atomically, so an interruption never leaves a half-applied version. Refuses
+/// to run against a database newer than this build understands.
+pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
     let mut version = current_version(conn)? as usize;
+    if version > MIGRATIONS.len() {
+        return Err(StoreError::Db(format!(
+            "database schema v{version} is newer than this build (v{})",
+            MIGRATIONS.len()
+        )));
+    }
     while version < MIGRATIONS.len() {
         let step = MIGRATIONS[version];
         let next = version + 1;

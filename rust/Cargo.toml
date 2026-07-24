@@ -29,6 +29,5 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }
 prost-build = "0.14.4"
 
 [dev-dependencies]
-hex = "0.4.3"
 proptest = "1.11.0"
 tempfile = "3.27.0"

@@ -17,6 +17,7 @@ mod schema;
 
 pub use records::{
     BlockEntry, Contact, Direction, InsertOutcome, Message, MessageState, NewContact, NewMessage,
+    NewTransfer, Transfer, TransferState,
 };
 
 use std::path::{Path, PathBuf};
@@ -37,9 +38,9 @@ const MASTER_LEN: usize = 32;
 /// The schema version this build migrates to (exposed for T07 diagnostics).
 pub const LATEST_SCHEMA_VERSION: i64 = schema::LATEST_VERSION;
 
-/// Errors from the store. Coarse — a caller learns an operation failed, not the
-/// backend's internal reason.
-#[derive(Debug)]
+/// Errors from the store. `Db` carries the backend's diagnostic string (for
+/// logging, never a secret); the other variants are coarse.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreError {
     /// The keystore backend failed.
     Keystore(KeystoreError),
@@ -136,6 +137,13 @@ impl Store {
 
         let conn = Connection::open(&db_path)?;
         key_database(&conn, master.as_bytes())?;
+        // Scrub SQLite's page cache and key schedule on free (SQLCipher 4
+        // defaults this OFF): narrows the RAM-forensics window after erase.
+        conn.execute_batch("PRAGMA cipher_memory_security = ON;")?;
+        // WAL: pairs with the single-writer model and keeps the -wal/-shm the
+        // crypto-erase deletes the ones actually in use. SQLCipher encrypts the
+        // WAL with the same key, so no plaintext leaks there.
+        conn.pragma_update(None, "journal_mode", "WAL")?;
         schema::migrate(&conn)?;
 
         Ok(Self {
@@ -166,8 +174,9 @@ impl Store {
         self.keystore.wipe(MASTER_LABEL)?;
         drop(self.conn); // close the database handle before deleting the file
         let _ = std::fs::remove_file(&self.db_path);
-        let _ = std::fs::remove_file(with_suffix(&self.db_path, "-wal"));
-        let _ = std::fs::remove_file(with_suffix(&self.db_path, "-shm"));
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let _ = std::fs::remove_file(with_suffix(&self.db_path, suffix));
+        }
         let _ = std::fs::remove_dir_all(&self.files_dir);
         Ok(())
     }
@@ -176,8 +185,10 @@ impl Store {
 /// Apply the SQLCipher raw key. The key must be a literal `x'HEX'`, so it can't
 /// be a bound parameter — this is the one place key bytes touch a format string.
 fn key_database(conn: &Connection, master: &[u8; MASTER_LEN]) -> Result<(), StoreError> {
-    // Zeroizing wipes the key-bearing PRAGMA string on drop.
-    let pragma = Zeroizing::new(format!("PRAGMA key = \"x'{}'\";", hex::encode(master)));
+    // Both the hex of the key and the assembled PRAGMA are Zeroizing, so no
+    // un-scrubbed copy of the master survives on the heap.
+    let hex_key = Zeroizing::new(hex::encode(master));
+    let pragma = Zeroizing::new(format!("PRAGMA key = \"x'{}'\";", &*hex_key));
     conn.execute_batch(&pragma)?;
     // Force a read so a wrong key fails now, not later.
     conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))?;
@@ -237,6 +248,44 @@ mod tests {
     }
 
     #[test]
+    fn contacts_and_messages_survive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let ks: Arc<dyn Keystore> = Arc::new(SoftwareKeystore::new());
+        let db = dir.path().join("hoppler.db");
+        let files = dir.path().join("files");
+        {
+            let s = Store::open(Arc::clone(&ks), &db, &files).unwrap();
+            let c = s
+                .add_contact(&NewContact {
+                    l1_pub: [4u8; 32],
+                    l2_pub: [5u8; 32],
+                    name: "Bob".into(),
+                    colour: 0x00abcdef,
+                    persona_version: 1,
+                    paired_at: 10,
+                })
+                .unwrap();
+            let t = s.create_thread(c, 11).unwrap();
+            s.add_message(&NewMessage {
+                thread_id: t,
+                seq: 1,
+                msg_id: b"m1".to_vec(),
+                body: b"hi".to_vec(),
+                direction: Direction::Incoming,
+                state: MessageState::Delivered,
+                created_at: 12,
+            })
+            .unwrap();
+        }
+        // Reopen: migrate must not wipe, and blobs must persist.
+        let s = Store::open(Arc::clone(&ks), &db, &files).unwrap();
+        let c = s.contact_by_l1(&[4u8; 32]).unwrap().unwrap();
+        assert_eq!(c.name, "Bob");
+        let t = s.thread_for_contact(c.id).unwrap().unwrap();
+        assert_eq!(s.messages_for_thread(t).unwrap()[0].body, b"hi");
+    }
+
+    #[test]
     fn wrong_master_cannot_open_existing_db() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("hoppler.db");
@@ -278,8 +327,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ks: Arc<dyn Keystore> = Arc::new(SoftwareKeystore::new());
         let db = dir.path().join("hoppler.db");
-        let s = Store::open(Arc::clone(&ks), &db, dir.path().join("files")).unwrap();
+        let files_dir = dir.path().join("files");
+        let s = Store::open(Arc::clone(&ks), &db, &files_dir).unwrap();
         s.settings_set("k", b"v").unwrap();
+        s.files().put("attachment", b"photo bytes").unwrap();
+        assert!(files_dir.exists());
 
         // Copy the encrypted DB bytes before erasing.
         let pre_erase = std::fs::read(&db).unwrap();
@@ -291,6 +343,7 @@ mod tests {
             KeystoreError::NotFound
         );
         assert!(!db.exists());
+        assert!(!files_dir.exists()); // the file store directory is gone too
         assert!(!pre_erase.is_empty()); // the copy exists but is now orphaned ciphertext
     }
 

@@ -2,26 +2,35 @@
 //!
 //! Each file is sealed with a key derived from the master and the file id, so
 //! no per-file key is ever stored and crypto-erasing the master makes every
-//! file undecryptable. The on-disk name is a hash of the id, so any id string
-//! is a safe filename (no path traversal). The id is also the AEAD associated
-//! data, binding each ciphertext to its own id.
+//! file undecryptable. The on-disk name is a *keyed* hash of the id (keyed by a
+//! master-derived key): unguessable and unlinkable without the master, and
+//! always a traversal-safe fixed-length filename. The id is also the AEAD
+//! associated data, binding each ciphertext to its own id.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use super::StoreError;
 use crate::crypto::{aead, hash, kdf};
 
 const FILE_KEY_LABEL: &[u8] = b"hoppler/filekey/v1";
+const FILE_NAME_CONTEXT: &str = "hoppler/filename/v1";
 
 /// A handle to the encrypted file store, borrowing the store's master key.
 pub struct FileStore<'a> {
     dir: &'a Path,
     master: &'a [u8; 32],
+    /// Keyed-hash key for on-disk filenames, derived from the master.
+    name_key: [u8; 32],
 }
 
 impl<'a> FileStore<'a> {
     pub(super) fn new(dir: &'a Path, master: &'a [u8; 32]) -> Self {
-        Self { dir, master }
+        Self {
+            dir,
+            master,
+            name_key: *hash::derive_key(FILE_NAME_CONTEXT, master),
+        }
     }
 
     fn key_for(&self, id: &str) -> aead::AeadKey {
@@ -30,11 +39,16 @@ impl<'a> FileStore<'a> {
     }
 
     fn path_for(&self, id: &str) -> PathBuf {
-        // Hash the id to a fixed hex name: any id is a safe filename.
-        self.dir.join(hex::encode(hash::hash(id.as_bytes())))
+        // Keyed hash: the on-disk name is unguessable and unlinkable without the
+        // master, so a directory-reader can't confirm a guessed id's presence.
+        // Fixed 64-hex output is also always a traversal-safe filename.
+        self.dir
+            .join(hex::encode(hash::keyed_hash(&self.name_key, id.as_bytes())))
     }
 
     /// Seal `plaintext` under `id`. On-disk layout is `nonce || ciphertext`.
+    /// Written atomically (temp file + fsync + rename) so a crash mid-write
+    /// cannot truncate or clobber an existing file.
     pub fn put(&self, id: &str, plaintext: &[u8]) -> Result<(), StoreError> {
         let key = self.key_for(id);
         let nonce = aead::random_nonce();
@@ -43,7 +57,15 @@ impl<'a> FileStore<'a> {
         let mut out = Vec::with_capacity(nonce.len() + ciphertext.len());
         out.extend_from_slice(&nonce);
         out.extend_from_slice(&ciphertext);
-        std::fs::write(self.path_for(id), out).map_err(|_| StoreError::FileIo)
+
+        let path = self.path_for(id);
+        let tmp = path.with_extension("tmp");
+        {
+            let mut f = std::fs::File::create(&tmp).map_err(|_| StoreError::FileIo)?;
+            f.write_all(&out).map_err(|_| StoreError::FileIo)?;
+            f.sync_all().map_err(|_| StoreError::FileIo)?;
+        }
+        std::fs::rename(&tmp, &path).map_err(|_| StoreError::FileIo)
     }
 
     /// Read and open the file under `id`.
@@ -119,10 +141,9 @@ mod tests {
         FileStore::new(dir.path(), &[1u8; 32])
             .put("f", b"data")
             .unwrap();
-        assert!(matches!(
-            FileStore::new(dir.path(), &[2u8; 32]).get("f"),
-            Err(StoreError::Decrypt)
-        ));
+        // The filename is keyed by the master, so a wrong master can't even
+        // locate the file (a stronger property than a decrypt failure).
+        assert!(FileStore::new(dir.path(), &[2u8; 32]).get("f").is_err());
     }
 
     #[test]

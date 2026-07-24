@@ -59,6 +59,64 @@ impl MessageState {
     }
 }
 
+/// State of a file transfer (tech spec §9).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TransferState {
+    Offered,
+    Active,
+    Complete,
+    Failed,
+}
+
+impl TransferState {
+    fn to_i64(self) -> i64 {
+        match self {
+            TransferState::Offered => 0,
+            TransferState::Active => 1,
+            TransferState::Complete => 2,
+            TransferState::Failed => 3,
+        }
+    }
+
+    fn from_i64(v: i64) -> Result<Self, StoreError> {
+        match v {
+            0 => Ok(TransferState::Offered),
+            1 => Ok(TransferState::Active),
+            2 => Ok(TransferState::Complete),
+            3 => Ok(TransferState::Failed),
+            _ => Err(StoreError::Db(format!("bad transfer state {v}"))),
+        }
+    }
+}
+
+/// A file transfer and its resumable chunk bitmap (tech spec §9).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Transfer {
+    pub id: i64,
+    pub thread_id: Option<i64>,
+    pub direction: Direction,
+    pub name: String,
+    pub size: i64,
+    pub mime: String,
+    pub state: TransferState,
+    pub root_hash: [u8; 32],
+    pub chunk_bitmap: Vec<u8>,
+    pub created_at: i64,
+}
+
+/// Fields for inserting a new transfer.
+pub struct NewTransfer {
+    pub thread_id: Option<i64>,
+    pub direction: Direction,
+    pub name: String,
+    pub size: i64,
+    pub mime: String,
+    pub state: TransferState,
+    pub root_hash: [u8; 32],
+    pub chunk_bitmap: Vec<u8>,
+    pub created_at: i64,
+}
+
 /// A paired identity (a Circle seed).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Contact {
@@ -157,6 +215,34 @@ impl Store {
             .transpose()
     }
 
+    pub fn contact_by_id(&self, id: i64) -> Result<Option<Contact>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT id, l1_pub, l2_pub, name, colour, persona_version, paired_at
+                 FROM contacts WHERE id = ?1",
+                params![id],
+                map_contact,
+            )
+            .optional()?
+            .transpose()
+    }
+
+    /// Update a contact's persona fields (their name/colour/version changed via
+    /// a persona record). Returns whether a row matched.
+    pub fn update_contact_persona(
+        &self,
+        id: i64,
+        name: &str,
+        colour: u32,
+        persona_version: u32,
+    ) -> Result<bool, StoreError> {
+        let changed = self.conn.execute(
+            "UPDATE contacts SET name = ?1, colour = ?2, persona_version = ?3 WHERE id = ?4",
+            params![name, colour as i64, persona_version as i64, id],
+        )?;
+        Ok(changed > 0)
+    }
+
     pub fn list_contacts(&self) -> Result<Vec<Contact>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, l1_pub, l2_pub, name, colour, persona_version, paired_at
@@ -187,15 +273,29 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// All threads as `(thread_id, contact_id)`, newest first — for the T07
+    /// conversation list.
+    pub fn list_threads(&self) -> Result<Vec<(i64, i64)>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, contact_id FROM threads ORDER BY created_at DESC, id DESC")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
     // ── messages ────────────────────────────────────────────────────────────
 
     /// Insert a message, or report it as a duplicate if its `msg_id` is already
     /// present (dedup for at-least-once delivery, tech spec §8).
+    ///
+    /// The ignore is scoped to the `msg_id` conflict, so a foreign-key or
+    /// NOT NULL violation errors rather than masquerading as a duplicate.
     pub fn add_message(&self, m: &NewMessage) -> Result<InsertOutcome, StoreError> {
         let changed = self.conn.execute(
-            "INSERT OR IGNORE INTO messages
+            "INSERT INTO messages
              (thread_id, seq, msg_id, body, direction, state, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(msg_id) DO NOTHING",
             params![
                 m.thread_id,
                 m.seq,
@@ -213,6 +313,40 @@ impl Store {
         }
     }
 
+    /// Look up a single message by its `msg_id`.
+    pub fn message_by_msg_id(&self, msg_id: &[u8]) -> Result<Option<Message>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT id, thread_id, seq, msg_id, body, direction, state, created_at
+                 FROM messages WHERE msg_id = ?1",
+                params![msg_id],
+                map_message,
+            )
+            .optional()?
+            .transpose()
+    }
+
+    /// Messages in a given delivery state, oldest first — the T12 send queue
+    /// (e.g. `messages_by_state(MessageState::Queued)` then filter Outgoing).
+    pub fn messages_by_state(&self, state: MessageState) -> Result<Vec<Message>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, thread_id, seq, msg_id, body, direction, state, created_at
+             FROM messages WHERE state = ?1 ORDER BY created_at, id",
+        )?;
+        let rows = stmt.query_map(params![state.to_i64()], map_message)?;
+        rows.map(|r| r?).collect()
+    }
+
+    /// The next per-sender `seq` to assign in a thread (max existing + 1).
+    pub fn next_seq(&self, thread_id: i64) -> Result<i64, StoreError> {
+        let max: Option<i64> = self.conn.query_row(
+            "SELECT max(seq) FROM messages WHERE thread_id = ?1",
+            params![thread_id],
+            |r| r.get(0),
+        )?;
+        Ok(max.unwrap_or(0) + 1)
+    }
+
     /// Messages of a thread, ordered by per-sender `seq` (tech spec §8: order by
     /// seq, never by arrival).
     pub fn messages_for_thread(&self, thread_id: i64) -> Result<Vec<Message>, StoreError> {
@@ -224,12 +358,18 @@ impl Store {
         rows.map(|r| r?).collect()
     }
 
-    pub fn set_message_state(&self, msg_id: &[u8], state: MessageState) -> Result<(), StoreError> {
-        self.conn.execute(
+    /// Update a message's delivery state. Returns whether a row matched, so a
+    /// state transition against an unknown `msg_id` is detectable.
+    pub fn set_message_state(
+        &self,
+        msg_id: &[u8],
+        state: MessageState,
+    ) -> Result<bool, StoreError> {
+        let changed = self.conn.execute(
             "UPDATE messages SET state = ?1 WHERE msg_id = ?2",
             params![state.to_i64(), msg_id],
         )?;
-        Ok(())
+        Ok(changed > 0)
     }
 
     // ── blocklist ───────────────────────────────────────────────────────────
@@ -307,6 +447,93 @@ impl Store {
             .optional()
             .map_err(Into::into)
     }
+
+    // ── transfers ─────────────────────────────────────────────────────────────
+
+    pub fn add_transfer(&self, t: &NewTransfer) -> Result<i64, StoreError> {
+        self.conn.execute(
+            "INSERT INTO transfers
+             (thread_id, direction, name, size, mime, state, root_hash, chunk_bitmap, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                t.thread_id,
+                t.direction.to_i64(),
+                t.name,
+                t.size,
+                t.mime,
+                t.state.to_i64(),
+                &t.root_hash[..],
+                t.chunk_bitmap,
+                t.created_at
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn transfer_by_id(&self, id: i64) -> Result<Option<Transfer>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT id, thread_id, direction, name, size, mime, state, root_hash, chunk_bitmap, created_at
+                 FROM transfers WHERE id = ?1",
+                params![id],
+                map_transfer,
+            )
+            .optional()?
+            .transpose()
+    }
+
+    pub fn set_transfer_state(&self, id: i64, state: TransferState) -> Result<bool, StoreError> {
+        let changed = self.conn.execute(
+            "UPDATE transfers SET state = ?1 WHERE id = ?2",
+            params![state.to_i64(), id],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Update the resumable chunk bitmap for a transfer (T16 resume).
+    pub fn set_chunk_bitmap(&self, id: i64, bitmap: &[u8]) -> Result<bool, StoreError> {
+        let changed = self.conn.execute(
+            "UPDATE transfers SET chunk_bitmap = ?1 WHERE id = ?2",
+            params![bitmap, id],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn list_transfers(&self) -> Result<Vec<Transfer>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, thread_id, direction, name, size, mime, state, root_hash, chunk_bitmap, created_at
+             FROM transfers ORDER BY created_at DESC, id DESC",
+        )?;
+        let rows = stmt.query_map([], map_transfer)?;
+        rows.map(|r| r?).collect()
+    }
+}
+
+fn map_transfer(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Transfer, StoreError>> {
+    let id = r.get(0)?;
+    let thread_id = r.get(1)?;
+    let direction: i64 = r.get(2)?;
+    let name = r.get(3)?;
+    let size = r.get(4)?;
+    let mime = r.get(5)?;
+    let state: i64 = r.get(6)?;
+    let root_hash: Vec<u8> = r.get(7)?;
+    let chunk_bitmap = r.get(8)?;
+    let created_at = r.get(9)?;
+    Ok((|| {
+        Ok(Transfer {
+            id,
+            thread_id,
+            direction: Direction::from_i64(direction)?,
+            name,
+            size,
+            mime,
+            state: TransferState::from_i64(state)?,
+            root_hash: blob32(root_hash)?,
+            chunk_bitmap,
+            created_at,
+        })
+    })())
 }
 
 fn map_contact(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Contact, StoreError>> {
@@ -423,11 +650,127 @@ mod tests {
             created_at: 0,
         })
         .unwrap();
-        s.set_message_state(b"m", MessageState::Delivered).unwrap();
+        assert!(s.set_message_state(b"m", MessageState::Delivered).unwrap());
         assert_eq!(
             s.messages_for_thread(t).unwrap()[0].state,
             MessageState::Delivered
         );
+        // Unknown msg_id: no row matched.
+        assert!(!s.set_message_state(b"nope", MessageState::Sent).unwrap());
+    }
+
+    #[test]
+    fn add_message_with_bad_thread_id_errors_not_duplicate() {
+        let (s, _d) = store();
+        // No such thread: an FK violation must surface as an error, never
+        // masquerade as InsertOutcome::Duplicate.
+        let r = s.add_message(&NewMessage {
+            thread_id: 9999,
+            seq: 1,
+            msg_id: b"x".to_vec(),
+            body: b"y".to_vec(),
+            direction: Direction::Incoming,
+            state: MessageState::Delivered,
+            created_at: 0,
+        });
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn messages_ordered_by_seq_with_gaps() {
+        let (s, _d) = store();
+        let c = s.add_contact(&a_contact()).unwrap();
+        let t = s.create_thread(c, 0).unwrap();
+        for (seq, id) in [(5i64, b"a" as &[u8]), (1, b"b"), (3, b"c")] {
+            s.add_message(&NewMessage {
+                thread_id: t,
+                seq,
+                msg_id: id.to_vec(),
+                body: b"x".to_vec(),
+                direction: Direction::Incoming,
+                state: MessageState::Delivered,
+                created_at: 0,
+            })
+            .unwrap();
+        }
+        assert_eq!(
+            s.messages_for_thread(t)
+                .unwrap()
+                .iter()
+                .map(|m| m.seq)
+                .collect::<Vec<_>>(),
+            vec![1, 3, 5]
+        );
+        assert_eq!(s.next_seq(t).unwrap(), 6);
+        assert_eq!(s.next_seq(999).unwrap(), 1); // empty thread starts at 1
+    }
+
+    #[test]
+    fn messages_by_state_finds_the_send_queue() {
+        let (s, _d) = store();
+        let c = s.add_contact(&a_contact()).unwrap();
+        let t = s.create_thread(c, 0).unwrap();
+        let mk = |seq, id: &[u8], state| NewMessage {
+            thread_id: t,
+            seq,
+            msg_id: id.to_vec(),
+            body: b"x".to_vec(),
+            direction: Direction::Outgoing,
+            state,
+            created_at: seq,
+        };
+        s.add_message(&mk(1, b"q1", MessageState::Queued)).unwrap();
+        s.add_message(&mk(2, b"d", MessageState::Delivered))
+            .unwrap();
+        s.add_message(&mk(3, b"q2", MessageState::Queued)).unwrap();
+        let queued = s.messages_by_state(MessageState::Queued).unwrap();
+        assert_eq!(
+            queued.iter().map(|m| m.msg_id.clone()).collect::<Vec<_>>(),
+            vec![b"q1".to_vec(), b"q2".to_vec()]
+        );
+        assert_eq!(
+            s.message_by_msg_id(b"d").unwrap().unwrap().state,
+            MessageState::Delivered
+        );
+    }
+
+    #[test]
+    fn transfer_round_trips_with_state_and_bitmap_updates() {
+        let (s, _d) = store();
+        let id = s
+            .add_transfer(&NewTransfer {
+                thread_id: None,
+                direction: Direction::Incoming,
+                name: "clip.mp4".into(),
+                size: 5_000_000,
+                mime: "video/mp4".into(),
+                state: TransferState::Offered,
+                root_hash: [9u8; 32],
+                chunk_bitmap: vec![0x00],
+                created_at: 1,
+            })
+            .unwrap();
+        let t = s.transfer_by_id(id).unwrap().unwrap();
+        assert_eq!(t.name, "clip.mp4");
+        assert_eq!(t.state, TransferState::Offered);
+
+        assert!(s.set_transfer_state(id, TransferState::Active).unwrap());
+        assert!(s.set_chunk_bitmap(id, &[0xff, 0x0f]).unwrap());
+        let t = s.transfer_by_id(id).unwrap().unwrap();
+        assert_eq!(t.state, TransferState::Active);
+        assert_eq!(t.chunk_bitmap, vec![0xff, 0x0f]);
+        assert_eq!(s.list_transfers().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn contact_by_id_and_persona_update() {
+        let (s, _d) = store();
+        let id = s.add_contact(&a_contact()).unwrap();
+        assert_eq!(s.contact_by_id(id).unwrap().unwrap().name, "Alice");
+        assert!(s.update_contact_persona(id, "Alicia", 0x010203, 2).unwrap());
+        let c = s.contact_by_id(id).unwrap().unwrap();
+        assert_eq!(c.name, "Alicia");
+        assert_eq!(c.persona_version, 2);
     }
 
     #[test]
