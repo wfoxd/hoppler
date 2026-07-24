@@ -165,6 +165,17 @@ impl Store {
         FileStore::new(&self.files_dir, self.master.as_bytes())
     }
 
+    /// Whether a store master is already sealed in `keystore`. Lets a caller
+    /// decide, on an open failure, whether a stale DB is safe to reset: only
+    /// when no master exists is the ciphertext provably unrecoverable.
+    ///
+    /// Only a definite `NotFound` counts as "no master". A backend error is
+    /// ambiguous and reported as sealed, so a transient keystore failure never
+    /// makes a caller destroy a DB whose master may still exist.
+    pub fn master_is_sealed(keystore: &dyn Keystore) -> bool {
+        !matches!(keystore.unseal(MASTER_LABEL), Err(KeystoreError::NotFound))
+    }
+
     /// Crypto-erase the store (R0-F9). Destroys the keystore master first — the
     /// point of no return, after which the database and all files are
     /// undecryptable even if their bytes survive — then best-effort deletes
