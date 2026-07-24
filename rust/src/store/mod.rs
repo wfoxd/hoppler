@@ -168,8 +168,12 @@ impl Store {
     /// Whether a store master is already sealed in `keystore`. Lets a caller
     /// decide, on an open failure, whether a stale DB is safe to reset: only
     /// when no master exists is the ciphertext provably unrecoverable.
+    ///
+    /// Only a definite `NotFound` counts as "no master". A backend error is
+    /// ambiguous and reported as sealed, so a transient keystore failure never
+    /// makes a caller destroy a DB whose master may still exist.
     pub fn master_is_sealed(keystore: &dyn Keystore) -> bool {
-        keystore.unseal(MASTER_LABEL).is_ok()
+        !matches!(keystore.unseal(MASTER_LABEL), Err(KeystoreError::NotFound))
     }
 
     /// Crypto-erase the store (R0-F9). Destroys the keystore master first — the

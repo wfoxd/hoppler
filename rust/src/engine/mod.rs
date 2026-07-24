@@ -17,7 +17,7 @@
 
 pub mod fake;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -76,7 +76,7 @@ pub fn init(support_dir: String) -> Result<PersonaDto, String> {
     let store = match Store::open(keystore.clone(), &db, &files) {
         Ok(s) => s,
         Err(_) if !had_master && db.exists() => {
-            std::fs::remove_file(&db).map_err(|_| "could not reset stale database".to_string())?;
+            reset_stale_db(&db)?;
             Store::open(keystore, &db, &files).map_err(stringify)?
         }
         Err(e) => return Err(stringify(e)),
@@ -346,4 +346,15 @@ fn now_millis() -> i64 {
 
 fn stringify(e: StoreError) -> String {
     e.to_string()
+}
+
+/// Remove a stale (unkeyable) database and its WAL sidecars before recreating.
+fn reset_stale_db(db: &Path) -> Result<(), String> {
+    std::fs::remove_file(db).map_err(|_| "could not reset stale database".to_string())?;
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut sidecar = db.as_os_str().to_owned();
+        sidecar.push(suffix);
+        let _ = std::fs::remove_file(PathBuf::from(sidecar));
+    }
+    Ok(())
 }
