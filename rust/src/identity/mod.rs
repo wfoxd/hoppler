@@ -59,6 +59,27 @@ const MAX_PERSONA_NAME_LEN: usize = 64;
 /// Colour is a packed 0xRRGGBB value; the top byte is not meaningful.
 const COLOUR_MASK: u32 = 0x00ff_ffff;
 
+/// Normalise persona fields so a locally-held persona always satisfies the same
+/// bounds `verify_persona_record` enforces on peers — colour masked to 24 bits,
+/// name truncated at a UTF-8 boundary to the byte cap. This makes an
+/// unverifiable local persona unrepresentable: `persona_record()` always
+/// verifies. Applied at every point a persona is set.
+fn normalise_persona(name: impl Into<String>, colour: u32, version: u32) -> Persona {
+    let mut name = name.into();
+    if name.len() > MAX_PERSONA_NAME_LEN {
+        let mut end = MAX_PERSONA_NAME_LEN;
+        while !name.is_char_boundary(end) {
+            end -= 1;
+        }
+        name.truncate(end);
+    }
+    Persona {
+        name,
+        colour: colour & COLOUR_MASK,
+        version,
+    }
+}
+
 /// The mutable, public-facing half of an identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Persona {
@@ -121,11 +142,7 @@ impl Identity {
         Self {
             layer1: sign::SigningKeyPair::generate(),
             layer2: sign::SigningKeyPair::generate(),
-            persona: Persona {
-                name: name.into(),
-                colour,
-                version: 1,
-            },
+            persona: normalise_persona(name, colour, 1),
         }
     }
 
@@ -138,7 +155,7 @@ impl Identity {
         Self {
             layer1: sign::SigningKeyPair::from_seed(layer1_seed),
             layer2: sign::SigningKeyPair::from_seed(layer2_seed),
-            persona,
+            persona: normalise_persona(persona.name, persona.colour, persona.version),
         }
     }
 
@@ -157,14 +174,10 @@ impl Identity {
     /// Replace the displayed persona and bump its version. The Layer-2 key is
     /// unchanged, so pairings and pseudonyms survive — only the name/colour
     /// shown in Discovery change. This is T07's edit-persona path; it avoids
-    /// round-tripping Layer-1 secret material through the caller. Colour is
-    /// normalised to 24 bits.
+    /// round-tripping Layer-1 secret material through the caller. Name and
+    /// colour are normalised to the persona bounds (see `normalise_persona`).
     pub fn update_persona(&mut self, name: impl Into<String>, colour: u32) {
-        self.persona = Persona {
-            name: name.into(),
-            colour: colour & COLOUR_MASK,
-            version: self.persona.version.saturating_add(1),
-        };
+        self.persona = normalise_persona(name, colour, self.persona.version.saturating_add(1));
     }
 
     /// Layer-1 seed, for sealing into the keystore. Never serialise it anywhere
@@ -403,16 +416,48 @@ mod tests {
 
     #[test]
     fn oversized_and_overlong_records_rejected() {
+        // Oversized wire.
         assert_eq!(
             verify_persona_record(&vec![0u8; MAX_PERSONA_RECORD_LEN + 1]),
             Err(IdentityError::MalformedRecord)
         );
-        // A validly-signed record whose name exceeds the cap is still rejected.
-        let id = Identity::generate(&"n".repeat(MAX_PERSONA_NAME_LEN + 1), 0);
+        // A validly-signed record from a peer that did NOT normalise its name
+        // (over the byte cap) is rejected on the read side.
+        let signer = sign::SigningKeyPair::generate();
+        let body = PersonaBody {
+            l2_pub: signer.public().0.to_vec(),
+            name: "n".repeat(MAX_PERSONA_NAME_LEN + 1),
+            colour: 0,
+            version: 1,
+        };
+        let body_bytes = body.encode_to_vec();
+        let record = SignedPersona {
+            signature: signer.sign(&body_bytes).0.to_vec(),
+            body: body_bytes,
+        }
+        .encode_to_vec();
         assert_eq!(
-            verify_persona_record(&id.persona_record()),
+            verify_persona_record(&record),
             Err(IdentityError::MalformedRecord)
         );
+    }
+
+    #[test]
+    fn our_own_record_always_verifies_despite_extreme_input() {
+        // Normalisation at creation makes an unverifiable local persona
+        // unrepresentable: even absurd input yields a record we can verify.
+        let id = Identity::generate(&"x".repeat(500), 0xffff_ffff);
+        let verified = verify_persona_record(&id.persona_record()).unwrap();
+        assert!(verified.name.len() <= MAX_PERSONA_NAME_LEN);
+        assert_eq!(verified.colour, 0x00ff_ffff);
+    }
+
+    #[test]
+    fn name_truncation_respects_utf8_boundaries() {
+        // A multi-byte char straddling the cap is dropped whole, never split.
+        let id = Identity::generate("é".repeat(40), 0); // 'é' = 2 bytes -> 80 bytes
+        assert!(id.persona().name.len() <= MAX_PERSONA_NAME_LEN);
+        assert!(id.persona().name.chars().all(|c| c == 'é'));
     }
 
     #[test]
