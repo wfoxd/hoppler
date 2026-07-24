@@ -188,7 +188,7 @@ fn key_database(conn: &Connection, master: &[u8; MASTER_LEN]) -> Result<(), Stor
     // Both the hex of the key and the assembled PRAGMA are Zeroizing, so no
     // un-scrubbed copy of the master survives on the heap.
     let hex_key = Zeroizing::new(hex::encode(master));
-    let pragma = Zeroizing::new(format!("PRAGMA key = \"x'{}'\";", &*hex_key));
+    let pragma = Zeroizing::new(format!("PRAGMA key = \"x'{}'\";", hex_key.as_str()));
     conn.execute_batch(&pragma)?;
     // Force a read so a wrong key fails now, not later.
     conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))?;
