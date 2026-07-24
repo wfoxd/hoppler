@@ -5,5 +5,15 @@
 
 import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
+import 'types.dart';
 
 String coreVersion() => RustLib.instance.api.crateApiCoreCoreVersion();
+
+/// The core API contract version. Breaking changes to any `crate::api` surface
+/// bump this (and `docs/CORE_API.md`).
+String apiVersion() => RustLib.instance.api.crateApiCoreApiVersion();
+
+/// Initialise the core at `support_dir` (the app's private data directory).
+/// Returns the local persona. Call once at startup, before other API calls.
+Future<PersonaDto> coreInit({required String supportDir}) =>
+    RustLib.instance.api.crateApiCoreCoreInit(supportDir: supportDir);
