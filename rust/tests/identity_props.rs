@@ -53,9 +53,11 @@ proptest! {
         prop_assert_eq!(before.pseudonym_toward(&peer_l2).0, after.pseudonym_toward(&peer_l2).0);
     }
 
-    // A record generated from arbitrary persona fields always verifies back to
-    // exactly those fields. Name is printable-ASCII bounded to the byte cap;
-    // colour is 24-bit (the top byte is normalised away on read).
+    // A record round-trips back to exactly the fields it was built from. The
+    // generators are chosen so normalisation is a no-op and the round-trip is an
+    // identity — NOT a claim about what the impl accepts (it takes any UTF-8
+    // name up to the byte cap): printable-ASCII keeps name.len() within the cap
+    // with no multi-byte truncation, and colour is already 24-bit.
     #[test]
     fn persona_record_round_trips(name in "[ -~]{0,64}", colour in 0u32..=0x00ff_ffff) {
         let id = identity_from([1u8; 32], [2u8; 32], name.clone(), colour);
