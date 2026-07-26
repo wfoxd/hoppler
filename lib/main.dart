@@ -135,7 +135,11 @@ class _HomePageState extends State<HomePage> {
       trailing: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          PingButton(service: _pingService, deviceId: d.deviceId),
+          PingButton(
+            key: ValueKey(d.deviceId),
+            service: _pingService,
+            deviceId: d.deviceId,
+          ),
           IconButton(
             icon: const Icon(Icons.chat_bubble_outline),
             tooltip: 'Chat',

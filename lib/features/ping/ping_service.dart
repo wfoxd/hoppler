@@ -18,7 +18,8 @@ class CorePingService implements PingService {
   CorePingService(Stream<CoreEvent> events)
       : acks = events
             .where((e) => e is CoreEvent_Pinged)
-            .map((e) => (e as CoreEvent_Pinged).deviceId);
+            .cast<CoreEvent_Pinged>()
+            .map((e) => e.deviceId);
 
   @override
   final Stream<String> acks;
