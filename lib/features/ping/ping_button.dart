@@ -56,7 +56,7 @@ class _PingButtonState extends State<PingButton> {
     // Acks correlate only by deviceId — fine for a payload-less gesture. Chat
     // and Drop, which copy this pattern, will need a per-message token instead.
     _ackSub = widget.service.acks.where((id) => id == widget.deviceId).listen((_) {
-      if (_phase != _Phase.pinging) return;
+      if (!mounted || _phase != _Phase.pinging) return;
       _watchdog?.cancel();
       _reset?.cancel();
       setState(() => _phase = _Phase.acked);
