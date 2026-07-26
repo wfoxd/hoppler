@@ -16,7 +16,11 @@ abstract interface class PingService {
 /// event stream (passed in so the whole app shares one subscription).
 class CorePingService implements PingService {
   CorePingService(Stream<CoreEvent> events)
-      : acks = events
+      : assert(
+          events.isBroadcast,
+          'pass a broadcast stream — each PingButton opens its own acks listener',
+        ),
+        acks = events
             .where((e) => e is CoreEvent_Pinged)
             .cast<CoreEvent_Pinged>()
             .map((e) => e.deviceId);
