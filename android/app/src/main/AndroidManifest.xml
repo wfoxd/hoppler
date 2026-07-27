@@ -1,4 +1,17 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- BLE rung (T08b). Android 12+ splits Bluetooth into three runtime
+         permissions; neverForLocation on the scan lets us decline location
+         entirely, which matches G-2 (nothing leaves the device) and avoids
+         asking for a permission Hoppler has no use for. -->
+    <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-feature
+        android:name="android.hardware.bluetooth_le"
+        android:required="true" />
+
     <application
         android:label="hoppler"
         android:name="${applicationName}"

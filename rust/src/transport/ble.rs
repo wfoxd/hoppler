@@ -40,12 +40,24 @@ use super::{
     TransportLimits,
 };
 
-/// BLE extended advertising (Android 8+, `LE 2M`/`LE Coded`) carries far more
-/// than legacy's ~26 usable bytes, but the floor across OEMs is what matters:
-/// `getLeMaximumAdvertisingDataLength()` reports as little as 191 on shipping
-/// hardware. Sized to the floor so a payload accepted here is not refused by
-/// the radio on a budget device.
-const MAX_ADVERTISING_PAYLOAD: usize = 180;
+/// What the core may put in an advertisement, after the adapter's framing.
+///
+/// The budget, worst case, on the smallest extended-advertising buffer that
+/// ships (`getLeMaximumAdvertisingDataLength()` reports 191 on budget hardware):
+///
+/// ```text
+///   191  extended advertising data
+///  - 18  service-data AD structure (1 len + 1 type + 16 UUID)
+///  -  2  L2CAP PSM, so a scanner can dial without a GATT round-trip
+///  -  1  id length
+///  - 63  local id (the longest `is_valid_peer_id` permits)
+///  = 107 left for the core
+/// ```
+///
+/// Rounded down to 100. Sizing to the *floor* rather than to a flagship is the
+/// difference between a payload the core composes freely and one the radio
+/// silently refuses on somebody's cheap phone.
+const MAX_ADVERTISING_PAYLOAD: usize = 100;
 
 /// L2CAP CoC MTU in practice. The core frames to this so the adapter never
 /// grows a fragmentation state machine (see the module docs on `limits`).

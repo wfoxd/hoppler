@@ -19,7 +19,11 @@ android {
         applicationId = "org.hoppler.hoppler"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
-        minSdk = flutter.minSdkVersion
+        // R0-N7 sets the floor at Android 10, and that is also exactly where
+        // BluetoothDevice.createInsecureL2capChannel arrives (API 29). Pinning
+        // it here is what lets the BLE rung use L2CAP CoC unconditionally and
+        // skip a GATT fallback in Ring 0 — see docs/BLE_CHANNEL.md.
+        minSdk = 29
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
