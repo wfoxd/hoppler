@@ -132,9 +132,17 @@ pub fn nearby_devices() -> Result<Vec<NearbyDevice>, String> {
 
 // ── sessions / threads ────────────────────────────────────────────────────────
 
-/// Ping a nearby device. Requires an initialised core and a known peer.
+/// Ping a device visible in Discovery. Only reachable while Discovery is open —
+/// closing it makes pings undeliverable (F3). The `Pinged` event is the ack.
+///
+/// Real cross-device reachability (the peer's Discovery state) and the
+/// receiver-side rate limiter (tech spec §7) arrive with the session layer
+/// (T09/T10); here reachability is modelled by our own Discovery flag.
 pub fn ping(device_id: String) -> Result<(), String> {
-    with_core(|_| Ok(()))?; // presence check
+    let discovering = with_core(|core| Ok(core.discovery_on))?;
+    if !discovering {
+        return Err("discovery is off — no one is reachable".to_string());
+    }
     let name = fake::peer(&device_id)
         .map(|p| p.name.to_owned())
         .ok_or_else(|| format!("device {device_id} is not nearby"))?;

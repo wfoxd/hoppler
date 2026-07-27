@@ -74,11 +74,18 @@ fn thread_messages_are_chronological_and_threads_reused() {
 }
 
 #[test]
-fn ping_unknown_device_errors() {
+fn ping_requires_discovery_and_a_known_peer() {
     let _g = LOCK.lock().unwrap();
     let _d = fresh();
-    assert!(ping("no-such-device".into()).is_err());
+    // Discovery off: nothing is reachable.
+    assert!(ping("fake-sam".into()).is_err());
+    set_discovery(true).unwrap();
+    // On: a known peer is pingable, an unknown one is not.
     ping("fake-sam".into()).unwrap();
+    assert!(ping("no-such-device".into()).is_err());
+    // Closing Discovery makes it undeliverable again (F3).
+    set_discovery(false).unwrap();
+    assert!(ping("fake-sam".into()).is_err());
 }
 
 #[test]
@@ -99,13 +106,4 @@ fn offer_drop_returns_a_transfer_id() {
     let _d = fresh();
     let id = offer_drop("fake-sam".into(), "clip.mp4".into(), 5_000_000).unwrap();
     assert!(id.starts_with("xfer-"), "unexpected id {id}");
-}
-
-#[test]
-fn ping_names_a_known_peer() {
-    let _g = LOCK.lock().unwrap();
-    let _d = fresh();
-    // ping succeeds for a known device (the payload goes to the event stream,
-    // which a Rust test has no sink for — the Dart integration test covers it).
-    ping("fake-sam".into()).unwrap();
 }

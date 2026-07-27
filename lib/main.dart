@@ -1,6 +1,8 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:hoppler/features/ping/ping_button.dart';
+import 'package:hoppler/features/ping/ping_service.dart';
 import 'package:hoppler/src/rust/api/core.dart';
 import 'package:hoppler/src/rust/api/discovery.dart';
 import 'package:hoppler/src/rust/api/events.dart';
@@ -46,11 +48,15 @@ class _HomePageState extends State<HomePage> {
   final List<String> _log = [];
   double? _transfer; // 0..1 while a Drop is in flight
   StreamSubscription<CoreEvent>? _events;
+  late final PingService _pingService;
 
   @override
   void initState() {
     super.initState();
-    _events = coreEventStream().listen(_onEvent);
+    // One broadcast stream shared by the app and the feature modules.
+    final stream = coreEventStream().asBroadcastStream();
+    _pingService = CorePingService(stream);
+    _events = stream.listen(_onEvent);
   }
 
   @override
@@ -129,10 +135,10 @@ class _HomePageState extends State<HomePage> {
       trailing: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          IconButton(
-            icon: const Icon(Icons.waving_hand_outlined),
-            tooltip: 'Ping',
-            onPressed: () => _run(() => ping(deviceId: d.deviceId)),
+          PingButton(
+            key: ValueKey(d.deviceId),
+            service: _pingService,
+            deviceId: d.deviceId,
           ),
           IconButton(
             icon: const Icon(Icons.chat_bubble_outline),
