@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 use std::sync::mpsc::{channel, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 
 use super::{EventSink, PeerId, Transport, TransportError, TransportEvent, TransportLimits};
@@ -72,11 +72,22 @@ impl LoopbackNet {
     pub fn join(&self, id: impl Into<PeerId>, sink: EventSink) -> LoopbackTransport {
         let id = id.into();
         let (tx, rx) = channel::<TransportEvent>();
+        // The sink is revocable: dropping the sender alone is not enough,
+        // because a Receiver keeps draining whatever was already queued — so
+        // events could still land after shutdown returned (contract rule 6).
+        let sink = Arc::new(RwLock::new(Some(sink)));
+        let delivery_sink = Arc::clone(&sink);
         // Deliver on our own thread: no Transport method may call the sink
         // before it returns (contract rule 1).
         thread::spawn(move || {
             while let Ok(event) = rx.recv() {
-                sink(event);
+                if let Some(s) = delivery_sink
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                {
+                    s(event);
+                }
             }
         });
         self.lock().nodes.insert(
@@ -91,6 +102,7 @@ impl LoopbackNet {
         LoopbackTransport {
             id: Mutex::new(id),
             net: self.clone(),
+            sink,
         }
     }
 
@@ -122,6 +134,9 @@ pub struct LoopbackTransport {
     /// Mutable so the node can rotate how it appears (tech spec §4).
     id: Mutex<PeerId>,
     net: LoopbackNet,
+    /// Cleared under the write lock by `shutdown`, so an event already queued
+    /// cannot still be delivered afterwards.
+    sink: Arc<RwLock<Option<EventSink>>>,
 }
 
 impl LoopbackTransport {
@@ -362,7 +377,9 @@ impl Transport for LoopbackTransport {
         }
         let _ = self.stop_advertising();
         let _ = self.stop_scanning();
-        // Dropping the sender ends the delivery thread.
+        // Revoke first, then drop the sender: anything still queued finds no
+        // sink, so nothing escapes after we return (contract rule 6).
+        *self.sink.write().unwrap_or_else(|e| e.into_inner()) = None;
         self.net.lock().nodes.remove(&me);
     }
 }
