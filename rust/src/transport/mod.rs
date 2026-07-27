@@ -38,8 +38,8 @@
 //!    emit `PeerLost` then `PeerFound` under the new id.
 //! 5. **A peer that dialled us is dialable back**, without waiting to discover
 //!    it.
-//! 6. **After `shutdown` the rung is silent and inert.** Idempotent; `Drop`
-//!    implies it.
+//! 6. **After `shutdown` the rung is silent and inert.** No event reaches the
+//!    sink once it returns. Idempotent; `Drop` implies it.
 
 pub mod lan;
 pub mod loopback;
@@ -189,7 +189,13 @@ pub trait Transport: Send + Sync {
     /// Peers we currently hold an open pipe to.
     fn pipes(&self) -> Vec<PeerId>;
 
-    /// Release everything: stop advertising and scanning, close pipes, join
-    /// threads. Idempotent.
+    /// Stop advertising and scanning, close every pipe, and revoke the sink.
+    /// Idempotent.
+    ///
+    /// The guarantee is *silence*, not thread-joining: once this returns, no
+    /// further event reaches the sink (a rung revokes it atomically). Worker
+    /// threads may still be unwinding as their sockets close, but they can no
+    /// longer be observed — which is what a caller tearing down its state
+    /// actually needs.
     fn shutdown(&self);
 }
