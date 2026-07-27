@@ -456,7 +456,11 @@ impl Transport for BleTransport {
         // Lock order: local_id before advertising. Both held across the
         // re-advertise so a concurrent start cannot publish the old id after
         // this one has moved on.
-        let mut local = self.inner.local_id.lock().unwrap_or_else(|e| e.into_inner());
+        let mut local = self
+            .inner
+            .local_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if *local == id {
             return Ok(());
         }
@@ -488,7 +492,11 @@ impl Transport for BleTransport {
         }
         // Lock order: local_id before advertising. Held together so a
         // concurrent rotation cannot publish this payload under the old name.
-        let _local = self.inner.local_id.lock().unwrap_or_else(|e| e.into_inner());
+        let _local = self
+            .inner
+            .local_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut advertising = self
             .inner
             .advertising
@@ -518,7 +526,11 @@ impl Transport for BleTransport {
 
     fn start_scanning(&self) -> Result<(), TransportError> {
         self.inner.alive()?;
-        let mut scanning = self.inner.scanning.lock().unwrap_or_else(|e| e.into_inner());
+        let mut scanning = self
+            .inner
+            .scanning
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if !*scanning {
             self.inner.platform.start_scanning()?;
             *scanning = true;
@@ -528,7 +540,11 @@ impl Transport for BleTransport {
 
     fn stop_scanning(&self) -> Result<(), TransportError> {
         self.inner.alive()?;
-        let mut scanning = self.inner.scanning.lock().unwrap_or_else(|e| e.into_inner());
+        let mut scanning = self
+            .inner
+            .scanning
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if *scanning {
             self.inner.platform.stop_scanning()?;
             *scanning = false;
@@ -673,7 +689,11 @@ impl Transport for BleTransport {
             .advertising
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
-        *self.inner.scanning.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        *self
+            .inner
+            .scanning
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = false;
         // Revoke under the write lock so suppression is atomic with the flag:
         // a dispatch already past its `dead` check still finds no sink.
         *self.inner.sink.write().unwrap_or_else(|e| e.into_inner()) = None;

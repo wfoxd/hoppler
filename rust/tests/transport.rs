@@ -955,7 +955,10 @@ mod fake_radio {
                 air.index_of(peer)
             };
             if let Some(target) = target {
-                Self::dispatch(&self.air, vec![(target, PlatformEvent::PipeClosed { peer: me })]);
+                Self::dispatch(
+                    &self.air,
+                    vec![(target, PlatformEvent::PipeClosed { peer: me })],
+                );
             }
             Ok(())
         }
@@ -1074,7 +1077,13 @@ impl rust_lib_hoppler::transport::ble::BlePlatform for Probe {
 }
 
 /// Build a transport wired to a probe, with one pipe already open.
-fn probed(peer: &str) -> (Arc<Probe>, rust_lib_hoppler::transport::ble::BleTransport, Events) {
+fn probed(
+    peer: &str,
+) -> (
+    Arc<Probe>,
+    rust_lib_hoppler::transport::ble::BleTransport,
+    Events,
+) {
     use rust_lib_hoppler::transport::ble::{BleTransport, PlatformEvent};
     let probe = Probe::new();
     let (sink, rx) = recorder();
@@ -1120,7 +1129,10 @@ fn the_send_window_pushes_back_and_reopens() {
             Err(e) => panic!("unexpected error: {e}"),
         }
     }
-    assert!(blocked, "the window never closed: {accepted} bytes accepted");
+    assert!(
+        blocked,
+        "the window never closed: {accepted} bytes accepted"
+    );
 
     // Acknowledging returns credit, and the pipe is usable again.
     probe.radio().on_write_complete("p1", accepted);

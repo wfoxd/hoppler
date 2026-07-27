@@ -7,7 +7,6 @@
 library;
 
 import 'dart:async';
-import 'dart:typed_data';
 
 import 'package:flutter/services.dart';
 
@@ -29,12 +28,12 @@ enum BleErrorCode {
   io;
 
   static BleErrorCode parse(String? code) => switch (code) {
-        'unavailable' => BleErrorCode.unavailable,
-        'no_such_peer' => BleErrorCode.noSuchPeer,
-        'payload_too_large' => BleErrorCode.payloadTooLarge,
-        'would_block' => BleErrorCode.wouldBlock,
-        _ => BleErrorCode.io,
-      };
+    'unavailable' => BleErrorCode.unavailable,
+    'no_such_peer' => BleErrorCode.noSuchPeer,
+    'payload_too_large' => BleErrorCode.payloadTooLarge,
+    'would_block' => BleErrorCode.wouldBlock,
+    _ => BleErrorCode.io,
+  };
 }
 
 /// A command the adapter refused.
@@ -101,8 +100,8 @@ class WriteComplete extends BleEvent {
 /// The adapter, as the core sees it.
 class BleChannel {
   BleChannel({MethodChannel? commands, EventChannel? events})
-      : _method = commands ?? _commands,
-        _event = events ?? _events;
+    : _method = commands ?? _commands,
+      _event = events ?? _events;
 
   final MethodChannel _method;
   final EventChannel _event;
@@ -148,8 +147,11 @@ class BleChannel {
   /// Facts from the radio. Malformed events are dropped rather than thrown:
   /// one bad frame from an OEM stack must not tear down the whole stream and
   /// leave the core blind.
-  Stream<BleEvent> get events =>
-      _event.receiveBroadcastStream().map(_decode).where((e) => e != null).cast<BleEvent>();
+  Stream<BleEvent> get events => _event
+      .receiveBroadcastStream()
+      .map(_decode)
+      .where((e) => e != null)
+      .cast<BleEvent>();
 
   Future<T?> _invoke<T>(String method, [Map<String, Object?>? args]) async {
     try {
@@ -159,7 +161,10 @@ class BleChannel {
     } on MissingPluginException {
       // No adapter registered — a desktop build, or an app half-way through a
       // hot restart. Unavailable is exactly right and the UI already says so.
-      throw BleError(BleErrorCode.unavailable, 'no BLE adapter on this platform');
+      throw BleError(
+        BleErrorCode.unavailable,
+        'no BLE adapter on this platform',
+      );
     }
   }
 
@@ -177,16 +182,20 @@ class BleChannel {
       'peerFound' when peer() != null => PeerFound(peer()!, bytes('payload')),
       'peerLost' when peer() != null => PeerLost(peer()!),
       'pipeOpened' when peer() != null => PipeOpened(peer()!),
-      'pipeFailed' when peer() != null =>
-        PipeFailed(peer()!, map['why'] as String? ?? 'unspecified'),
+      'pipeFailed' when peer() != null => PipeFailed(
+        peer()!,
+        map['why'] as String? ?? 'unspecified',
+      ),
       'pipeClosed' when peer() != null => PipeClosed(peer()!),
       'received' when peer() != null => Received(peer()!, bytes('bytes')),
       'availability' => Availability(
-          map['available'] as bool? ?? false,
-          map['reason'] as String?,
-        ),
-      'writeComplete' when peer() != null =>
-        WriteComplete(peer()!, map['bytes'] as int? ?? 0),
+        map['available'] as bool? ?? false,
+        map['reason'] as String?,
+      ),
+      'writeComplete' when peer() != null => WriteComplete(
+        peer()!,
+        map['bytes'] as int? ?? 0,
+      ),
       // Unknown types are ignored by contract (§3), so a newer adapter can add
       // events without breaking an older core.
       _ => null,

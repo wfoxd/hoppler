@@ -1,4 +1,3 @@
-import 'dart:typed_data';
 
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -38,26 +37,36 @@ void main() {
       await ble.connect('peer-b');
       await ble.stopAdvertising();
 
-      expect(calls.map((c) => c.method),
-          ['setLocalId', 'startAdvertising', 'send', 'connect', 'stopAdvertising']);
+      expect(calls.map((c) => c.method), [
+        'setLocalId',
+        'startAdvertising',
+        'send',
+        'connect',
+        'stopAdvertising',
+      ]);
       expect(calls[0].arguments, {'localId': 'node-a'});
       expect(calls[1].arguments, {'payload': payload});
       expect(calls[2].arguments['peer'], 'peer-b');
       expect(calls[4].arguments, isNull);
     });
 
-    test('a version mismatch is fatal at startup, not a mystery later', () async {
-      final ble = channelWith((call) async => 2);
-      await expectLater(
-        ble.checkVersion(),
-        throwsA(isA<BleError>()
-            .having((e) => e.code, 'code', BleErrorCode.unavailable)
-            .having((e) => e.message, 'message', contains('v2'))),
-      );
+    test(
+      'a version mismatch is fatal at startup, not a mystery later',
+      () async {
+        final ble = channelWith((call) async => 2);
+        await expectLater(
+          ble.checkVersion(),
+          throwsA(
+            isA<BleError>()
+                .having((e) => e.code, 'code', BleErrorCode.unavailable)
+                .having((e) => e.message, 'message', contains('v2')),
+          ),
+        );
 
-      final ok = channelWith((call) async => bleChannelVersion);
-      await expectLater(ok.checkVersion(), completes);
-    });
+        final ok = channelWith((call) async => bleChannelVersion);
+        await expectLater(ok.checkVersion(), completes);
+      },
+    );
 
     test('every documented error code routes to its own branch', () async {
       const codes = {
@@ -69,25 +78,33 @@ void main() {
       };
       for (final entry in codes.entries) {
         final ble = channelWith(
-          (call) async => throw PlatformException(code: entry.key, message: 'x'),
+          (call) async =>
+              throw PlatformException(code: entry.key, message: 'x'),
         );
         await expectLater(
           ble.stopAdvertising(),
-          throwsA(isA<BleError>().having((e) => e.code, entry.key, entry.value)),
+          throwsA(
+            isA<BleError>().having((e) => e.code, entry.key, entry.value),
+          ),
         );
       }
     });
 
-    test('an unrecognised code degrades to io rather than escaping untyped',
-        () async {
-      final ble = channelWith(
-        (call) async => throw PlatformException(code: 'brand_new', message: 'x'),
-      );
-      await expectLater(
-        ble.stopAdvertising(),
-        throwsA(isA<BleError>().having((e) => e.code, 'code', BleErrorCode.io)),
-      );
-    });
+    test(
+      'an unrecognised code degrades to io rather than escaping untyped',
+      () async {
+        final ble = channelWith(
+          (call) async =>
+              throw PlatformException(code: 'brand_new', message: 'x'),
+        );
+        await expectLater(
+          ble.stopAdvertising(),
+          throwsA(
+            isA<BleError>().having((e) => e.code, 'code', BleErrorCode.io),
+          ),
+        );
+      },
+    );
 
     test('no adapter on this platform reads as unavailable', () async {
       // Desktop builds and hot restarts both land here. Anything other than
@@ -98,8 +115,13 @@ void main() {
       );
       await expectLater(
         ble.startScanning(),
-        throwsA(isA<BleError>()
-            .having((e) => e.code, 'code', BleErrorCode.unavailable)),
+        throwsA(
+          isA<BleError>().having(
+            (e) => e.code,
+            'code',
+            BleErrorCode.unavailable,
+          ),
+        ),
       );
     });
   });
@@ -108,21 +130,26 @@ void main() {
     /// Push raw frames through the real EventChannel codec, so the decoder is
     /// tested against what the platform actually sends.
     Stream<BleEvent> decoded(List<Object?> frames) {
-      messenger.setMockStreamHandler(
-        event,
-        _Frames(frames),
-      );
+      messenger.setMockStreamHandler(event, _Frames(frames));
       return BleChannel(commands: method, events: event).events;
     }
 
     test('every documented event type decodes', () async {
       final events = await decoded([
-        {'type': 'peerFound', 'peer': 'a', 'payload': Uint8List.fromList([7])},
+        {
+          'type': 'peerFound',
+          'peer': 'a',
+          'payload': Uint8List.fromList([7]),
+        },
         {'type': 'peerLost', 'peer': 'a'},
         {'type': 'pipeOpened', 'peer': 'a'},
         {'type': 'pipeFailed', 'peer': 'a', 'why': 'refused'},
         {'type': 'pipeClosed', 'peer': 'a'},
-        {'type': 'received', 'peer': 'a', 'bytes': Uint8List.fromList([1, 2])},
+        {
+          'type': 'received',
+          'peer': 'a',
+          'bytes': Uint8List.fromList([1, 2]),
+        },
         {'type': 'availability', 'available': false, 'reason': 'bluetooth off'},
         {'type': 'writeComplete', 'peer': 'a', 'bytes': 42},
       ]).toList();
