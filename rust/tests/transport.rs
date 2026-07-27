@@ -1275,3 +1275,91 @@ fn the_adapter_learns_our_id_even_when_we_never_advertise() {
         "a rotation with nothing advertised must still reach the adapter"
     );
 }
+
+/// Rule 6 says the rung is silent *once `shutdown` returns*. That is a claim
+/// about a delivery already in flight, which the suite's drain-then-check can
+/// only catch by luck — and did not: the BLE rung shipped cloning the sink out
+/// and releasing the lock before calling it, so `shutdown` returned while a
+/// delivery was still running.
+///
+/// Run against every rung rather than the one that had the bug, because the
+/// next rung is where it would come back.
+fn shutdown_waits_for_in_flight_delivery(
+    rung: &str,
+    make: impl FnOnce(Box<dyn Fn(TransportEvent) + Send + Sync>) -> Arc<dyn Transport>,
+) {
+    use std::sync::Condvar;
+
+    let entered = Arc::new((Mutex::new(false), Condvar::new()));
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let (e, r) = (entered.clone(), release.clone());
+
+    let t = make(Box::new(move |_| {
+        *e.0.lock().unwrap() = true;
+        e.1.notify_all();
+        let mut go = r.0.lock().unwrap();
+        while !*go {
+            go = r.1.wait(go).unwrap();
+        }
+    }));
+
+    // Dialling an unknown peer emits PipeFailed on every rung, so it is the one
+    // event this helper can provoke without a second node.
+    let _ = t.connect("ghost");
+
+    {
+        let mut in_sink = entered.0.lock().unwrap();
+        while !*in_sink {
+            let (guard, timeout) = entered
+                .1
+                .wait_timeout(in_sink, Duration::from_secs(5))
+                .unwrap();
+            in_sink = guard;
+            assert!(!timeout.timed_out(), "{rung}: the sink was never called");
+        }
+    }
+
+    let (done_tx, done_rx) = channel();
+    let shutting = t.clone();
+    let handle = std::thread::spawn(move || {
+        shutting.shutdown();
+        let _ = done_tx.send(());
+    });
+
+    assert!(
+        done_rx.recv_timeout(Duration::from_millis(500)).is_err(),
+        "{rung}: shutdown returned while a delivery was still running — the sink \
+         can then be called after the caller believes the rung is silent"
+    );
+
+    *release.0.lock().unwrap() = true;
+    release.1.notify_all();
+    done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("shutdown never completed once the sink returned");
+    handle.join().unwrap();
+}
+
+#[test]
+fn loopback_shutdown_waits_for_an_in_flight_delivery() {
+    let net = LoopbackNet::new();
+    shutdown_waits_for_in_flight_delivery("loopback", |sink| Arc::new(net.join("sd", sink)));
+}
+
+#[test]
+fn lan_shutdown_waits_for_an_in_flight_delivery() {
+    shutdown_waits_for_in_flight_delivery("lan", |sink| {
+        Arc::new(LanTransport::new("sd-lan", sink).unwrap())
+    });
+}
+
+#[test]
+fn ble_shutdown_waits_for_an_in_flight_delivery() {
+    use rust_lib_hoppler::transport::ble::BleTransport;
+    shutdown_waits_for_in_flight_delivery("ble", |sink| {
+        let probe = Probe::new();
+        let t = Arc::new(BleTransport::new("sd-ble", probe.clone(), sink).unwrap());
+        probe.attach(t.ingress());
+        t
+    });
+}

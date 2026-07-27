@@ -38,6 +38,14 @@ android {
     }
 }
 
+tasks.withType<Test>().configureEach {
+    // A test task that discovers nothing still reports BUILD SUCCESSFUL, which
+    // reads as "all green" when it means "nothing ran" — so make the absence of
+    // tests a failure rather than something a human has to notice in a log.
+    failOnNoDiscoveredTests = true
+    testLogging { events("passed", "failed", "skipped") }
+}
+
 dependencies {
     // JVM unit tests for the adapter's radio-free logic (framing, id
     // validation, the sighting decision). BLE behaviour still needs two

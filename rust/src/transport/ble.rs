@@ -38,7 +38,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Sender};
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 use super::{
     is_valid_peer_id, EventSink, PeerId, SharedSink, Transport, TransportError, TransportEvent,
@@ -163,6 +163,11 @@ struct Inner {
     /// Revoked on shutdown under a write lock, so suppression is atomic with
     /// the flag rather than racing it (rule 6).
     sink: RwLock<Option<SharedSink>>,
+    /// Set before the write lock is taken, so a delivery that already holds the
+    /// read guard still suppresses — and so a sink that shuts us down from
+    /// inside itself does not deadlock waiting for its own guard.
+    revoked: AtomicBool,
+    dispatch_thread: OnceLock<std::thread::ThreadId>,
     tx: Mutex<Option<Sender<TransportEvent>>>,
     dead: AtomicBool,
     available: AtomicBool,
@@ -175,6 +180,18 @@ impl Inner {
             return Err(TransportError::Unavailable("transport is shut down".into()));
         }
         Ok(())
+    }
+
+    /// Stop delivering, atomically with respect to a delivery in flight.
+    fn revoke(&self) {
+        // Ordered first: a dispatch already holding the read guard sees this
+        // even though the write lock below cannot be taken until it finishes.
+        self.revoked.store(true, Ordering::SeqCst);
+        // Skip the write lock when the sink itself called shutdown — we would
+        // be waiting on a read guard held by this very thread.
+        if self.dispatch_thread.get() != Some(&std::thread::current().id()) {
+            *self.sink.write().unwrap_or_else(|e| e.into_inner()) = None;
+        }
     }
 
     /// Queue an event for the dispatch thread. Never calls the sink inline —
@@ -215,6 +232,8 @@ impl BleTransport {
             peers: Mutex::new(HashSet::new()),
             pipes: Mutex::new(HashMap::new()),
             sink: RwLock::new(Some(Arc::from(sink))),
+            revoked: AtomicBool::new(false),
+            dispatch_thread: OnceLock::new(),
             tx: Mutex::new(Some(tx)),
             dead: AtomicBool::new(false),
             available: AtomicBool::new(true),
@@ -228,18 +247,21 @@ impl BleTransport {
         std::thread::Builder::new()
             .name("hoppler-ble-dispatch".into())
             .spawn(move || {
+                let _ = dispatch.dispatch_thread.set(std::thread::current().id());
                 while let Ok(event) = rx.recv() {
-                    // Clone the sink out and release the lock before calling:
-                    // a sink that reacts by shutting us down would otherwise
-                    // deadlock against the revocation write lock.
-                    let sink = {
-                        let guard = dispatch.sink.read().unwrap_or_else(|e| e.into_inner());
-                        match guard.as_ref() {
-                            Some(s) => s.clone(),
-                            None => continue,
-                        }
-                    };
-                    sink(event);
+                    // The guard is held ACROSS the call, so a `shutdown` on
+                    // another thread blocks until this delivery finishes and
+                    // only then revokes — which is what makes "silent once
+                    // shutdown returns" exact rather than best-effort (rule 6).
+                    // Cloning the sink out and releasing first would let
+                    // shutdown return while this call was still running.
+                    let guard = dispatch.sink.read().unwrap_or_else(|e| e.into_inner());
+                    if dispatch.revoked.load(Ordering::SeqCst) {
+                        continue;
+                    }
+                    if let Some(sink) = guard.as_ref() {
+                        sink(event);
+                    }
                 }
             })
             .map_err(|e| TransportError::Io(format!("dispatch thread: {e}")))?;
@@ -699,9 +721,8 @@ impl Transport for BleTransport {
             .scanning
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = false;
-        // Revoke under the write lock so suppression is atomic with the flag:
-        // a dispatch already past its `dead` check still finds no sink.
-        *self.inner.sink.write().unwrap_or_else(|e| e.into_inner()) = None;
+        // Waits for any delivery already in flight, then revokes.
+        self.inner.revoke();
         // Drop the sender so the dispatch thread's recv fails and it exits.
         *self.inner.tx.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
