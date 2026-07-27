@@ -14,7 +14,9 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6, TcpListener, TcpStream};
+use std::net::{
+    IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener, TcpStream,
+};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex, RwLock};
@@ -524,7 +526,18 @@ fn accept_loop(inner: Arc<Inner>, listener: TcpListener) {
             let _ = stream.set_read_timeout(None);
             // Their source port is ephemeral; pair their IP with the listening
             // port they told us about, or the address is undialable later.
-            let dialable = addr.map(|a| SocketAddr::new(a.ip(), listen_port));
+            // Keep the scope id: a link-local IPv6 peer is undialable without
+            // the interface it arrived on (the same EINVAL that bit us in
+            // dial_candidates).
+            let dialable = addr.map(|a| match a {
+                SocketAddr::V4(v4) => SocketAddr::V4(SocketAddrV4::new(*v4.ip(), listen_port)),
+                SocketAddr::V6(v6) => SocketAddr::V6(SocketAddrV6::new(
+                    *v6.ip(),
+                    listen_port,
+                    v6.flowinfo(),
+                    v6.scope_id(),
+                )),
+            });
             inner.adopt(peer, stream, dialable, false);
         });
     }
@@ -651,11 +664,19 @@ impl Transport for LanTransport {
                         if candidates.is_empty() {
                             continue;
                         }
-                        inner
-                            .peers
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .insert(peer.clone(), candidates);
+                        {
+                            // Merge, don't replace: an address learned from an
+                            // inbound dial (rule 5) or seeded by hand is still
+                            // valid, and a later mDNS resolve must not drop the
+                            // only candidate that actually works.
+                            let mut peers = inner.peers.lock().unwrap_or_else(|e| e.into_inner());
+                            let known = peers.entry(peer.clone()).or_default();
+                            for addr in candidates {
+                                if !known.contains(&addr) {
+                                    known.push(addr);
+                                }
+                            }
+                        }
                         inner.emit(TransportEvent::PeerFound { peer, payload });
                     }
                     ServiceEvent::ServiceRemoved(_, fullname) => {

@@ -323,8 +323,13 @@ fn events_never_fire_on_the_callers_thread() {
     let net = LoopbackNet::new();
     let caller = std::thread::current().id();
     let seen_on_caller = Arc::new(Mutex::new(false));
+    // Also count deliveries: asserting only "never on the caller's thread"
+    // passes vacuously if the sink is never invoked at all.
+    let delivered = Arc::new(Mutex::new(0usize));
     let flag = Arc::clone(&seen_on_caller);
+    let count = Arc::clone(&delivered);
     let sink: Box<dyn Fn(TransportEvent) + Send + Sync> = Box::new(move |_| {
+        *count.lock().unwrap_or_else(|p| p.into_inner()) += 1;
         if std::thread::current().id() == caller {
             *flag.lock().unwrap_or_else(|p| p.into_inner()) = true;
         }
@@ -339,7 +344,17 @@ fn events_never_fire_on_the_callers_thread() {
     opened(&rx_b, "re-a");
     a.send("re-b", b"hello").unwrap();
     a.disconnect("re-b").unwrap();
-    std::thread::sleep(Duration::from_millis(100));
+
+    // Wait until events actually arrive, so the assertion below is meaningful
+    // rather than passing because nothing was delivered.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while *delivered.lock().unwrap_or_else(|p| p.into_inner()) < 3 {
+        assert!(
+            Instant::now() < deadline,
+            "sink received too few events to judge"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
     assert!(
         !*seen_on_caller.lock().unwrap_or_else(|p| p.into_inner()),
