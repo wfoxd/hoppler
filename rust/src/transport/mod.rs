@@ -41,6 +41,7 @@
 //! 6. **After `shutdown` the rung is silent and inert.** No event reaches the
 //!    sink once it returns. Idempotent; `Drop` implies it.
 
+pub mod ble;
 pub mod lan;
 pub mod loopback;
 
