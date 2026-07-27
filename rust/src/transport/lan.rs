@@ -280,9 +280,7 @@ impl LanTransport {
         // on many hosts is IPv6 link-local *only*. An IPv4-only listener would
         // refuse exactly the addresses we advertise. `::` accepts both families
         // where the OS allows it; fall back to IPv4 where it doesn't.
-        let listener = TcpListener::bind((Ipv6Addr::UNSPECIFIED, 0))
-            .or_else(|_| TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)))
-            .map_err(io_err)?;
+        let listener = bind_dual_stack().map_err(io_err)?;
         let local_addr = listener.local_addr().map_err(io_err)?;
         let port = local_addr.port();
         let mdns = ServiceDaemon::new().map_err(unavailable)?;
@@ -379,6 +377,7 @@ impl LanTransport {
 
     /// Dial a peer directly at `addr`, bypassing discovery.
     pub fn connect_addr(&self, peer: &str, addr: SocketAddr) -> Result<(), TransportError> {
+        self.alive()?;
         let stream = match TcpStream::connect_timeout(&addr, DIAL_TIMEOUT) {
             Ok(s) => s,
             Err(e) => {
@@ -389,7 +388,13 @@ impl LanTransport {
                 return Err(io_err(e));
             }
         };
-        send_hello(&stream, &self.inner.id(), self.inner.port)?;
+        if let Err(e) = send_hello(&stream, &self.inner.id(), self.inner.port) {
+            self.inner.emit(TransportEvent::PipeFailed {
+                peer: peer.to_string(),
+                why: e.to_string(),
+            });
+            return Err(e);
+        }
         self.inner.adopt(peer.to_string(), stream, Some(addr), true);
         Ok(())
     }
@@ -444,6 +449,28 @@ fn dial_race(candidates: &[SocketAddr]) -> Result<(TcpStream, SocketAddr), Trans
     }
 }
 
+/// Bind a listener that accepts **both** address families.
+///
+/// `::` is dual-stack only where the OS says so — Linux/Android default to
+/// `bindv6only=0`, but others (and hardened containers) default the other way,
+/// where an IPv6 listener silently refuses the IPv4 candidates we advertise.
+/// That failure mode is the one recorded in the T08 findings: discovery looks
+/// healthy while every dial gets `ECONNREFUSED`. So we ask for it explicitly,
+/// and fall back to IPv4 only if IPv6 is unavailable entirely.
+fn bind_dual_stack() -> std::io::Result<TcpListener> {
+    use socket2::{Domain, Socket, Type};
+
+    let attempt = || -> std::io::Result<TcpListener> {
+        let sock = Socket::new(Domain::IPV6, Type::STREAM, None)?;
+        sock.set_only_v6(false)?;
+        sock.set_reuse_address(true)?;
+        sock.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)).into())?;
+        sock.listen(128)?;
+        Ok(sock.into())
+    };
+    attempt().or_else(|_| TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)))
+}
+
 /// Why a write could not be completed.
 enum WriteFailure {
     /// Not a single byte reached the wire — safe for the caller to retry.
@@ -459,7 +486,9 @@ enum WriteFailure {
 /// per-`write`, so a peer accepting a trickle resets it indefinitely — the same
 /// trap as `SO_RCVTIMEO` on the read side, so both now count against a
 /// wall-clock deadline.
-fn write_all_by(stream: &mut TcpStream, buf: &[u8], deadline: Instant) -> Result<(), WriteFailure> {
+fn write_all_by(stream: &TcpStream, buf: &[u8], deadline: Instant) -> Result<(), WriteFailure> {
+    // `Write` is implemented for `&TcpStream`, so no mutable handle is needed.
+    let mut sink = stream;
     let mut written = 0usize;
     let fail = |written: usize, why: String| {
         if written == 0 {
@@ -476,7 +505,7 @@ fn write_all_by(stream: &mut TcpStream, buf: &[u8], deadline: Instant) -> Result
         if stream.set_write_timeout(Some(left)).is_err() {
             return Err(fail(written, "could not arm write timeout".into()));
         }
-        match stream.write(&buf[written..]) {
+        match sink.write(&buf[written..]) {
             Ok(0) => return Err(fail(written, "peer closed during write".into())),
             Ok(n) => written += n,
             // Loop; the deadline check above decides when to give up.
@@ -494,17 +523,16 @@ fn write_all_by(stream: &mut TcpStream, buf: &[u8], deadline: Instant) -> Result
 /// source* port, which is useless for dialling back once this connection
 /// closes. Carrying the listening port is what makes "a peer that dialled us
 /// is dialable back" (contract rule 5) actually true rather than nominally so.
-fn send_hello(
-    mut stream: &TcpStream,
-    node_id: &str,
-    listen_port: u16,
-) -> Result<(), TransportError> {
+fn send_hello(stream: &TcpStream, node_id: &str, listen_port: u16) -> Result<(), TransportError> {
     let bytes = node_id.as_bytes();
     let mut hello = Vec::with_capacity(3 + bytes.len());
     hello.push(bytes.len() as u8);
     hello.extend_from_slice(bytes);
     hello.extend_from_slice(&listen_port.to_be_bytes());
-    stream.write_all(&hello).map_err(io_err)
+    // Deadline-bounded: a peer that accepts the connection and then stalls must
+    // not hang `connect`, which the contract treats as an acceptance operation.
+    write_all_by(stream, &hello, Instant::now() + HELLO_DEADLINE)
+        .map_err(|_| TransportError::Io("peer did not accept the hello".into()))
 }
 
 /// Read the peer's hello, giving up at `deadline`.
@@ -712,28 +740,34 @@ impl Transport for LanTransport {
 
     fn start_advertising(&self, payload: Vec<u8>) -> Result<(), TransportError> {
         self.alive()?;
-        let id = self.inner.id();
-        self.publish(&id, &payload)?;
-        *self
+        // Hold the guard across the mDNS call so start/stop are linearizable:
+        // otherwise a concurrent stop can unregister a record published a
+        // moment later, leaving us silent while reporting that we advertise.
+        let mut advertising = self
             .inner
             .advertising
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(payload);
+            .unwrap_or_else(|e| e.into_inner());
+        let id = self.inner.id();
+        self.publish(&id, &payload)?;
+        *advertising = Some(payload);
         Ok(())
     }
 
     fn stop_advertising(&self) -> Result<(), TransportError> {
-        let was = self
+        let mut advertising = self
             .inner
             .advertising
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        if was.is_some() {
+            .unwrap_or_else(|e| e.into_inner());
+        if advertising.is_some() {
+            // Unregister first: reporting success while the old record still
+            // answers is the failure mode this ordering exists to prevent.
             self.inner
                 .mdns
                 .unregister(&Self::fullname(&self.inner.id()))
                 .map_err(unavailable)?;
+            *advertising = None;
         }
         Ok(())
     }
@@ -822,7 +856,13 @@ impl Transport for LanTransport {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if *scanning {
-            let _ = self.inner.mdns.stop_browse(SERVICE_TYPE);
+            // If the browse cannot be stopped we are still multicasting, so
+            // reporting "scanning off" would be an F2 lie. Leave the flag set
+            // and surface the failure.
+            self.inner
+                .mdns
+                .stop_browse(SERVICE_TYPE)
+                .map_err(unavailable)?;
             *scanning = false;
         }
         Ok(())
@@ -865,7 +905,13 @@ impl Transport for LanTransport {
                 return Err(e);
             }
         };
-        send_hello(&stream, &self.inner.id(), self.inner.port)?;
+        if let Err(e) = send_hello(&stream, &self.inner.id(), self.inner.port) {
+            self.inner.emit(TransportEvent::PipeFailed {
+                peer: peer.to_string(),
+                why: e.to_string(),
+            });
+            return Err(e);
+        }
         self.inner.adopt(peer.to_string(), stream, Some(addr), true);
         Ok(())
     }
@@ -880,8 +926,8 @@ impl Transport for LanTransport {
         };
         // Hold the per-pipe lock across the whole write so concurrent sends to
         // one peer can't interleave their bytes (contract rule 3).
-        let mut stream = pipe.lock().unwrap_or_else(|e| e.into_inner());
-        match write_all_by(&mut stream, bytes, Instant::now() + WRITE_TIMEOUT) {
+        let stream = pipe.lock().unwrap_or_else(|e| e.into_inner());
+        match write_all_by(&stream, bytes, Instant::now() + WRITE_TIMEOUT) {
             Ok(()) => Ok(()),
             // Nothing reached the wire, so a retry is safe — the only case that
             // may report WouldBlock.

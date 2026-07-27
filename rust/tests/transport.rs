@@ -334,7 +334,11 @@ fn lan_meets_the_contract() {
     // Seed the address instead of discovering it: mDNS needs multicast and is
     // exercised separately, but every *behavioural* rule is checked here
     // through the same `connect` the other rungs use.
+    // Seed both families: whether the listener ends up v4, v6 or dual-stack is
+    // an OS-configuration detail, and the rung races candidates in production
+    // for exactly this reason.
     a.add_peer_addr("ct-b", ([127, 0, 0, 1], b.port()).into());
+    a.add_peer_addr("ct-b", (std::net::Ipv6Addr::LOCALHOST, b.port()).into());
     conformance(Pair {
         a: Box::new(a),
         b: Box::new(b),
