@@ -127,6 +127,20 @@ fn conformance(p: Pair) {
         );
     }
 
+    // Rungs must agree on what `peers()` means: a peer discovered and not since
+    // lost stays known after scanning stops, because rule 5 depends on that
+    // record surviving. (Hiding peers while discovery is off is a core-layer
+    // decision, not a transport one.)
+    if discovery_works {
+        a.stop_scanning().unwrap();
+        assert!(
+            a.peers().contains(&id_b),
+            "{}: peers() must survive stop_scanning",
+            a.name()
+        );
+        a.start_scanning().unwrap();
+    }
+
     // Rule: an oversized advertisement is refused with the right error.
     let too_big = vec![0u8; a.limits().max_advertising_payload + 1];
     assert!(

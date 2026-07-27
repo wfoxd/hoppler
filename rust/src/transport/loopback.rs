@@ -31,6 +31,9 @@ struct Node {
     advertising: Option<Vec<u8>>,
     scanning: bool,
     pipes: Vec<PeerId>,
+    /// Peers this node has seen and not since lost. Kept across
+    /// `stop_scanning`, matching the LAN rung and the trait contract.
+    discovered: Vec<PeerId>,
 }
 
 struct NetState {
@@ -119,6 +122,7 @@ impl LoopbackNet {
                 advertising: None,
                 scanning: false,
                 pipes: Vec::new(),
+                discovered: Vec::new(),
             },
         );
         drop(state);
@@ -140,7 +144,25 @@ impl LoopbackNet {
 impl NetState {
     /// Queue an event for `peer`. Queuing under the lock is safe — the sink
     /// runs on the node's own thread, not here.
-    fn post(&self, peer: &str, event: TransportEvent) {
+    fn post(&mut self, peer: &str, event: TransportEvent) {
+        // Keep the observer's known-peer set in step with what it is told, so
+        // `peers()` reports discovery state rather than who happens to be
+        // advertising right now.
+        match &event {
+            TransportEvent::PeerFound { peer: found, .. } => {
+                if let Some(n) = self.nodes.get_mut(peer) {
+                    if !n.discovered.contains(found) {
+                        n.discovered.push(found.clone());
+                    }
+                }
+            }
+            TransportEvent::PeerLost { peer: lost } => {
+                if let Some(n) = self.nodes.get_mut(peer) {
+                    n.discovered.retain(|p| p != lost);
+                }
+            }
+            _ => {}
+        }
         if let Some(tx) = self.nodes.get(peer).and_then(|n| n.tx.as_ref()) {
             let _ = tx.send(event);
         }
@@ -361,7 +383,7 @@ impl Transport for LoopbackTransport {
         let me = self.id();
         // The whole send happens under one lock, so concurrent sends to the
         // same peer can never interleave their chunks (contract rule 3).
-        let state = self.net.lock();
+        let mut state = self.net.lock();
         let open = state
             .nodes
             .get(&me)
@@ -411,16 +433,12 @@ impl Transport for LoopbackTransport {
 
     fn peers(&self) -> Vec<PeerId> {
         let me = self.id();
-        let state = self.net.lock();
-        if !state.nodes.get(&me).is_some_and(|n| n.scanning) {
-            return Vec::new();
-        }
-        state
+        self.net
+            .lock()
             .nodes
-            .iter()
-            .filter(|(id, n)| id.as_str() != me && n.advertising.is_some())
-            .map(|(id, _)| id.clone())
-            .collect()
+            .get(&me)
+            .map(|n| n.discovered.clone())
+            .unwrap_or_default()
     }
 
     fn pipes(&self) -> Vec<PeerId> {

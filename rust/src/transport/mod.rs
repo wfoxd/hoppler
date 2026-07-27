@@ -211,7 +211,13 @@ pub trait Transport: Send + Sync {
     /// Close a pipe. Emits `PipeClosed`. Closing an absent pipe is not an error.
     fn disconnect(&self, peer: &str) -> Result<(), TransportError>;
 
-    /// Peers currently known from discovery.
+    /// Peers currently known — those discovered and not since lost, plus any
+    /// that dialled us.
+    ///
+    /// **Not** cleared by [`Transport::stop_scanning`]: rule 5 depends on the
+    /// record surviving, and a peer seen a moment ago is still reachable. The
+    /// "show nothing while discovery is off" behaviour is a core-layer
+    /// decision, not a transport one.
     fn peers(&self) -> Vec<PeerId>;
 
     /// Peers we currently hold an open pipe to.

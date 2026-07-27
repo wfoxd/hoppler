@@ -920,6 +920,10 @@ impl Transport for LanTransport {
     }
 
     fn send(&self, peer: &str, bytes: &[u8]) -> Result<(), TransportError> {
+        // Checked before the lookup: during shutdown the flag is set before the
+        // pipes are drained, and without this a caller could still push bytes
+        // onto a socket that is in the middle of being torn down.
+        self.alive()?;
         let pipe = {
             let pipes = self.inner.pipes.lock().unwrap_or_else(|e| e.into_inner());
             pipes
