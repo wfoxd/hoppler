@@ -491,3 +491,30 @@ fn lan_records_a_dialable_address_for_an_inbound_peer() {
     a.connect("db-b").unwrap();
     opened(&rx_a, "db-b");
 }
+
+/// A handshake still in flight when shutdown begins must not leave a live pipe
+/// behind — the rung is inert afterwards, not merely quiet.
+#[test]
+fn lan_shutdown_beats_an_in_flight_handshake() {
+    let (sink_a, _rx_a) = recorder();
+    let (sink_b, _rx_b) = recorder();
+    let a = LanTransport::new("race-a", sink_a).unwrap();
+    let b = LanTransport::new("race-b", sink_b).unwrap();
+    b.add_peer_addr("race-a", ([127, 0, 0, 1], a.port()).into());
+
+    // Dial and shut down concurrently; whichever order the two take, `a` must
+    // end with no pipes.
+    let dialer = std::thread::spawn(move || {
+        let _ = b.connect("race-a");
+        b
+    });
+    a.shutdown();
+    let _b = dialer.join().unwrap();
+
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        a.pipes().is_empty(),
+        "a pipe survived shutdown: {:?}",
+        a.pipes()
+    );
+}

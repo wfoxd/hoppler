@@ -150,6 +150,14 @@ impl Inner {
         let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
         {
             let mut pipes = self.pipes.lock().unwrap_or_else(|e| e.into_inner());
+            // A handshake still in flight when shutdown began must not resurrect
+            // a pipe the drain already swept. Checking under the same lock the
+            // drain takes makes this race-free in both orders: either we insert
+            // and shutdown closes it, or shutdown wins and we refuse here.
+            if self.shutdown.load(Ordering::SeqCst) {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+                return;
+            }
             if pipes.contains_key(&peer) {
                 let winner_is_us = me <= peer; // whose dial survives
                 if we_dialled != winner_is_us {
