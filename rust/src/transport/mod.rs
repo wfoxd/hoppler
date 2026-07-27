@@ -45,6 +45,7 @@ pub mod lan;
 pub mod loopback;
 
 use std::fmt;
+use std::sync::Arc;
 
 /// How a peer is named *within one transport*. Opaque above this layer — a LAN
 /// instance name today, a rotating BLE advertisement id tomorrow. It is **not**
@@ -132,9 +133,29 @@ impl fmt::Display for TransportError {
 
 impl std::error::Error for TransportError {}
 
+/// The rule every rung applies to a local id and to any id arriving off the
+/// network. Rungs must agree, or code developed against one picks ids another
+/// refuses at runtime — and a `.` in particular splits differently on the two
+/// ends of a pipe, yielding one connection under two `PeerId`s.
+///
+/// Constrained by the strictest rung: a DNS label (mDNS instance/host name).
+pub fn is_valid_peer_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 63
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && !id.starts_with('-')
+        && !id.ends_with('-')
+}
+
 /// Where a transport delivers its events. `Send + Sync` because transports
 /// deliver from their own threads.
 pub type EventSink = Box<dyn Fn(TransportEvent) + Send + Sync>;
+
+/// A rung's internal handle on the sink. Shared rather than boxed so a delivery
+/// thread can clone it out and *release* the lock before calling — a sink that
+/// reacts by shutting the transport down must not deadlock against the
+/// revocation lock.
+pub(crate) type SharedSink = Arc<dyn Fn(TransportEvent) + Send + Sync>;
 
 /// A rung of the transport ladder. See the module docs for the contract every
 /// implementation must honour.

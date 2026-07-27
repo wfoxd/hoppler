@@ -15,8 +15,9 @@
 //!   `Received` breaks on a real radio; here it breaks in a unit test instead.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread;
 
 use super::{EventSink, PeerId, Transport, TransportError, TransportEvent, TransportLimits};
@@ -71,21 +72,35 @@ impl LoopbackNet {
     /// Join the airspace as `id`, delivering events to `sink`.
     pub fn join(&self, id: impl Into<PeerId>, sink: EventSink) -> LoopbackTransport {
         let id = id.into();
+        assert!(
+            super::is_valid_peer_id(&id),
+            "loopback id {id:?} is not a legal peer id — rungs must agree on this, \
+             or code developed here picks ids the LAN/BLE rungs refuse"
+        );
         let (tx, rx) = channel::<TransportEvent>();
         // The sink is revocable: dropping the sender alone is not enough,
         // because a Receiver keeps draining whatever was already queued — so
         // events could still land after shutdown returned (contract rule 6).
-        let sink = Arc::new(RwLock::new(Some(sink)));
+        let sink: Arc<RwLock<Option<super::SharedSink>>> =
+            Arc::new(RwLock::new(Some(Arc::from(sink))));
+        let revoked = Arc::new(AtomicBool::new(false));
+        let dispatch_thread: Arc<OnceLock<thread::ThreadId>> = Arc::new(OnceLock::new());
         let delivery_sink = Arc::clone(&sink);
+        let delivery_revoked = Arc::clone(&revoked);
+        let delivery_id = Arc::clone(&dispatch_thread);
         // Deliver on our own thread: no Transport method may call the sink
         // before it returns (contract rule 1).
         thread::spawn(move || {
+            let _ = delivery_id.set(thread::current().id());
             while let Ok(event) = rx.recv() {
-                if let Some(s) = delivery_sink
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .as_ref()
-                {
+                // Guard held across the call so `shutdown` on another thread
+                // waits for an in-flight delivery before revoking; `revoked`
+                // covers the reentrant case (see `revoke`).
+                let guard = delivery_sink.read().unwrap_or_else(|e| e.into_inner());
+                if delivery_revoked.load(Ordering::SeqCst) {
+                    continue;
+                }
+                if let Some(s) = guard.as_ref() {
                     s(event);
                 }
             }
@@ -111,6 +126,9 @@ impl LoopbackNet {
             id: Mutex::new(id),
             net: self.clone(),
             sink,
+            revoked,
+            dispatch_thread,
+            dead: AtomicBool::new(false),
         }
     }
 
@@ -144,10 +162,26 @@ pub struct LoopbackTransport {
     net: LoopbackNet,
     /// Cleared under the write lock by `shutdown`, so an event already queued
     /// cannot still be delivered afterwards.
-    sink: Arc<RwLock<Option<EventSink>>>,
+    sink: Arc<RwLock<Option<super::SharedSink>>>,
+    revoked: Arc<AtomicBool>,
+    dispatch_thread: Arc<OnceLock<thread::ThreadId>>,
+    /// Set by `shutdown`; every mutating method refuses afterwards so a dead
+    /// node can never touch a live peer's state (contract rule 6).
+    dead: AtomicBool,
 }
 
 impl LoopbackTransport {
+    /// Refuse anything mutating once shut down: otherwise a dead node still
+    /// reaches into the shared airspace and mutates *live* peers.
+    fn alive(&self) -> Result<(), TransportError> {
+        if self.dead.load(Ordering::SeqCst) {
+            return Err(TransportError::Unavailable(
+                "transport has shut down".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn id(&self) -> PeerId {
         self.id.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
@@ -158,6 +192,10 @@ impl Transport for LoopbackTransport {
         "loopback"
     }
 
+    fn is_available(&self) -> bool {
+        !self.dead.load(Ordering::SeqCst)
+    }
+
     fn limits(&self) -> TransportLimits {
         TransportLimits {
             max_advertising_payload: MAX_ADVERTISING_PAYLOAD,
@@ -166,6 +204,10 @@ impl Transport for LoopbackTransport {
     }
 
     fn set_local_id(&self, new_id: &str) -> Result<(), TransportError> {
+        self.alive()?;
+        if !super::is_valid_peer_id(new_id) {
+            return Err(TransportError::Unavailable("illegal peer id".into()));
+        }
         let mut id = self.id.lock().unwrap_or_else(|e| e.into_inner());
         if *id == new_id {
             return Ok(());
@@ -177,6 +219,13 @@ impl Transport for LoopbackTransport {
         if state.nodes.get(&*id).is_some_and(|n| !n.pipes.is_empty()) {
             return Err(TransportError::Unavailable(
                 "cannot rotate the local id while pipes are open".into(),
+            ));
+        }
+        // Taking a name already in the airspace would drop that node's sender
+        // and leave its transport permanently deaf with no error anywhere.
+        if state.nodes.contains_key(new_id) {
+            return Err(TransportError::Unavailable(
+                "that id is already in use".into(),
             ));
         }
         let Some(node) = state.nodes.remove(&*id) else {
@@ -205,6 +254,7 @@ impl Transport for LoopbackTransport {
     }
 
     fn start_advertising(&self, payload: Vec<u8>) -> Result<(), TransportError> {
+        self.alive()?;
         if payload.len() > MAX_ADVERTISING_PAYLOAD {
             return Err(TransportError::PayloadTooLarge {
                 max: MAX_ADVERTISING_PAYLOAD,
@@ -229,6 +279,7 @@ impl Transport for LoopbackTransport {
     }
 
     fn stop_advertising(&self) -> Result<(), TransportError> {
+        self.alive()?;
         let me = self.id();
         let mut state = self.net.lock();
         let was = state.nodes.get_mut(&me).and_then(|n| n.advertising.take());
@@ -241,6 +292,7 @@ impl Transport for LoopbackTransport {
     }
 
     fn start_scanning(&self) -> Result<(), TransportError> {
+        self.alive()?;
         let me = self.id();
         let mut state = self.net.lock();
         let Some(node) = state.nodes.get_mut(&me) else {
@@ -261,6 +313,7 @@ impl Transport for LoopbackTransport {
     }
 
     fn stop_scanning(&self) -> Result<(), TransportError> {
+        self.alive()?;
         let me = self.id();
         if let Some(node) = self.net.lock().nodes.get_mut(&me) {
             node.scanning = false;
@@ -269,6 +322,7 @@ impl Transport for LoopbackTransport {
     }
 
     fn connect(&self, peer: &str) -> Result<(), TransportError> {
+        self.alive()?;
         let me = self.id();
         let mut state = self.net.lock();
         if !state.nodes.contains_key(peer) {
@@ -303,6 +357,7 @@ impl Transport for LoopbackTransport {
     }
 
     fn send(&self, peer: &str, bytes: &[u8]) -> Result<(), TransportError> {
+        self.alive()?;
         let me = self.id();
         // The whole send happens under one lock, so concurrent sends to the
         // same peer can never interleave their chunks (contract rule 3).
@@ -328,6 +383,7 @@ impl Transport for LoopbackTransport {
     }
 
     fn disconnect(&self, peer: &str) -> Result<(), TransportError> {
+        self.alive()?;
         let me = self.id();
         let mut state = self.net.lock();
         let mut closed = false;
@@ -378,16 +434,39 @@ impl Transport for LoopbackTransport {
     }
 
     fn shutdown(&self) {
-        let me = self.id();
-        let peers = self.pipes();
-        for p in peers {
-            let _ = self.disconnect(&p);
+        if self.dead.swap(true, Ordering::SeqCst) {
+            return;
         }
-        let _ = self.stop_advertising();
-        let _ = self.stop_scanning();
+        let me = self.id();
+        // The public methods now refuse once `dead` is set, so tear down
+        // directly here.
+        let mut state = self.net.lock();
+        let peers = state
+            .nodes
+            .get(&me)
+            .map(|n| n.pipes.clone())
+            .unwrap_or_default();
+        for p in &peers {
+            if let Some(node) = state.nodes.get_mut(p) {
+                node.pipes.retain(|x| x != &me);
+            }
+            state.post(p, TransportEvent::PipeClosed { peer: me.clone() });
+        }
+        let was_advertising = state.nodes.get_mut(&me).and_then(|n| n.advertising.take());
+        if was_advertising.is_some() {
+            for w in state.scanners_other_than(&me) {
+                state.post(&w, TransportEvent::PeerLost { peer: me.clone() });
+            }
+        }
+        drop(state);
         // Revoke first, then drop the sender: anything still queued finds no
         // sink, so nothing escapes after we return (contract rule 6).
-        *self.sink.write().unwrap_or_else(|e| e.into_inner()) = None;
+        self.revoked.store(true, Ordering::SeqCst);
+        if self.dispatch_thread.get() != Some(&thread::current().id()) {
+            // Waits for an in-flight delivery to finish; skipped when the sink
+            // itself called shutdown, which already read-holds this lock.
+            *self.sink.write().unwrap_or_else(|e| e.into_inner()) = None;
+        }
         self.net.lock().nodes.remove(&me);
     }
 }

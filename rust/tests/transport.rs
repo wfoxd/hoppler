@@ -162,9 +162,16 @@ fn conformance(p: Pair) {
     b.send(&id_a, b"pong").unwrap();
     assert_eq!(received_bytes(&rx_a, 4), b"pong", "{}: b→a", a.name());
 
-    // Rule: a peer that dialled us is dialable back without re-discovery.
+    // Rule 5: a peer that dialled us is dialable back without re-discovery.
+    // b must NOT already hold the pipe here — otherwise connect takes the
+    // already-open fast path and never consults its address book, and this
+    // passes on a rung that records no address at all.
+    b.disconnect(&id_a).unwrap();
+    closed(&rx_b, &id_a);
+    closed(&rx_a, &id_b);
     b.connect(&id_a).unwrap();
     opened(&rx_b, &id_a);
+    opened(&rx_a, &id_b);
 
     // Rule: connecting an already-open pipe still announces it, so a caller
     // awaiting PipeOpened never hangs.
@@ -197,22 +204,92 @@ fn conformance(p: Pair) {
         |e| matches!(e, TransportEvent::PipeFailed { peer, .. } if peer == "ghost"),
     );
 
+    // Rule 3: concurrent sends to one peer never interleave. Checked on every
+    // rung — the LAN write mutex had no coverage while this lived in a
+    // loopback-only test.
+    a.connect(&id_b).unwrap();
+    opened(&rx_a, &id_b);
+    const CHUNK: usize = 8 * 1024;
+    std::thread::scope(|scope| {
+        for v in [1u8, 2u8] {
+            let a = &a;
+            let id_b = &id_b;
+            scope.spawn(move || a.send(id_b, &vec![v; CHUNK]).unwrap());
+        }
+    });
+    let got = received_bytes(&rx_b, 2 * CHUNK);
+    let transitions = got.windows(2).filter(|w| w[0] != w[1]).count();
+    assert_eq!(
+        transitions,
+        1,
+        "{}: sends interleaved ({transitions} transitions, expected 1)",
+        a.name()
+    );
+    a.disconnect(&id_b).unwrap();
+    closed(&rx_a, &id_b);
+    closed(&rx_b, &id_a);
+
+    // Rule 4: with no pipe open, rotating the local id is a real rotation —
+    // the old name goes and the new one arrives.
+    if discovery_works {
+        b.start_advertising(b"rot".to_vec()).unwrap();
+        wait_for(
+            &rx_a,
+            |e| matches!(e, TransportEvent::PeerFound { peer, .. } if peer == &id_b),
+        );
+        let rotated = format!("{id_b}-rot");
+        b.set_local_id(&rotated).unwrap();
+        wait_for(
+            &rx_a,
+            |e| matches!(e, TransportEvent::PeerLost { peer } if peer == &id_b),
+        );
+        wait_for(
+            &rx_a,
+            |e| matches!(e, TransportEvent::PeerFound { peer, .. } if peer == &rotated),
+        );
+    }
+
     // Rule: stop_advertising makes us undiscoverable, and scanners hear about it.
     b.stop_advertising().unwrap();
     if discovery_works {
         wait_for(
             &rx_a,
-            |e| matches!(e, TransportEvent::PeerLost { peer } if peer == &id_b),
+            |e| matches!(e, TransportEvent::PeerLost { peer } if peer.starts_with(&id_b)),
         );
     }
 
-    // Rule: after shutdown the rung is silent and inert; shutdown is idempotent.
+    // Rule 6: after shutdown the rung is silent AND inert; shutdown is
+    // idempotent, and every mutating call refuses rather than half-working.
+    //
+    // Drain first: anything delivered *before* shutdown is legitimate, and
+    // leaving it queued would make the silence check below assert on history
+    // rather than on what shutdown actually guarantees.
+    while rx_a.try_recv().is_ok() {}
     a.shutdown();
     a.shutdown();
     if let Ok(e) = rx_a.recv_timeout(Duration::from_millis(300)) {
         panic!("{}: event after shutdown: {e:?}", a.name());
     }
-    assert!(a.send(&id_b, b"x").is_err());
+    assert!(
+        a.send(&id_b, b"x").is_err(),
+        "{}: send after shutdown",
+        a.name()
+    );
+    assert!(
+        a.connect(&id_b).is_err(),
+        "{}: connect after shutdown",
+        a.name()
+    );
+    assert!(
+        a.start_advertising(b"zombie".to_vec()).is_err(),
+        "{}: advertising after shutdown",
+        a.name()
+    );
+    assert!(
+        !a.is_available(),
+        "{}: is_available after shutdown",
+        a.name()
+    );
 }
 
 #[test]

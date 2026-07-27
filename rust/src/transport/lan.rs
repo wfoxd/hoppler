@@ -13,13 +13,13 @@
 //! it is opaque payload.
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener, TcpStream,
 };
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Sender};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -71,7 +71,13 @@ type Pipe = Arc<Mutex<TcpStream>>;
 /// `PipeClosed` for a pipe that is very much alive.
 struct PipeEntry {
     generation: u64,
-    stream: Pipe,
+    /// Serializes writes. Only `send` takes this.
+    write: Pipe,
+    /// An independent handle used *only* to tear the socket down. Deliberately
+    /// not behind the write mutex: teardown must be able to abort a write that
+    /// is currently blocked on a stalled peer, and anything that merely wants
+    /// to close a pipe must never queue behind that writer.
+    teardown: TcpStream,
 }
 
 struct Inner {
@@ -82,7 +88,14 @@ struct Inner {
     events: Sender<TransportEvent>,
     /// Cleared under the write lock by `shutdown`, so suppression is atomic
     /// with respect to a dispatch already in flight (contract rule 6).
-    sink: Arc<RwLock<Option<EventSink>>>,
+    sink: Arc<RwLock<Option<super::SharedSink>>>,
+    /// Set before revocation and checked under the read guard, so a sink that
+    /// is *about* to be called is stopped even when `shutdown` cannot take the
+    /// write lock (see `revoke`).
+    revoked: Arc<AtomicBool>,
+    /// Which thread runs the sink. `shutdown` called *from* a sink must not
+    /// block on the write lock that thread already read-holds.
+    dispatch_thread: Arc<OnceLock<thread::ThreadId>>,
     mdns: ServiceDaemon,
     port: u16,
     /// The address the listener actually bound, for the shutdown wake-up.
@@ -119,6 +132,18 @@ impl Inner {
             .clone()
     }
 
+    /// Stop delivering, and — unless we are *on* the dispatch thread — wait for
+    /// any call already in flight, so silence is exact once `shutdown` returns.
+    /// A sink that calls `shutdown` itself takes the reentrant path: it already
+    /// read-holds the lock, so taking the write lock here would deadlock.
+    fn revoke(&self) {
+        self.revoked.store(true, Ordering::SeqCst);
+        let on_dispatch = self.dispatch_thread.get() == Some(&thread::current().id());
+        if !on_dispatch {
+            *self.sink.write().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
     /// Register an open pipe and start its reader. Both the dialer and the
     /// accepter land here, so the two directions behave identically.
     ///
@@ -137,13 +162,12 @@ impl Inner {
         addr: Option<SocketAddr>,
         we_dialled: bool,
     ) {
-        let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
-        let read_half = match stream.try_clone() {
-            Ok(s) => s,
-            Err(e) => {
+        let (read_half, teardown) = match (stream.try_clone(), stream.try_clone()) {
+            (Ok(r), Ok(t)) => (r, t),
+            _ => {
                 self.emit(TransportEvent::PipeFailed {
                     peer,
-                    why: e.to_string(),
+                    why: "could not duplicate socket".into(),
                 });
                 return;
             }
@@ -168,18 +192,25 @@ impl Inner {
                     return;
                 }
                 if let Some(old) = pipes.remove(&peer) {
-                    if let Ok(s) = old.stream.lock() {
-                        let _ = s.shutdown(std::net::Shutdown::Both);
-                    }
+                    // Close via the teardown handle: the old writer may be
+                    // blocked holding its own write mutex.
+                    let _ = old.teardown.shutdown(std::net::Shutdown::Both);
                 }
             }
             pipes.insert(
                 peer.clone(),
                 PipeEntry {
                     generation,
-                    stream: Arc::new(Mutex::new(stream)),
+                    write: Arc::new(Mutex::new(stream)),
+                    teardown,
                 },
             );
+            // Emitted under the same guard as the insert, so {insert,
+            // PipeOpened} is atomic against {remove, PipeClosed}. Without this a
+            // concurrent disconnect could publish PipeClosed first and leave the
+            // caller believing a dead pipe is live, permanently. `emit` only
+            // enqueues, so holding the lock here is safe (rule 1).
+            self.emit(TransportEvent::PipeOpened { peer: peer.clone() });
         }
         // A peer that dialled us must be dialable back (contract rule 5).
         if let Some(addr) = addr {
@@ -195,17 +226,25 @@ impl Inner {
     }
 
     fn read_loop(self: Arc<Self>, peer: PeerId, mut stream: TcpStream, generation: u64) {
-        self.emit(TransportEvent::PipeOpened { peer: peer.clone() });
-
         let mut buf = vec![0u8; READ_CHUNK];
         loop {
             match stream.read(&mut buf) {
                 Ok(0) => break,  // peer hung up
                 Err(_) => break, // severed link
-                Ok(n) => self.emit(TransportEvent::Received {
-                    peer: peer.clone(),
-                    bytes: buf[..n].to_vec(),
-                }),
+                Ok(n) => {
+                    // Publish under the pipes guard, and only while we are still
+                    // the current pipe: otherwise a concurrent disconnect can
+                    // emit PipeClosed first and these bytes arrive for a peer
+                    // the caller has already torn down.
+                    let pipes = self.pipes.lock().unwrap_or_else(|e| e.into_inner());
+                    if pipes.get(&peer).is_none_or(|e| e.generation != generation) {
+                        return;
+                    }
+                    self.emit(TransportEvent::Received {
+                        peer: peer.clone(),
+                        bytes: buf[..n].to_vec(),
+                    });
+                }
             }
             if self.shutdown.load(Ordering::SeqCst) {
                 return; // shutdown() already reported the closure
@@ -214,14 +253,9 @@ impl Inner {
         // Tear down only the entry this reader owns. A newer pipe under the
         // same peer belongs to a newer reader, and killing it here would report
         // PipeClosed for a live connection — and then deliver Received after it.
-        let removed = {
-            let mut pipes = self.pipes.lock().unwrap_or_else(|e| e.into_inner());
-            match pipes.get(&peer) {
-                Some(entry) if entry.generation == generation => pipes.remove(&peer).is_some(),
-                _ => false,
-            }
-        };
-        if removed {
+        let mut pipes = self.pipes.lock().unwrap_or_else(|e| e.into_inner());
+        if pipes.get(&peer).is_some_and(|e| e.generation == generation) {
+            pipes.remove(&peer);
             self.emit(TransportEvent::PipeClosed { peer });
         }
     }
@@ -251,16 +285,27 @@ impl LanTransport {
 
         // The sink lives behind a lock the dispatch thread reads per event, so
         // `shutdown` can revoke it atomically rather than racing a check.
-        let sink = Arc::new(RwLock::new(Some(sink)));
+        let sink: Arc<RwLock<Option<super::SharedSink>>> =
+            Arc::new(RwLock::new(Some(Arc::from(sink))));
+        let revoked = Arc::new(AtomicBool::new(false));
+        let dispatch_thread: Arc<OnceLock<thread::ThreadId>> = Arc::new(OnceLock::new());
         let (events, rx) = channel::<TransportEvent>();
         let dispatch_sink = Arc::clone(&sink);
+        let dispatch_revoked = Arc::clone(&revoked);
+        let dispatch_id = Arc::clone(&dispatch_thread);
         thread::spawn(move || {
+            let _ = dispatch_id.set(thread::current().id());
             while let Ok(event) = rx.recv() {
-                if let Some(s) = dispatch_sink
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .as_ref()
-                {
+                // The guard is held ACROSS the call, so a `shutdown` on another
+                // thread blocks until this delivery finishes and then revokes —
+                // making "silent once shutdown returns" exact rather than
+                // best-effort. `revoked` covers the case where shutdown could
+                // not take the write lock because the sink itself called it.
+                let guard = dispatch_sink.read().unwrap_or_else(|e| e.into_inner());
+                if dispatch_revoked.load(Ordering::SeqCst) {
+                    continue;
+                }
+                if let Some(s) = guard.as_ref() {
                     s(event);
                 }
             }
@@ -270,6 +315,8 @@ impl LanTransport {
             local_id: Mutex::new(node_id),
             events,
             sink,
+            revoked,
+            dispatch_thread,
             mdns,
             port,
             local_addr,
@@ -285,6 +332,18 @@ impl LanTransport {
         let accept_inner = Arc::clone(&inner);
         thread::spawn(move || accept_loop(accept_inner, listener));
         Ok(Self { inner })
+    }
+
+    /// Refuse anything mutating once shut down: a dead rung must not dial
+    /// sockets, burn a peer's handshake budget, or return `Ok` for work it will
+    /// never do (contract rule 6).
+    fn alive(&self) -> Result<(), TransportError> {
+        if self.inner.shutdown.load(Ordering::SeqCst) {
+            return Err(TransportError::Unavailable(
+                "transport has shut down".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// The port this node listens on (useful in tests and diagnostics).
@@ -379,6 +438,50 @@ fn dial_race(candidates: &[SocketAddr]) -> Result<(TcpStream, SocketAddr), Trans
             Err(_) => return Err(last), // all dialers failed, or we ran out of time
         }
     }
+}
+
+/// Why a write could not be completed.
+enum WriteFailure {
+    /// Not a single byte reached the wire — safe for the caller to retry.
+    Stalled,
+    /// Some bytes were delivered before the failure. The stream is torn: a
+    /// retry would duplicate the prefix already sent.
+    Torn(String),
+}
+
+/// Write every byte, or fail saying whether anything was delivered.
+///
+/// The deadline is absolute and re-armed per syscall. `SO_SNDTIMEO` alone is
+/// per-`write`, so a peer accepting a trickle resets it indefinitely — the same
+/// trap as `SO_RCVTIMEO` on the read side, so both now count against a
+/// wall-clock deadline.
+fn write_all_by(stream: &mut TcpStream, buf: &[u8], deadline: Instant) -> Result<(), WriteFailure> {
+    let mut written = 0usize;
+    let fail = |written: usize, why: String| {
+        if written == 0 {
+            WriteFailure::Stalled
+        } else {
+            WriteFailure::Torn(why)
+        }
+    };
+    while written < buf.len() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(fail(written, "write deadline exceeded".into()));
+        }
+        if stream.set_write_timeout(Some(left)).is_err() {
+            return Err(fail(written, "could not arm write timeout".into()));
+        }
+        match stream.write(&buf[written..]) {
+            Ok(0) => return Err(fail(written, "peer closed during write".into())),
+            Ok(n) => written += n,
+            // Loop; the deadline check above decides when to give up.
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => return Err(fail(written, e.to_string())),
+        }
+    }
+    Ok(())
 }
 
 /// `[len][node_id][listen_port:2]`.
@@ -483,18 +586,13 @@ fn dial_candidates(info: &mdns_sd::ResolvedService) -> Vec<SocketAddr> {
 /// `.` to recover the peer id, so `"a.b"` would be seen as `"a"` by the scanner
 /// and `"a.b"` by the hello — the same pipe under two ids on the two ends.
 fn check_label(id: &str) -> Result<(), TransportError> {
-    if id.is_empty() || id.len() > 63 {
-        return Err(unavailable("node_id must be 1..=63 bytes"));
+    if super::is_valid_peer_id(id) {
+        Ok(())
+    } else {
+        Err(unavailable(
+            "id must be 1..=63 chars, alphanumeric or '-', not leading/trailing '-'",
+        ))
     }
-    // The id also becomes a hostname label (`{id}.local.`), where only
-    // alphanumerics and '-' are valid, and '-' may not lead or trail.
-    if !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
-        return Err(unavailable("node_id must be alphanumeric or '-'"));
-    }
-    if id.starts_with('-') || id.ends_with('-') {
-        return Err(unavailable("node_id must not start or end with '-'"));
-    }
-    Ok(())
 }
 
 fn accept_loop(inner: Arc<Inner>, listener: TcpListener) {
@@ -609,6 +707,7 @@ impl Transport for LanTransport {
     }
 
     fn start_advertising(&self, payload: Vec<u8>) -> Result<(), TransportError> {
+        self.alive()?;
         let id = self.inner.id();
         self.publish(&id, &payload)?;
         *self
@@ -636,6 +735,7 @@ impl Transport for LanTransport {
     }
 
     fn start_scanning(&self) -> Result<(), TransportError> {
+        self.alive()?;
         // Hold the flag lock across the browse call so a concurrent stop can't
         // leave us multicasting with scanning reported as off.
         let mut scanning = self
@@ -725,6 +825,7 @@ impl Transport for LanTransport {
     }
 
     fn connect(&self, peer: &str) -> Result<(), TransportError> {
+        self.alive()?;
         // Already open: still announce it, so a caller awaiting PipeOpened after
         // connect never hangs (contract rule 2).
         if self
@@ -770,32 +871,45 @@ impl Transport for LanTransport {
             let pipes = self.inner.pipes.lock().unwrap_or_else(|e| e.into_inner());
             pipes
                 .get(peer)
-                .map(|e| Arc::clone(&e.stream))
+                .map(|e| Arc::clone(&e.write))
                 .ok_or_else(|| TransportError::NoSuchPeer(peer.to_string()))?
         };
         // Hold the per-pipe lock across the whole write so concurrent sends to
         // one peer can't interleave their bytes (contract rule 3).
         let mut stream = pipe.lock().unwrap_or_else(|e| e.into_inner());
-        stream.write_all(bytes).map_err(|e| match e.kind() {
-            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
-                TransportError::WouldBlock
+        match write_all_by(&mut stream, bytes, Instant::now() + WRITE_TIMEOUT) {
+            Ok(()) => Ok(()),
+            // Nothing reached the wire, so a retry is safe — the only case that
+            // may report WouldBlock.
+            Err(WriteFailure::Stalled) => Err(TransportError::WouldBlock),
+            // Bytes were already delivered. Retrying would duplicate a prefix
+            // and desync the framer above us, so the pipe is unrecoverable:
+            // tear it down and report a hard error instead of inviting a retry.
+            Err(WriteFailure::Torn(why)) => {
+                drop(stream);
+                let _ = self.disconnect(peer);
+                Err(TransportError::Io(why))
             }
-            _ => io_err(e),
-        })
+        }
     }
 
     fn disconnect(&self, peer: &str) -> Result<(), TransportError> {
         let removed = {
             let mut pipes = self.inner.pipes.lock().unwrap_or_else(|e| e.into_inner());
-            pipes.remove(peer)
+            let entry = pipes.remove(peer);
+            if entry.is_some() {
+                // Under the guard, so it cannot be reordered before a
+                // concurrent adopt's PipeOpened.
+                self.inner.emit(TransportEvent::PipeClosed {
+                    peer: peer.to_string(),
+                });
+            }
+            entry
         };
         if let Some(entry) = removed {
-            if let Ok(s) = entry.stream.lock() {
-                let _ = s.shutdown(std::net::Shutdown::Both);
-            }
-            self.inner.emit(TransportEvent::PipeClosed {
-                peer: peer.to_string(),
-            });
+            // The teardown handle is never locked, so this aborts a write that
+            // is currently blocked instead of queueing behind it.
+            let _ = entry.teardown.shutdown(std::net::Shutdown::Both);
         }
         Ok(())
     }
@@ -826,19 +940,15 @@ impl Transport for LanTransport {
         }
         let _ = self.stop_advertising();
         let _ = self.stop_scanning();
-        let pipes: Vec<Pipe> = {
+        let pipes: Vec<TcpStream> = {
             let mut guard = self.inner.pipes.lock().unwrap_or_else(|e| e.into_inner());
-            guard.drain().map(|(_, e)| e.stream).collect()
+            guard.drain().map(|(_, e)| e.teardown).collect()
         };
-        for p in pipes {
-            if let Ok(s) = p.lock() {
-                let _ = s.shutdown(std::net::Shutdown::Both);
-            }
+        for s in pipes {
+            let _ = s.shutdown(std::net::Shutdown::Both);
         }
         let _ = self.inner.mdns.shutdown();
-        // Revoke the sink under the write lock: any event already dequeued but
-        // not yet delivered finds None, so no event escapes after we return.
-        *self.inner.sink.write().unwrap_or_else(|e| e.into_inner()) = None;
+        self.inner.revoke();
         // Unblock the accept loop, which exits on the shutdown flag. Dial the
         // address the listener actually bound — assuming v4-mapped dual stack
         // leaves the thread blocked forever where the OS doesn't provide it.
