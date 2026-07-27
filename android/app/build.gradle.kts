@@ -38,6 +38,13 @@ android {
     }
 }
 
+dependencies {
+    // JVM unit tests for the adapter's radio-free logic (framing, id
+    // validation, the sighting decision). BLE behaviour still needs two
+    // phones; parsing a byte array does not.
+    testImplementation("junit:junit:4.13.2")
+}
+
 kotlin {
     compilerOptions {
         jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17

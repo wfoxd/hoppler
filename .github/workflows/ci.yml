@@ -52,6 +52,10 @@ jobs:
       - uses: subosito/flutter-action@v2
         with: { flutter-version: "${{ env.FLUTTER_VERSION }}", channel: stable, cache: true }
       - run: flutter build apk --debug
+      # The adapter's radio-free logic (framing, peer-id validation, the
+      # sighting decision). BLE itself needs two phones; these do not, and two
+      # of the three defects review found in the adapter were exactly this kind.
+      - run: cd android && ./gradlew :app:testDebugUnitTest
 
   linux:
     runs-on: ubuntu-latest

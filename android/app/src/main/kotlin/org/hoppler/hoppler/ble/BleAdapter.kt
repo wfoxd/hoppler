@@ -89,12 +89,9 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
     /** Open pipes: id → socket and its serialised writer. */
     private val pipes = ConcurrentHashMap<String, Pipe>()
 
-    // Not a data class: a generated equals() over a ByteArray compares by
-    // reference, which is exactly the wrong answer for the payload.
     private class Sighting(
         val device: BluetoothDevice,
-        val psm: Int,
-        val payload: ByteArray,
+        val advert: BleFraming.Advert,
         var lastSeen: Long
     )
 
@@ -182,45 +179,6 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
 
     // ── advertising ─────────────────────────────────────────────────────────
 
-    /**
-     * Service data is `[psm:2][idLen:1][id][payload]`. The PSM travels in the
-     * advertisement so a scanner can dial without a GATT round-trip, and the id
-     * travels because the MAC address rotates underneath us (§5.4).
-     */
-    private fun frame(localId: String, payload: ByteArray): ByteArray {
-        val id = localId.toByteArray(Charsets.US_ASCII)
-        require(id.size in 1..63) { "local id must be 1..63 bytes" }
-        return ByteArray(3 + id.size + payload.size).also {
-            it[0] = (localPsm shr 8).toByte()
-            it[1] = (localPsm and 0xFF).toByte()
-            it[2] = id.size.toByte()
-            id.copyInto(it, 3)
-            payload.copyInto(it, 3 + id.size)
-        }
-    }
-
-    private fun unframe(data: ByteArray): Triple<String, Int, ByteArray>? {
-        if (data.size < 3) return null
-        val psm = ((data[0].toInt() and 0xFF) shl 8) or (data[1].toInt() and 0xFF)
-        val idLen = data[2].toInt() and 0xFF
-        if (idLen == 0 || data.size < 3 + idLen) return null
-        val id = String(data, 3, idLen, Charsets.US_ASCII)
-        // An advertisement is whatever a stranger chose to broadcast. The core
-        // drops ids it does not like, but an unfiltered one would still land in
-        // `seen` on the way there — so anyone in radio range could grow that
-        // map without limit. Enforce the rule here too (§5.4).
-        if (!isValidPeerId(id)) return null
-        return Triple(id, psm, data.copyOfRange(3 + idLen, data.size))
-    }
-
-    /** The core's rule, mirrored: ASCII alphanumeric and `-`, 1..63, no edges. */
-    private fun isValidPeerId(id: String): Boolean =
-        id.isNotEmpty() &&
-            id.length <= 63 &&
-            !id.startsWith('-') &&
-            !id.endsWith('-') &&
-            id.all { (it.isLetterOrDigit() && it.code < 128) || it == '-' }
-
     @SuppressLint("MissingPermission")
     private fun startAdvertising(payload: ByteArray, result: MethodChannel.Result) {
         val localId = this.localId
@@ -243,7 +201,7 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
                 "this device has no LE extended advertising; Hoppler needs it to carry a persona"
             )
         }
-        val body = frame(localId, payload)
+        val body = BleFraming.frame(localPsm, localId, payload)
         // 18 bytes of service-data AD overhead; see MAX_ADVERTISING_PAYLOAD.
         if (body.size + 18 > bt.leMaximumAdvertisingDataLength) {
             return fail(
@@ -311,18 +269,17 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
         val callback = object : ScanCallback() {
             override fun onScanResult(callbackType: Int, sr: ScanResult?) {
                 val data = sr?.scanRecord?.getServiceData(SERVICE_PARCEL) ?: return
-                val (id, psm, payload) = unframe(data) ?: return
+                val advert = BleFraming.unframe(data) ?: return
                 val now = System.currentTimeMillis()
-                val previous = seen.put(id, Sighting(sr.device, psm, payload, now))
-                // PeerFound is "latest known", so a repeat of the same
-                // advertisement is noise — but a *changed* payload is the
-                // persona changing and must get through. Comparing only the
-                // PSM would strand the core on stale persona data.
-                val changed = previous == null ||
-                    previous.psm != psm ||
-                    !previous.payload.contentEquals(payload)
-                if (changed) {
-                    emit(mapOf("type" to "peerFound", "peer" to id, "payload" to payload))
+                val previous = seen.put(advert.id, Sighting(sr.device, advert, now))
+                if (BleFraming.isNews(previous?.advert, advert)) {
+                    emit(
+                        mapOf(
+                            "type" to "peerFound",
+                            "peer" to advert.id,
+                            "payload" to advert.payload
+                        )
+                    )
                 }
             }
 
@@ -446,7 +403,7 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
         ok(result)
         io.execute {
             try {
-                val socket = sighting.device.createInsecureL2capChannel(sighting.psm)
+                val socket = sighting.device.createInsecureL2capChannel(sighting.advert.psm)
                 socket.connect()
                 val id = (localId ?: "").toByteArray(Charsets.US_ASCII)
                 socket.outputStream.apply {
