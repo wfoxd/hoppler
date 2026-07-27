@@ -489,6 +489,48 @@ fn rotating_the_local_id_is_visible_as_a_new_peer() {
     );
 }
 
+/// Rotation and advertising both touch the id and the advertised record. Taking
+/// those two locks in opposite orders deadlocks — and a deadlock hangs the suite
+/// rather than failing it, so this races them under a bounded wait.
+#[test]
+fn rotating_while_advertising_does_not_deadlock() {
+    let (sink, _rx) = recorder();
+    let t = std::sync::Arc::new(LanTransport::new("lock-order", sink).unwrap());
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+
+    let mut threads = Vec::new();
+    for (i, job) in [0u8, 1].into_iter().enumerate() {
+        let (t, stop, done_tx) = (t.clone(), stop.clone(), done_tx.clone());
+        threads.push(std::thread::spawn(move || {
+            let mut n = 0u32;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) && n < 300 {
+                if job == 0 {
+                    let _ = t.set_local_id(&format!("rot-{i}-{n}"));
+                } else {
+                    let _ = t.start_advertising(b"x".to_vec());
+                    let _ = t.stop_advertising();
+                }
+                n += 1;
+            }
+            let _ = done_tx.send(());
+        }));
+    }
+    drop(done_tx);
+
+    // Both halves must report in; a missing report means one is wedged.
+    for _ in 0..2 {
+        done_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("rotation deadlocked against advertising");
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for h in threads {
+        h.join().unwrap();
+    }
+    t.shutdown();
+}
+
 #[test]
 fn lan_reassembles_a_large_payload_in_order() {
     let (sink_a, _rx_a) = recorder();

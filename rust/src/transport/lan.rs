@@ -80,6 +80,10 @@ struct PipeEntry {
     teardown: TcpStream,
 }
 
+/// Lock order, where more than one is held: **`local_id` → `advertising` →
+/// `peers` → `pipes`**. `set_local_id` and `start_advertising` both need the
+/// first two, and taking them in opposite orders deadlocks a rotation against a
+/// concurrent advertise.
 struct Inner {
     /// How we appear to peers. Rotatable (tech spec §4), so behind a lock.
     local_id: Mutex<PeerId>,
@@ -741,15 +745,21 @@ impl Transport for LanTransport {
 
     fn start_advertising(&self, payload: Vec<u8>) -> Result<(), TransportError> {
         self.alive()?;
-        // Hold the guard across the mDNS call so start/stop are linearizable:
-        // otherwise a concurrent stop can unregister a record published a
+        // Lock order: local_id before advertising (see `Inner`). Holding the
+        // advertising guard across the mDNS call keeps start/stop linearizable
+        // — otherwise a concurrent stop can unregister a record published a
         // moment later, leaving us silent while reporting that we advertise.
+        let id = self
+            .inner
+            .local_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let mut advertising = self
             .inner
             .advertising
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let id = self.inner.id();
         self.publish(&id, &payload)?;
         *advertising = Some(payload);
         Ok(())
@@ -757,6 +767,13 @@ impl Transport for LanTransport {
 
     fn stop_advertising(&self) -> Result<(), TransportError> {
         self.alive()?;
+        // Lock order: local_id before advertising (see `Inner`).
+        let id = self
+            .inner
+            .local_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let mut advertising = self
             .inner
             .advertising
@@ -767,7 +784,7 @@ impl Transport for LanTransport {
             // answers is the failure mode this ordering exists to prevent.
             self.inner
                 .mdns
-                .unregister(&Self::fullname(&self.inner.id()))
+                .unregister(&Self::fullname(&id))
                 .map_err(unavailable)?;
             *advertising = None;
         }
