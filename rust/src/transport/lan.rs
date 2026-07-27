@@ -174,6 +174,18 @@ impl Inner {
         };
         let me = self.id();
         let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
+
+        // Record the address BEFORE announcing the pipe. PipeOpened is emitted
+        // under the pipes guard below, so a caller that reacts to it by dialling
+        // back would otherwise race an address book that is still empty —
+        // rule 5 must hold the moment the event is observable.
+        if let Some(addr) = addr {
+            let mut peers = self.peers.lock().unwrap_or_else(|e| e.into_inner());
+            let known = peers.entry(peer.clone()).or_default();
+            if !known.contains(&addr) {
+                known.push(addr);
+            }
+        }
         {
             let mut pipes = self.pipes.lock().unwrap_or_else(|e| e.into_inner());
             // A handshake still in flight when shutdown began must not resurrect
@@ -211,14 +223,6 @@ impl Inner {
             // caller believing a dead pipe is live, permanently. `emit` only
             // enqueues, so holding the lock here is safe (rule 1).
             self.emit(TransportEvent::PipeOpened { peer: peer.clone() });
-        }
-        // A peer that dialled us must be dialable back (contract rule 5).
-        if let Some(addr) = addr {
-            let mut peers = self.peers.lock().unwrap_or_else(|e| e.into_inner());
-            let known = peers.entry(peer.clone()).or_default();
-            if !known.contains(&addr) {
-                known.push(addr);
-            }
         }
 
         let inner = Arc::clone(self);
