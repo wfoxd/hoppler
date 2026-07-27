@@ -1,49 +1,95 @@
 //! An in-process transport: a shared "airspace" several nodes join, discover
-//! each other in, and exchange bytes over — with no sockets, no radios, and no
-//! timing nondeterminism.
+//! each other in, and exchange bytes over — with no sockets and no radios.
 //!
 //! This is not a mock of the trait; it is a real implementation of it, which is
-//! what makes it useful: the session layer (T10) can drive Noise handshakes and
-//! framing over it in a unit test and get the same semantics a radio gives —
-//! ordered, reliable, unframed bytes — deterministically and in microseconds.
+//! what makes it useful: the session layer (T10) can drive Noise handshakes
+//! over it in a unit test and get the same semantics a radio gives — ordered,
+//! reliable, *unframed* bytes delivered on a transport thread.
+//!
+//! Two details exist specifically to stop callers developing habits a radio
+//! will punish:
+//! - Events are delivered on a per-node thread, never on the caller's (contract
+//!   rule 1), so code written here doesn't assume synchronous callbacks.
+//! - [`LoopbackNet::with_max_chunk`] splits sends, because a rung is free to
+//!   fragment and BLE's MTU will. Code that assumes one `send` yields one
+//!   `Received` breaks on a real radio; here it breaks in a unit test instead.
 
 use std::collections::HashMap;
+use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
+use std::thread;
 
-use super::{EventSink, PeerId, Transport, TransportError, TransportEvent};
+use super::{EventSink, PeerId, Transport, TransportError, TransportEvent, TransportLimits};
 
-#[derive(Default)]
+/// Loopback carries anything; the cap only exists so the value is finite.
+const MAX_ADVERTISING_PAYLOAD: usize = 64 * 1024;
+
 struct Node {
-    sink: Option<Arc<EventSink>>,
+    /// Delivery queue for this node's sink, drained by its own thread.
+    tx: Option<Sender<TransportEvent>>,
     advertising: Option<Vec<u8>>,
     scanning: bool,
     pipes: Vec<PeerId>,
 }
 
-#[derive(Default)]
 struct NetState {
     nodes: HashMap<PeerId, Node>,
+    max_chunk: Option<usize>,
 }
 
 /// A shared airspace. Clone it to hand the same airspace to several nodes.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct LoopbackNet {
     state: Arc<Mutex<NetState>>,
 }
 
+impl Default for LoopbackNet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LoopbackNet {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            state: Arc::new(Mutex::new(NetState {
+                nodes: HashMap::new(),
+                max_chunk: None,
+            })),
+        }
+    }
+
+    /// An airspace that splits every send into chunks of at most `n` bytes —
+    /// the deliberate analogue of an MTU, so callers cannot rely on message
+    /// boundaries the contract doesn't promise.
+    pub fn with_max_chunk(n: usize) -> Self {
+        let net = Self::new();
+        net.lock().max_chunk = Some(n.max(1));
+        net
     }
 
     /// Join the airspace as `id`, delivering events to `sink`.
     pub fn join(&self, id: impl Into<PeerId>, sink: EventSink) -> LoopbackTransport {
         let id = id.into();
-        let mut state = self.lock();
-        state.nodes.entry(id.clone()).or_default().sink = Some(Arc::new(sink));
-        drop(state);
+        let (tx, rx) = channel::<TransportEvent>();
+        // Deliver on our own thread: no Transport method may call the sink
+        // before it returns (contract rule 1).
+        thread::spawn(move || {
+            while let Ok(event) = rx.recv() {
+                sink(event);
+            }
+        });
+        self.lock().nodes.insert(
+            id.clone(),
+            Node {
+                tx: Some(tx),
+                advertising: None,
+                scanning: false,
+                pipes: Vec::new(),
+            },
+        );
         LoopbackTransport {
-            id,
+            id: Mutex::new(id),
             net: self.clone(),
         }
     }
@@ -53,36 +99,34 @@ impl LoopbackNet {
     }
 }
 
+impl NetState {
+    /// Queue an event for `peer`. Queuing under the lock is safe — the sink
+    /// runs on the node's own thread, not here.
+    fn post(&self, peer: &str, event: TransportEvent) {
+        if let Some(tx) = self.nodes.get(peer).and_then(|n| n.tx.as_ref()) {
+            let _ = tx.send(event);
+        }
+    }
+
+    fn scanners_other_than(&self, me: &str) -> Vec<PeerId> {
+        self.nodes
+            .iter()
+            .filter(|(id, n)| n.scanning && id.as_str() != me)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+}
+
 /// One node's view of the airspace.
 pub struct LoopbackTransport {
-    id: PeerId,
+    /// Mutable so the node can rotate how it appears (tech spec §4).
+    id: Mutex<PeerId>,
     net: LoopbackNet,
 }
 
 impl LoopbackTransport {
-    pub fn id(&self) -> &str {
-        &self.id
-    }
-
-    /// Queue a delivery to `peer`, to be dispatched *after* the net lock is
-    /// released — a transport must never call a sink while holding a lock.
-    fn collect(state: &NetState, peer: &str, event: TransportEvent) -> Option<Delivery> {
-        state
-            .nodes
-            .get(peer)
-            .and_then(|n| n.sink.clone())
-            .map(|sink| Delivery { sink, event })
-    }
-}
-
-struct Delivery {
-    sink: Arc<EventSink>,
-    event: TransportEvent,
-}
-
-fn dispatch(deliveries: Vec<Delivery>) {
-    for d in deliveries {
-        (d.sink)(d.event);
+    pub fn id(&self) -> PeerId {
+        self.id.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
@@ -91,159 +135,174 @@ impl Transport for LoopbackTransport {
         "loopback"
     }
 
-    fn start_advertising(&self, payload: Vec<u8>) -> Result<(), TransportError> {
-        let mut state = self.net.lock();
-        state.nodes.entry(self.id.clone()).or_default().advertising = Some(payload.clone());
+    fn limits(&self) -> TransportLimits {
+        TransportLimits {
+            max_advertising_payload: MAX_ADVERTISING_PAYLOAD,
+            preferred_write_size: self.net.lock().max_chunk.unwrap_or(16 * 1024),
+        }
+    }
 
-        // Everyone currently scanning sees us (a re-advertise refreshes them).
-        let watchers: Vec<PeerId> = state
-            .nodes
-            .iter()
-            .filter(|(id, n)| n.scanning && *id != &self.id)
-            .map(|(id, _)| id.clone())
-            .collect();
-        let deliveries: Vec<Delivery> = watchers
-            .iter()
-            .filter_map(|w| {
-                LoopbackTransport::collect(
-                    &state,
-                    w,
+    fn set_local_id(&self, new_id: &str) -> Result<(), TransportError> {
+        let mut id = self.id.lock().unwrap_or_else(|e| e.into_inner());
+        if *id == new_id {
+            return Ok(());
+        }
+        let mut state = self.net.lock();
+        let Some(node) = state.nodes.remove(&*id) else {
+            return Err(TransportError::Unavailable("node has shut down".into()));
+        };
+        // Scanners see the old name go and the new one arrive — which is the
+        // point: an observer must not be able to link the two.
+        let was_advertising = node.advertising.clone();
+        for w in state.scanners_other_than(&id) {
+            state.post(&w, TransportEvent::PeerLost { peer: id.clone() });
+        }
+        state.nodes.insert(new_id.to_string(), node);
+        if let Some(payload) = was_advertising {
+            for w in state.scanners_other_than(new_id) {
+                state.post(
+                    &w,
                     TransportEvent::PeerFound {
-                        peer: self.id.clone(),
+                        peer: new_id.to_string(),
                         payload: payload.clone(),
                     },
-                )
-            })
-            .collect();
-        drop(state);
-        dispatch(deliveries);
+                );
+            }
+        }
+        *id = new_id.to_string();
+        Ok(())
+    }
+
+    fn start_advertising(&self, payload: Vec<u8>) -> Result<(), TransportError> {
+        if payload.len() > MAX_ADVERTISING_PAYLOAD {
+            return Err(TransportError::PayloadTooLarge {
+                max: MAX_ADVERTISING_PAYLOAD,
+            });
+        }
+        let me = self.id();
+        let mut state = self.net.lock();
+        let Some(node) = state.nodes.get_mut(&me) else {
+            return Err(TransportError::Unavailable("node has shut down".into()));
+        };
+        node.advertising = Some(payload.clone());
+        for w in state.scanners_other_than(&me) {
+            state.post(
+                &w,
+                TransportEvent::PeerFound {
+                    peer: me.clone(),
+                    payload: payload.clone(),
+                },
+            );
+        }
         Ok(())
     }
 
     fn stop_advertising(&self) -> Result<(), TransportError> {
+        let me = self.id();
         let mut state = self.net.lock();
-        state.nodes.entry(self.id.clone()).or_default().advertising = None;
-
-        let watchers: Vec<PeerId> = state
-            .nodes
-            .iter()
-            .filter(|(id, n)| n.scanning && *id != &self.id)
-            .map(|(id, _)| id.clone())
-            .collect();
-        let deliveries: Vec<Delivery> = watchers
-            .iter()
-            .filter_map(|w| {
-                LoopbackTransport::collect(
-                    &state,
-                    w,
-                    TransportEvent::PeerLost {
-                        peer: self.id.clone(),
-                    },
-                )
-            })
-            .collect();
-        drop(state);
-        dispatch(deliveries);
+        let was = state.nodes.get_mut(&me).and_then(|n| n.advertising.take());
+        if was.is_some() {
+            for w in state.scanners_other_than(&me) {
+                state.post(&w, TransportEvent::PeerLost { peer: me.clone() });
+            }
+        }
         Ok(())
     }
 
     fn start_scanning(&self) -> Result<(), TransportError> {
+        let me = self.id();
         let mut state = self.net.lock();
-        state.nodes.entry(self.id.clone()).or_default().scanning = true;
-
+        let Some(node) = state.nodes.get_mut(&me) else {
+            return Err(TransportError::Unavailable("node has shut down".into()));
+        };
+        node.scanning = true;
         // Immediately see everyone already advertising.
         let seen: Vec<(PeerId, Vec<u8>)> = state
             .nodes
             .iter()
-            .filter(|(id, _)| *id != &self.id)
+            .filter(|(id, _)| id.as_str() != me)
             .filter_map(|(id, n)| n.advertising.clone().map(|p| (id.clone(), p)))
             .collect();
-        let deliveries: Vec<Delivery> = seen
-            .into_iter()
-            .filter_map(|(peer, payload)| {
-                LoopbackTransport::collect(
-                    &state,
-                    &self.id,
-                    TransportEvent::PeerFound { peer, payload },
-                )
-            })
-            .collect();
-        drop(state);
-        dispatch(deliveries);
+        for (peer, payload) in seen {
+            state.post(&me, TransportEvent::PeerFound { peer, payload });
+        }
         Ok(())
     }
 
     fn stop_scanning(&self) -> Result<(), TransportError> {
-        let mut state = self.net.lock();
-        state.nodes.entry(self.id.clone()).or_default().scanning = false;
+        let me = self.id();
+        if let Some(node) = self.net.lock().nodes.get_mut(&me) {
+            node.scanning = false;
+        }
         Ok(())
     }
 
     fn connect(&self, peer: &str) -> Result<(), TransportError> {
+        let me = self.id();
         let mut state = self.net.lock();
         if !state.nodes.contains_key(peer) {
+            state.post(
+                &me,
+                TransportEvent::PipeFailed {
+                    peer: peer.to_string(),
+                    why: "no such peer".into(),
+                },
+            );
             return Err(TransportError::NoSuchPeer(peer.to_string()));
         }
         for (a, b) in [
-            (self.id.clone(), peer.to_string()),
-            (peer.to_string(), self.id.clone()),
+            (me.clone(), peer.to_string()),
+            (peer.to_string(), me.clone()),
         ] {
-            let node = state.nodes.entry(a).or_default();
-            if !node.pipes.contains(&b) {
-                node.pipes.push(b);
+            if let Some(node) = state.nodes.get_mut(&a) {
+                if !node.pipes.contains(&b) {
+                    node.pipes.push(b);
+                }
             }
         }
-        // Both ends learn the pipe is open.
-        let deliveries: Vec<Delivery> = [self.id.as_str(), peer]
-            .iter()
-            .filter_map(|who| {
-                let other = if *who == self.id {
-                    peer
-                } else {
-                    self.id.as_str()
-                };
-                LoopbackTransport::collect(
-                    &state,
-                    who,
-                    TransportEvent::PipeOpened {
-                        peer: other.to_string(),
-                    },
-                )
-            })
-            .collect();
-        drop(state);
-        dispatch(deliveries);
+        // Always emitted, even if the pipe was already open (contract rule 2).
+        state.post(
+            &me,
+            TransportEvent::PipeOpened {
+                peer: peer.to_string(),
+            },
+        );
+        state.post(peer, TransportEvent::PipeOpened { peer: me.clone() });
         Ok(())
     }
 
     fn send(&self, peer: &str, bytes: &[u8]) -> Result<(), TransportError> {
+        let me = self.id();
+        // The whole send happens under one lock, so concurrent sends to the
+        // same peer can never interleave their chunks (contract rule 3).
         let state = self.net.lock();
         let open = state
             .nodes
-            .get(&self.id)
+            .get(&me)
             .is_some_and(|n| n.pipes.iter().any(|p| p == peer));
         if !open {
             return Err(TransportError::NoSuchPeer(peer.to_string()));
         }
-        let delivery = LoopbackTransport::collect(
-            &state,
-            peer,
-            TransportEvent::Received {
-                peer: self.id.clone(),
-                bytes: bytes.to_vec(),
-            },
-        );
-        drop(state);
-        dispatch(delivery.into_iter().collect());
+        let chunk = state.max_chunk.unwrap_or(usize::MAX).max(1);
+        for part in bytes.chunks(chunk) {
+            state.post(
+                peer,
+                TransportEvent::Received {
+                    peer: me.clone(),
+                    bytes: part.to_vec(),
+                },
+            );
+        }
         Ok(())
     }
 
     fn disconnect(&self, peer: &str) -> Result<(), TransportError> {
+        let me = self.id();
         let mut state = self.net.lock();
         let mut closed = false;
         for (a, b) in [
-            (self.id.clone(), peer.to_string()),
-            (peer.to_string(), self.id.clone()),
+            (me.clone(), peer.to_string()),
+            (peer.to_string(), me.clone()),
         ] {
             if let Some(node) = state.nodes.get_mut(&a) {
                 let before = node.pipes.len();
@@ -251,47 +310,52 @@ impl Transport for LoopbackTransport {
                 closed |= node.pipes.len() != before;
             }
         }
-        let deliveries: Vec<Delivery> = if closed {
-            [self.id.as_str(), peer]
-                .iter()
-                .filter_map(|who| {
-                    let other = if *who == self.id {
-                        peer
-                    } else {
-                        self.id.as_str()
-                    };
-                    LoopbackTransport::collect(
-                        &state,
-                        who,
-                        TransportEvent::PipeClosed {
-                            peer: other.to_string(),
-                        },
-                    )
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        drop(state);
-        dispatch(deliveries);
+        if closed {
+            state.post(
+                &me,
+                TransportEvent::PipeClosed {
+                    peer: peer.to_string(),
+                },
+            );
+            state.post(peer, TransportEvent::PipeClosed { peer: me.clone() });
+        }
         Ok(())
     }
 
+    fn peers(&self) -> Vec<PeerId> {
+        let me = self.id();
+        let state = self.net.lock();
+        if !state.nodes.get(&me).is_some_and(|n| n.scanning) {
+            return Vec::new();
+        }
+        state
+            .nodes
+            .iter()
+            .filter(|(id, n)| id.as_str() != me && n.advertising.is_some())
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    fn pipes(&self) -> Vec<PeerId> {
+        let me = self.id();
+        self.net
+            .lock()
+            .nodes
+            .get(&me)
+            .map(|n| n.pipes.clone())
+            .unwrap_or_default()
+    }
+
     fn shutdown(&self) {
-        let _ = self.stop_advertising();
-        let _ = self.stop_scanning();
-        let peers: Vec<PeerId> = {
-            let state = self.net.lock();
-            state
-                .nodes
-                .get(&self.id)
-                .map(|n| n.pipes.clone())
-                .unwrap_or_default()
-        };
+        let me = self.id();
+        let peers = self.pipes();
         for p in peers {
             let _ = self.disconnect(&p);
         }
-        self.net.lock().nodes.remove(&self.id);
+        let _ = self.stop_advertising();
+        let _ = self.stop_scanning();
+        // Dropping the sender ends the delivery thread.
+        self.net.lock().nodes.remove(&me);
     }
 }
 

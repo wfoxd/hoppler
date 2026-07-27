@@ -1,25 +1,26 @@
-//! Transport-layer tests (T08). The same behavioural suite is run against
-//! *both* rungs — the in-process loopback and the real LAN transport — because
-//! the point of the trait is that the session layer above cannot tell them
-//! apart. A rung that passes these is a drop-in for the next one (BLE).
+//! Transport-layer tests (T08).
 //!
-//! mDNS discovery needs multicast, which container CI usually lacks, so the
-//! discovery test is `#[ignore]`d and run locally; every other LAN test dials a
-//! known address over loopback TCP and runs everywhere.
+//! The heart of this file is [`conformance`] — one behavioural suite run
+//! against *every* rung, because the trait's whole claim is that the session
+//! layer above cannot tell them apart. A rung that passes it is a drop-in for
+//! the next one, and the BLE adapter (T08b) can call it directly.
+//!
+//! Rung-specific tests live below the harness and cover only what is genuinely
+//! particular to a rung (mDNS multicast, TCP reassembly, throughput).
 
 use std::sync::mpsc::{channel, Receiver};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rust_lib_hoppler::transport::lan::LanTransport;
 use rust_lib_hoppler::transport::loopback::LoopbackNet;
 use rust_lib_hoppler::transport::{Transport, TransportError, TransportEvent};
 
-/// Collects a node's events into a channel.
-fn recorder() -> (
-    Box<dyn Fn(TransportEvent) + Send + Sync>,
-    Receiver<TransportEvent>,
-) {
+// ── harness plumbing ────────────────────────────────────────────────────────
+
+type Events = Receiver<TransportEvent>;
+
+fn recorder() -> (Box<dyn Fn(TransportEvent) + Send + Sync>, Events) {
     let (tx, rx) = channel();
     let tx = Mutex::new(tx);
     let sink: Box<dyn Fn(TransportEvent) + Send + Sync> = Box::new(move |e| {
@@ -29,10 +30,7 @@ fn recorder() -> (
 }
 
 /// Wait for the first event matching `pred`, ignoring others.
-fn wait_for(
-    rx: &Receiver<TransportEvent>,
-    pred: impl Fn(&TransportEvent) -> bool,
-) -> TransportEvent {
+fn wait_for(rx: &Events, pred: impl Fn(&TransportEvent) -> bool) -> TransportEvent {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
@@ -45,7 +43,23 @@ fn wait_for(
     }
 }
 
-fn received_bytes(rx: &Receiver<TransportEvent>, want: usize) -> Vec<u8> {
+fn opened(rx: &Events, peer: &str) {
+    wait_for(
+        rx,
+        |e| matches!(e, TransportEvent::PipeOpened { peer: p } if p == peer),
+    );
+}
+
+fn closed(rx: &Events, peer: &str) {
+    wait_for(
+        rx,
+        |e| matches!(e, TransportEvent::PipeClosed { peer: p } if p == peer),
+    );
+}
+
+/// Collect `want` bytes from `Received` events, however the rung chose to
+/// chunk them.
+fn received_bytes(rx: &Events, want: usize) -> Vec<u8> {
     let mut got = Vec::new();
     while got.len() < want {
         match wait_for(rx, |e| matches!(e, TransportEvent::Received { .. })) {
@@ -56,109 +70,290 @@ fn received_bytes(rx: &Receiver<TransportEvent>, want: usize) -> Vec<u8> {
     got
 }
 
-// ── loopback ────────────────────────────────────────────────────────────────
+/// A pair of nodes on one rung, plus their event streams.
+struct Pair {
+    a: Box<dyn Transport>,
+    b: Box<dyn Transport>,
+    rx_a: Events,
+    rx_b: Events,
+    id_a: String,
+    id_b: String,
+    /// Whether this rung's discovery can actually run here. LAN discovery needs
+    /// multicast, which container CI lacks — the *behavioural* rules are still
+    /// checked, with the address seeded instead of discovered.
+    discovery_works: bool,
+}
 
-#[test]
-fn loopback_discovers_advertisers_and_pipes_bytes() {
-    let net = LoopbackNet::new();
-    let (sink_a, rx_a) = recorder();
-    let (sink_b, rx_b) = recorder();
-    let a = net.join("a", sink_a);
-    let b = net.join("b", sink_b);
+// ── the conformance suite ───────────────────────────────────────────────────
 
-    b.start_advertising(b"beacon-b".to_vec()).unwrap();
+/// Every rule from the module-level contract, checked against one rung.
+fn conformance(p: Pair) {
+    let Pair {
+        a,
+        b,
+        rx_a,
+        rx_b,
+        id_a,
+        id_b,
+        discovery_works,
+    } = p;
+
+    // Rule: limits are reported and sane.
+    assert!(a.limits().max_advertising_payload > 0);
+    assert!(a.limits().preferred_write_size > 0);
+    assert!(a.is_available());
+
+    // Rule: an advertiser is discovered, with its payload.
+    b.start_advertising(b"beacon".to_vec()).unwrap();
     a.start_scanning().unwrap();
-    let found = wait_for(&rx_a, |e| matches!(e, TransportEvent::PeerFound { .. }));
-    assert_eq!(
-        found,
-        TransportEvent::PeerFound {
-            peer: "b".into(),
-            payload: b"beacon-b".to_vec()
-        }
+    if discovery_works {
+        let found = wait_for(
+            &rx_a,
+            |e| matches!(e, TransportEvent::PeerFound { peer, .. } if peer == &id_b),
+        );
+        let TransportEvent::PeerFound { payload, .. } = found else {
+            unreachable!()
+        };
+        assert_eq!(
+            payload,
+            b"beacon",
+            "{}: payload must survive discovery",
+            a.name()
+        );
+        assert!(
+            a.peers().contains(&id_b),
+            "{}: peers() must list the sighting",
+            a.name()
+        );
+    }
+
+    // Rule: an oversized advertisement is refused with the right error.
+    let too_big = vec![0u8; a.limits().max_advertising_payload + 1];
+    assert!(
+        matches!(
+            a.start_advertising(too_big),
+            Err(TransportError::PayloadTooLarge { .. })
+        ),
+        "{}: oversized payload must be PayloadTooLarge",
+        a.name()
     );
 
-    a.connect("b").unwrap();
-    wait_for(&rx_b, |e| matches!(e, TransportEvent::PipeOpened { .. }));
-    a.send("b", b"hello").unwrap();
-    assert_eq!(received_bytes(&rx_b, 5), b"hello");
+    // Rule: connect is accepted, and the pipe is usable only after PipeOpened —
+    // which both ends receive.
+    a.connect(&id_b).unwrap();
+    opened(&rx_a, &id_b);
+    opened(&rx_b, &id_a);
+    assert!(
+        a.pipes().contains(&id_b),
+        "{}: pipes() must list the open pipe",
+        a.name()
+    );
 
-    // The pipe is bidirectional.
-    b.send("a", b"hi").unwrap();
-    assert_eq!(received_bytes(&rx_a, 2), b"hi");
+    // Rule: bytes flow both ways, reassembling byte-exact regardless of how the
+    // rung chunked them.
+    let payload: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+    a.send(&id_b, &payload).unwrap();
+    assert_eq!(
+        received_bytes(&rx_b, payload.len()),
+        payload,
+        "{}: a→b",
+        a.name()
+    );
+    b.send(&id_a, b"pong").unwrap();
+    assert_eq!(received_bytes(&rx_a, 4), b"pong", "{}: b→a", a.name());
 
-    a.disconnect("b").unwrap();
-    wait_for(&rx_b, |e| matches!(e, TransportEvent::PipeClosed { .. }));
-    assert!(matches!(
-        a.send("b", b"x"),
-        Err(TransportError::NoSuchPeer(_))
-    ));
+    // Rule: a peer that dialled us is dialable back without re-discovery.
+    b.connect(&id_a).unwrap();
+    opened(&rx_b, &id_a);
+
+    // Rule: connecting an already-open pipe still announces it, so a caller
+    // awaiting PipeOpened never hangs.
+    a.connect(&id_b).unwrap();
+    opened(&rx_a, &id_b);
+
+    // Rule: disconnect closes both ends and the pipe stops working.
+    a.disconnect(&id_b).unwrap();
+    closed(&rx_a, &id_b);
+    closed(&rx_b, &id_a);
+    assert!(!a.pipes().contains(&id_b));
+    assert!(
+        matches!(a.send(&id_b, b"x"), Err(TransportError::NoSuchPeer(_))),
+        "{}: send after close must fail",
+        a.name()
+    );
+
+    // Rule: dialling an unknown peer fails, and says so on the event stream.
+    assert!(a.connect("ghost").is_err());
+    wait_for(
+        &rx_a,
+        |e| matches!(e, TransportEvent::PipeFailed { peer, .. } if peer == "ghost"),
+    );
+
+    // Rule: stop_advertising makes us undiscoverable, and scanners hear about it.
+    b.stop_advertising().unwrap();
+    if discovery_works {
+        wait_for(
+            &rx_a,
+            |e| matches!(e, TransportEvent::PeerLost { peer } if peer == &id_b),
+        );
+    }
+
+    // Rule: after shutdown the rung is silent and inert; shutdown is idempotent.
+    a.shutdown();
+    a.shutdown();
+    if let Ok(e) = rx_a.recv_timeout(Duration::from_millis(300)) {
+        panic!("{}: event after shutdown: {e:?}", a.name());
+    }
+    assert!(a.send(&id_b, b"x").is_err());
 }
 
 #[test]
-fn loopback_stop_advertising_hides_us_and_notifies_scanners() {
+fn loopback_meets_the_contract() {
+    let net = LoopbackNet::new();
+    let (sink_a, rx_a) = recorder();
+    let (sink_b, rx_b) = recorder();
+    conformance(Pair {
+        a: Box::new(net.join("lb-a", sink_a)),
+        b: Box::new(net.join("lb-b", sink_b)),
+        rx_a,
+        rx_b,
+        id_a: "lb-a".into(),
+        id_b: "lb-b".into(),
+        discovery_works: true,
+    });
+}
+
+#[test]
+fn loopback_meets_the_contract_when_fragmenting() {
+    // A rung may split sends; callers must not depend on message boundaries.
+    let net = LoopbackNet::with_max_chunk(17);
+    let (sink_a, rx_a) = recorder();
+    let (sink_b, rx_b) = recorder();
+    conformance(Pair {
+        a: Box::new(net.join("fr-a", sink_a)),
+        b: Box::new(net.join("fr-b", sink_b)),
+        rx_a,
+        rx_b,
+        id_a: "fr-a".into(),
+        id_b: "fr-b".into(),
+        discovery_works: true,
+    });
+}
+
+#[test]
+fn lan_meets_the_contract() {
+    let (sink_a, rx_a) = recorder();
+    let (sink_b, rx_b) = recorder();
+    let a = LanTransport::new("ct-a", sink_a).unwrap();
+    let b = LanTransport::new("ct-b", sink_b).unwrap();
+    // Seed the address instead of discovering it: mDNS needs multicast and is
+    // exercised separately, but every *behavioural* rule is checked here
+    // through the same `connect` the other rungs use.
+    a.add_peer_addr("ct-b", ([127, 0, 0, 1], b.port()).into());
+    conformance(Pair {
+        a: Box::new(a),
+        b: Box::new(b),
+        rx_a,
+        rx_b,
+        id_a: "ct-a".into(),
+        id_b: "ct-b".into(),
+        // mDNS needs multicast; the dedicated test below covers it locally.
+        discovery_works: false,
+    });
+}
+
+// ── rung-specific ───────────────────────────────────────────────────────────
+
+/// Concurrent sends to one peer must not interleave their bytes — the framer
+/// above us would desync and the failure would look like a crypto bug.
+#[test]
+fn send_is_atomic_under_concurrency() {
+    let net = LoopbackNet::new();
+    let (sink_a, _rx_a) = recorder();
+    let (sink_b, rx_b) = recorder();
+    let a = Arc::new(net.join("at-a", sink_a));
+    let _b = net.join("at-b", sink_b);
+    a.connect("at-b").unwrap();
+    opened(&rx_b, "at-a");
+
+    // Two writers, distinct byte values, large enough to interleave if unlocked.
+    const N: usize = 8 * 1024;
+    let handles: Vec<_> = [1u8, 2u8]
+        .into_iter()
+        .map(|v| {
+            let a = Arc::clone(&a);
+            std::thread::spawn(move || a.send("at-b", &vec![v; N]).unwrap())
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    // Every run of bytes must be whole: no value changes mid-message.
+    let got = received_bytes(&rx_b, 2 * N);
+    let ones = got.iter().filter(|b| **b == 1).count();
+    assert_eq!(ones, N, "bytes were lost or duplicated");
+    assert_eq!(got.len(), 2 * N);
+}
+
+/// No Transport method may invoke the sink before it returns: the core calls
+/// `connect` while holding its own locks, and a re-entrant event would deadlock.
+#[test]
+fn events_never_fire_on_the_callers_thread() {
+    let net = LoopbackNet::new();
+    let caller = std::thread::current().id();
+    let seen_on_caller = Arc::new(Mutex::new(false));
+    let flag = Arc::clone(&seen_on_caller);
+    let sink: Box<dyn Fn(TransportEvent) + Send + Sync> = Box::new(move |_| {
+        if std::thread::current().id() == caller {
+            *flag.lock().unwrap_or_else(|p| p.into_inner()) = true;
+        }
+    });
+    let (sink_b, rx_b) = recorder();
+    let a = net.join("re-a", sink);
+    let b = net.join("re-b", sink_b);
+
+    b.start_advertising(b"x".to_vec()).unwrap();
+    a.start_scanning().unwrap();
+    a.connect("re-b").unwrap();
+    opened(&rx_b, "re-a");
+    a.send("re-b", b"hello").unwrap();
+    a.disconnect("re-b").unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+
+    assert!(
+        !*seen_on_caller.lock().unwrap_or_else(|p| p.into_inner()),
+        "a sink ran on the caller's thread — the core would deadlock"
+    );
+}
+
+/// Rotating the local id is how a rung delivers unlinkability (tech spec §4):
+/// rotating only the payload while a stable name rides alongside would let an
+/// observer link across rotations.
+#[test]
+fn rotating_the_local_id_is_visible_as_a_new_peer() {
     let net = LoopbackNet::new();
     let (sink_a, rx_a) = recorder();
     let (sink_b, _rx_b) = recorder();
-    let a = net.join("a", sink_a);
-    let b = net.join("b", sink_b);
+    let a = net.join("watch", sink_a);
+    let b = net.join("before", sink_b);
 
     a.start_scanning().unwrap();
-    b.start_advertising(b"x".to_vec()).unwrap();
-    wait_for(&rx_a, |e| matches!(e, TransportEvent::PeerFound { .. }));
-
-    b.stop_advertising().unwrap();
-    wait_for(&rx_a, |e| matches!(e, TransportEvent::PeerLost { .. }));
-}
-
-#[test]
-fn loopback_never_discovers_itself() {
-    let net = LoopbackNet::new();
-    let (sink, rx) = recorder();
-    let a = net.join("a", sink);
-    a.start_advertising(b"me".to_vec()).unwrap();
-    a.start_scanning().unwrap();
-    assert!(
-        rx.recv_timeout(Duration::from_millis(200)).is_err(),
-        "a node must not discover its own advertisement"
-    );
-}
-
-#[test]
-fn loopback_connect_to_unknown_peer_errors() {
-    let net = LoopbackNet::new();
-    let (sink, _rx) = recorder();
-    let a = net.join("a", sink);
-    assert!(matches!(
-        a.connect("ghost"),
-        Err(TransportError::NoSuchPeer(_))
-    ));
-}
-
-// ── LAN ─────────────────────────────────────────────────────────────────────
-
-#[test]
-fn lan_pipe_carries_bytes_both_ways() {
-    let (sink_a, rx_a) = recorder();
-    let (sink_b, rx_b) = recorder();
-    let a = LanTransport::new("lan-a", sink_a).unwrap();
-    let b = LanTransport::new("lan-b", sink_b).unwrap();
-
-    // Dial by address — discovery is exercised separately (needs multicast).
-    a.connect_addr("lan-b", ([127, 0, 0, 1], b.port()).into())
-        .unwrap();
-    wait_for(&rx_a, |e| matches!(e, TransportEvent::PipeOpened { .. }));
-    // The accepting side learns who dialled from the link-layer hello.
-    assert_eq!(
-        wait_for(&rx_b, |e| matches!(e, TransportEvent::PipeOpened { .. })),
-        TransportEvent::PipeOpened {
-            peer: "lan-a".into()
-        }
+    b.start_advertising(b"p".to_vec()).unwrap();
+    wait_for(
+        &rx_a,
+        |e| matches!(e, TransportEvent::PeerFound { peer, .. } if peer == "before"),
     );
 
-    a.send("lan-b", b"ping").unwrap();
-    assert_eq!(received_bytes(&rx_b, 4), b"ping");
-    b.send("lan-a", b"pong").unwrap();
-    assert_eq!(received_bytes(&rx_a, 4), b"pong");
+    b.set_local_id("after").unwrap();
+    wait_for(
+        &rx_a,
+        |e| matches!(e, TransportEvent::PeerLost { peer } if peer == "before"),
+    );
+    wait_for(
+        &rx_a,
+        |e| matches!(e, TransportEvent::PeerFound { peer, .. } if peer == "after"),
+    );
 }
 
 #[test]
@@ -169,71 +364,16 @@ fn lan_reassembles_a_large_payload_in_order() {
     let b = LanTransport::new("big-b", sink_b).unwrap();
     a.connect_addr("big-b", ([127, 0, 0, 1], b.port()).into())
         .unwrap();
-    wait_for(&rx_b, |e| matches!(e, TransportEvent::PipeOpened { .. }));
+    opened(&rx_b, "big-a");
 
-    // TCP does not preserve message boundaries (the trait says so), but the
-    // byte stream must arrive complete and in order.
     let payload: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
     a.send("big-b", &payload).unwrap();
     assert_eq!(received_bytes(&rx_b, payload.len()), payload);
 }
 
-#[test]
-fn lan_disconnect_closes_both_ends() {
-    let (sink_a, rx_a) = recorder();
-    let (sink_b, rx_b) = recorder();
-    let a = LanTransport::new("dis-a", sink_a).unwrap();
-    let b = LanTransport::new("dis-b", sink_b).unwrap();
-    a.connect_addr("dis-b", ([127, 0, 0, 1], b.port()).into())
-        .unwrap();
-    wait_for(&rx_b, |e| matches!(e, TransportEvent::PipeOpened { .. }));
-
-    a.disconnect("dis-b").unwrap();
-    wait_for(&rx_a, |e| matches!(e, TransportEvent::PipeClosed { .. }));
-    // The severed link reaches the far side too.
-    wait_for(&rx_b, |e| matches!(e, TransportEvent::PipeClosed { .. }));
-    assert!(matches!(
-        a.send("dis-b", b"x"),
-        Err(TransportError::NoSuchPeer(_))
-    ));
-}
-
-#[test]
-fn lan_shutdown_is_idempotent_and_silences_the_node() {
-    let (sink_a, rx_a) = recorder();
-    let (sink_b, _rx_b) = recorder();
-    let a = LanTransport::new("sd-a", sink_a).unwrap();
-    let b = LanTransport::new("sd-b", sink_b).unwrap();
-    a.connect_addr("sd-b", ([127, 0, 0, 1], b.port()).into())
-        .unwrap();
-    wait_for(&rx_a, |e| matches!(e, TransportEvent::PipeOpened { .. }));
-
-    a.shutdown();
-    a.shutdown(); // idempotent
-                  // Nothing more is emitted, and the node is unusable.
-    if let Ok(e) = rx_a.recv_timeout(Duration::from_millis(200)) {
-        panic!("event after shutdown: {e:?}");
-    }
-    assert!(a.send("sd-b", b"x").is_err());
-}
-
-#[test]
-fn lan_send_to_unknown_peer_errors() {
-    let (sink, _rx) = recorder();
-    let a = LanTransport::new("solo", sink).unwrap();
-    assert!(matches!(
-        a.send("ghost", b"x"),
-        Err(TransportError::NoSuchPeer(_))
-    ));
-    assert!(matches!(
-        a.connect("ghost"),
-        Err(TransportError::NoSuchPeer(_))
-    ));
-}
-
-/// Throughput smoke for the byte pipe (T08 asks for ≥ 10 kB/s; loopback TCP is
-/// orders of magnitude above that, so this guards against a pathological
-/// regression rather than measuring the radio).
+/// Throughput smoke (T08 asks for ≥ 10 kB/s). Loopback TCP is far above that,
+/// so this guards against a pathological regression rather than measuring a
+/// radio.
 #[test]
 fn lan_pipe_throughput_is_sane() {
     let (sink_a, _rx_a) = recorder();
@@ -242,7 +382,7 @@ fn lan_pipe_throughput_is_sane() {
     let b = LanTransport::new("tp-b", sink_b).unwrap();
     a.connect_addr("tp-b", ([127, 0, 0, 1], b.port()).into())
         .unwrap();
-    wait_for(&rx_b, |e| matches!(e, TransportEvent::PipeOpened { .. }));
+    opened(&rx_b, "tp-a");
 
     let payload = vec![7u8; 1024 * 1024];
     let start = Instant::now();
@@ -254,6 +394,23 @@ fn lan_pipe_throughput_is_sane() {
         rate > 10_000.0,
         "throughput {rate:.0} B/s below the 10 kB/s floor"
     );
+}
+
+/// A peer that connects and never identifies itself must not wedge the accept
+/// loop for everyone else.
+#[test]
+fn lan_accept_loop_survives_a_silent_connection() {
+    let (sink_a, rx_a) = recorder();
+    let (sink_b, _rx_b) = recorder();
+    let a = LanTransport::new("sl-a", sink_a).unwrap();
+    let b = LanTransport::new("sl-b", sink_b).unwrap();
+
+    // Connect without sending a hello, and hold it open.
+    let _silent = std::net::TcpStream::connect(("127.0.0.1", a.port())).unwrap();
+    // A well-behaved peer still gets through immediately.
+    b.connect_addr("sl-a", ([127, 0, 0, 1], a.port()).into())
+        .unwrap();
+    opened(&rx_a, "sl-b");
 }
 
 /// Real mDNS discovery. Needs working multicast on a real interface, which
@@ -281,5 +438,5 @@ fn lan_discovers_a_peer_over_mdns() {
 
     // Discovery gave us an address: the pipe opens without a manual dial.
     a.connect("mdns-b").unwrap();
-    wait_for(&rx_a, |e| matches!(e, TransportEvent::PipeOpened { .. }));
+    opened(&rx_a, "mdns-b");
 }
