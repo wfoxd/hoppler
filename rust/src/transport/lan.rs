@@ -12,7 +12,7 @@
 //! deliberately the *only* bytes this layer writes on its own. Everything after
 //! it is opaque payload.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener, TcpStream,
@@ -81,12 +81,20 @@ struct PipeEntry {
 }
 
 /// Lock order, where more than one is held: **`local_id` → `advertising` →
-/// `peers` → `pipes`**. `set_local_id` and `start_advertising` both need the
-/// first two, and taking them in opposite orders deadlocks a rotation against a
-/// concurrent advertise.
+/// `peers` → `pipes`**. (`scanning` is never held alongside another.)
+///
+/// `set_local_id`, `start_advertising` and `stop_advertising` each hold the
+/// first two *together*, and must: taking them in opposite orders deadlocks a
+/// rotation against a concurrent advertise, but merely reading the id and
+/// releasing it is not enough either — the publish would then race a rotation
+/// and leave the pre-rotation name registered, which defeats the rotation.
 struct Inner {
     /// How we appear to peers. Rotatable (tech spec §4), so behind a lock.
     local_id: Mutex<PeerId>,
+    /// Every name we currently have registered with mDNS. Normally 0 or 1 —
+    /// it is a set because the bug worth catching is a *second* name surviving
+    /// a rotation, and a scalar cannot represent the state it fails in.
+    registered: Mutex<HashSet<PeerId>>,
     /// Queue to the sink's own thread — no Transport method may call the sink
     /// before returning (contract rule 1).
     events: Sender<TransportEvent>,
@@ -319,6 +327,7 @@ impl LanTransport {
 
         let inner = Arc::new(Inner {
             local_id: Mutex::new(node_id),
+            registered: Mutex::new(HashSet::new()),
             events,
             sink,
             revoked,
@@ -355,6 +364,20 @@ impl LanTransport {
     /// The port this node listens on (useful in tests and diagnostics).
     pub fn port(&self) -> u16 {
         self.inner.port
+    }
+
+    /// Names currently registered with mDNS. Exposed so the rotation tests can
+    /// assert the invariant that matters — a rotation leaves exactly one name
+    /// behind, never the old one as well.
+    #[doc(hidden)]
+    pub fn registered_names(&self) -> Vec<PeerId> {
+        self.inner
+            .registered
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect()
     }
 
     /// Every address a discovered peer might be dialled at, best first.
@@ -421,7 +444,13 @@ impl LanTransport {
         let info = ServiceInfo::new(SERVICE_TYPE, id, &host, (), self.inner.port, props)
             .map_err(unavailable)?
             .enable_addr_auto();
-        self.inner.mdns.register(info).map_err(unavailable)
+        self.inner.mdns.register(info).map_err(unavailable)?;
+        self.inner
+            .registered
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.to_string());
+        Ok(())
     }
 }
 
@@ -734,12 +763,20 @@ impl Transport for LanTransport {
                 .mdns
                 .unregister(&Self::fullname(&id))
                 .map_err(unavailable)?;
+            self.inner
+                .registered
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&*id);
         }
         *id = new_id.to_string();
-        drop(id);
+        // Keep the guard until the new name is published: dropping it here lets
+        // a concurrent `start_advertising` read the new id and publish its own
+        // payload first, which this call then overwrites.
         if let Some(payload) = payload {
             self.publish(new_id, &payload)?;
         }
+        drop(id);
         Ok(())
     }
 
@@ -753,8 +790,7 @@ impl Transport for LanTransport {
             .inner
             .local_id
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+            .unwrap_or_else(|e| e.into_inner());
         let mut advertising = self
             .inner
             .advertising
@@ -772,8 +808,7 @@ impl Transport for LanTransport {
             .inner
             .local_id
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+            .unwrap_or_else(|e| e.into_inner());
         let mut advertising = self
             .inner
             .advertising
@@ -786,6 +821,11 @@ impl Transport for LanTransport {
                 .mdns
                 .unregister(&Self::fullname(&id))
                 .map_err(unavailable)?;
+            self.inner
+                .registered
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&*id);
             *advertising = None;
         }
         Ok(())

@@ -149,7 +149,12 @@ impl NetState {
         // `peers()` reports discovery state rather than who happens to be
         // advertising right now.
         match &event {
-            TransportEvent::PeerFound { peer: found, .. } => {
+            // A peer that dialled us is known to us too, even if we never
+            // scanned — rule 5 lets us dial it back, so `peers()` must say so.
+            // Recorded before the event goes out, matching the LAN rung, so an
+            // observer woken by `PipeOpened` never sees an empty `peers()`.
+            TransportEvent::PeerFound { peer: found, .. }
+            | TransportEvent::PipeOpened { peer: found } => {
                 if let Some(n) = self.nodes.get_mut(peer) {
                     if !n.discovered.contains(found) {
                         n.discovered.push(found.clone());

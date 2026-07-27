@@ -162,6 +162,14 @@ fn conformance(p: Pair) {
         "{}: pipes() must list the open pipe",
         a.name()
     );
+    // Ungated on `discovery_works`: b never scanned, so this is the only check
+    // that a peer which *dialled* us is known to us — the half of `peers()`
+    // that rule 5's dial-back depends on.
+    assert!(
+        b.peers().contains(&id_a),
+        "{}: a peer that dialled us must appear in peers()",
+        b.name()
+    );
 
     // Rule: bytes flow both ways, reassembling byte-exact regardless of how the
     // rung chunked them.
@@ -489,23 +497,31 @@ fn rotating_the_local_id_is_visible_as_a_new_peer() {
     );
 }
 
-/// Rotation and advertising both touch the id and the advertised record. Taking
-/// those two locks in opposite orders deadlocks — and a deadlock hangs the suite
-/// rather than failing it, so this races them under a bounded wait.
+/// Rotation and advertising both touch the id *and* the advertised record, so
+/// they must hold both locks together and in one order. Two distinct failures
+/// live here and this test has to catch both: taking the locks in opposite
+/// orders deadlocks (which hangs a suite rather than failing it, hence the
+/// bounded wait), and holding neither across the publish silently leaks the
+/// pre-rotation name.
 #[test]
-fn rotating_while_advertising_does_not_deadlock() {
+fn rotating_while_advertising_does_not_deadlock_or_leak_a_name() {
     let (sink, _rx) = recorder();
     let t = std::sync::Arc::new(LanTransport::new("lock-order", sink).unwrap());
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (done_tx, done_rx) = std::sync::mpsc::channel();
 
+    // Several threads per job, and time-boxed rather than iteration-capped: the
+    // leak needs a rotation to land entirely inside another thread's
+    // read-id-then-publish window, which a two-thread lockstep rarely hits.
+    const WORKERS: usize = 3;
+    let deadline = Instant::now() + Duration::from_secs(3);
     let mut threads = Vec::new();
-    for (i, job) in [0u8, 1].into_iter().enumerate() {
+    for i in 0..WORKERS * 2 {
         let (t, stop, done_tx) = (t.clone(), stop.clone(), done_tx.clone());
         threads.push(std::thread::spawn(move || {
             let mut n = 0u32;
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) && n < 300 {
-                if job == 0 {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) && Instant::now() < deadline {
+                if i % 2 == 0 {
                     let _ = t.set_local_id(&format!("rot-{i}-{n}"));
                 } else {
                     let _ = t.start_advertising(b"x".to_vec());
@@ -518,16 +534,39 @@ fn rotating_while_advertising_does_not_deadlock() {
     }
     drop(done_tx);
 
-    // Both halves must report in; a missing report means one is wedged.
-    for _ in 0..2 {
+    // Every worker must report in; a missing report means one is wedged.
+    for _ in 0..WORKERS * 2 {
         done_rx
-            .recv_timeout(Duration::from_secs(20))
+            .recv_timeout(Duration::from_secs(30))
             .expect("rotation deadlocked against advertising");
     }
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     for h in threads {
         h.join().unwrap();
     }
+
+    // Liveness is only half of it. The race can also *succeed* wrongly: a
+    // rotation that interleaves with a publish can leave the pre-rotation name
+    // registered alongside the new one, which is an unlinkability failure
+    // (tech spec §4) that no deadlock check would notice. Quiescent now, so
+    // this is deterministic — stop advertising and nothing may remain.
+    // `mdns-sd` rejects commands with `Again` when its channel backs up, which
+    // this loop provokes by design; the rung correctly refuses to report a
+    // withdrawal it could not perform, so retry rather than treat it as failure.
+    let mut stopped = Err(TransportError::Unavailable("not attempted".into()));
+    for _ in 0..50 {
+        stopped = t.stop_advertising();
+        if stopped.is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    stopped.expect("stop_advertising never drained");
+    assert_eq!(
+        t.registered_names(),
+        Vec::<String>::new(),
+        "a rotation leaked an mDNS registration: the old name still answers"
+    );
     t.shutdown();
 }
 
