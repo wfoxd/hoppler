@@ -692,6 +692,7 @@ impl Transport for LanTransport {
     }
 
     fn set_local_id(&self, new_id: &str) -> Result<(), TransportError> {
+        self.alive()?;
         check_label(new_id)?;
         // Same rule on every rung: a connected peer knows us by the id it
         // dialled, so the core rotates when idle (contract rule 4).
@@ -755,6 +756,7 @@ impl Transport for LanTransport {
     }
 
     fn stop_advertising(&self) -> Result<(), TransportError> {
+        self.alive()?;
         let mut advertising = self
             .inner
             .advertising
@@ -850,6 +852,7 @@ impl Transport for LanTransport {
     }
 
     fn stop_scanning(&self) -> Result<(), TransportError> {
+        self.alive()?;
         let mut scanning = self
             .inner
             .scanning
@@ -944,6 +947,7 @@ impl Transport for LanTransport {
     }
 
     fn disconnect(&self, peer: &str) -> Result<(), TransportError> {
+        self.alive()?;
         let removed = {
             let mut pipes = self.inner.pipes.lock().unwrap_or_else(|e| e.into_inner());
             let entry = pipes.remove(peer);
@@ -988,8 +992,19 @@ impl Transport for LanTransport {
         if self.inner.shutdown.swap(true, Ordering::SeqCst) {
             return;
         }
-        let _ = self.stop_advertising();
-        let _ = self.stop_scanning();
+        // Not via the public methods: they refuse once the flag is set (and
+        // rightly so). `mdns.shutdown()` below withdraws every registration and
+        // ends the browse, so clearing local state is all that is left.
+        *self
+            .inner
+            .advertising
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        *self
+            .inner
+            .scanning
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = false;
         let pipes: Vec<TcpStream> = {
             let mut guard = self.inner.pipes.lock().unwrap_or_else(|e| e.into_inner());
             guard.drain().map(|(_, e)| e.teardown).collect()

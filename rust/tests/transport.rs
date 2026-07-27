@@ -270,21 +270,24 @@ fn conformance(p: Pair) {
     if let Ok(e) = rx_a.recv_timeout(Duration::from_millis(300)) {
         panic!("{}: event after shutdown: {e:?}", a.name());
     }
-    assert!(
-        a.send(&id_b, b"x").is_err(),
-        "{}: send after shutdown",
-        a.name()
-    );
-    assert!(
-        a.connect(&id_b).is_err(),
-        "{}: connect after shutdown",
-        a.name()
-    );
-    assert!(
-        a.start_advertising(b"zombie".to_vec()).is_err(),
-        "{}: advertising after shutdown",
-        a.name()
-    );
+    // Every mutating method, not a sample: this class of gap was otherwise
+    // being found one method at a time.
+    for (what, result) in [
+        ("send", a.send(&id_b, b"x")),
+        ("connect", a.connect(&id_b)),
+        ("disconnect", a.disconnect(&id_b)),
+        ("start_advertising", a.start_advertising(b"zombie".to_vec())),
+        ("stop_advertising", a.stop_advertising()),
+        ("start_scanning", a.start_scanning()),
+        ("stop_scanning", a.stop_scanning()),
+        ("set_local_id", a.set_local_id("after-shutdown")),
+    ] {
+        assert!(
+            result.is_err(),
+            "{}: {what} succeeded after shutdown — the rung must be inert, not merely quiet",
+            a.name()
+        );
+    }
     assert!(
         !a.is_available(),
         "{}: is_available after shutdown",
