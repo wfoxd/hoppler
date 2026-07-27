@@ -5,3 +5,4 @@ mod frb_generated;
 pub mod identity;
 pub mod proto;
 pub mod store;
+pub mod transport;
