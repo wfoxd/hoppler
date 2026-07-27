@@ -16,9 +16,11 @@ flutter_rust_bridge = "=2.12.0"
 getrandom = "0.4.3"
 hex = "0.4.3"
 hkdf = "0.13.0"
+mdns-sd = "0.20.3"
 prost = "0.14.4"
 rusqlite = { version = "0.40.1", default-features = false, features = ["bundled-sqlcipher-vendored-openssl"] }
 sha2 = "0.11.0"
+socket2 = "0.6.5"
 x25519-dalek = { version = "3.0.0", features = ["static_secrets", "zeroize"] }
 zeroize = "1.9.0"
 
