@@ -32,16 +32,18 @@ void main() {
       });
 
       final payload = Uint8List.fromList([1, 2, 3]);
-      await ble.startAdvertising('node-a', payload);
+      await ble.setLocalId('node-a');
+      await ble.startAdvertising(payload);
       await ble.send('peer-b', Uint8List.fromList([9]));
       await ble.connect('peer-b');
       await ble.stopAdvertising();
 
       expect(calls.map((c) => c.method),
-          ['startAdvertising', 'send', 'connect', 'stopAdvertising']);
-      expect(calls[0].arguments, {'localId': 'node-a', 'payload': payload});
-      expect(calls[1].arguments['peer'], 'peer-b');
-      expect(calls[3].arguments, isNull);
+          ['setLocalId', 'startAdvertising', 'send', 'connect', 'stopAdvertising']);
+      expect(calls[0].arguments, {'localId': 'node-a'});
+      expect(calls[1].arguments, {'payload': payload});
+      expect(calls[2].arguments['peer'], 'peer-b');
+      expect(calls[4].arguments, isNull);
     });
 
     test('a version mismatch is fatal at startup, not a mystery later', () async {

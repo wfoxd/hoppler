@@ -38,7 +38,8 @@ are a `Map<String, Object>`; a command returns `null` on success or raises a
 | Method | Arguments | Meaning |
 |---|---|---|
 | `version` | — | Returns `int`. Must equal 1. |
-| `startAdvertising` | `localId: String`, `payload: Uint8List` | Advertise `payload` under `localId`, replacing any current advertisement. |
+| `setLocalId` | `localId: String` | How we are named. Sent at startup and on every rotation, **whether or not we advertise** (§5.5). |
+| `startAdvertising` | `payload: Uint8List` | Advertise `payload` under the current local id, replacing any current advertisement. |
 | `stopAdvertising` | — | Stop. Must be a radio stop, not a flag (§5.1). |
 | `startScanning` | — | Begin scanning. |
 | `stopScanning` | — | Stop scanning. Open pipes are unaffected. |
@@ -113,7 +114,15 @@ rotates the address underneath you, and a peer that changes id mid-pipe breaks
 contract rule 4. The same peer may legitimately appear under a new id after a
 rotation, with no pipe open — report that as `peerLost` then `peerFound`.
 
-### 5.5 Facts, not interpretations
+### 5.5 The local id applies even with nothing advertised
+
+`setLocalId` arrives before any advertisement and again on every rotation. A
+node with Discovery off still dials peers it is paired with (R0-F2), and the
+dialer introduces itself by this id — so an adapter that only learned the id
+from `startAdvertising` would have nothing to offer on exactly the path that
+matters most for paired contact.
+
+### 5.6 Facts, not interpretations
 
 Report what the radio did. Do not suppress a duplicate, infer a close from a
 timeout, or re-order events to look tidier — the core has more context and

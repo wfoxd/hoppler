@@ -811,10 +811,16 @@ mod fake_radio {
     }
 
     impl BlePlatform for FakePlatform {
-        fn start_advertising(&self, local_id: &str, payload: &[u8]) -> Result<(), TransportError> {
+        fn set_local_id(&self, local_id: &str) -> Result<(), TransportError> {
+            self.air.lock().unwrap_or_else(|e| e.into_inner()).nodes[self.handle].id =
+                local_id.to_string();
+            Ok(())
+        }
+
+        fn start_advertising(&self, payload: &[u8]) -> Result<(), TransportError> {
             let deliveries = {
                 let mut air = self.air.lock().unwrap_or_else(|e| e.into_inner());
-                air.nodes[self.handle].id = local_id.to_string();
+                let local_id = air.nodes[self.handle].id.clone();
                 air.nodes[self.handle].advertising = Some(payload.to_vec());
                 air.nodes
                     .iter()
@@ -824,7 +830,7 @@ mod fake_radio {
                         (
                             i,
                             PlatformEvent::PeerFound {
-                                peer: local_id.to_string(),
+                                peer: local_id.clone(),
                                 payload: payload.to_vec(),
                             },
                         )
@@ -1003,6 +1009,7 @@ fn ble_meets_the_contract() {
 struct Probe {
     ingress: Mutex<Option<rust_lib_hoppler::transport::ble::BleIngress>>,
     sent: Mutex<Vec<(String, usize)>>,
+    ids: Mutex<Vec<String>>,
     /// Whether to acknowledge writes from inside `send`, as a fast inline
     /// write does.
     ack_inline: std::sync::atomic::AtomicBool,
@@ -1013,6 +1020,7 @@ impl Probe {
         Arc::new(Probe {
             ingress: Mutex::new(None),
             sent: Mutex::new(Vec::new()),
+            ids: Mutex::new(Vec::new()),
             ack_inline: std::sync::atomic::AtomicBool::new(true),
         })
     }
@@ -1028,7 +1036,11 @@ impl Probe {
 }
 
 impl rust_lib_hoppler::transport::ble::BlePlatform for Probe {
-    fn start_advertising(&self, _: &str, _: &[u8]) -> Result<(), TransportError> {
+    fn set_local_id(&self, id: &str) -> Result<(), TransportError> {
+        self.ids.lock().unwrap().push(id.to_string());
+        Ok(())
+    }
+    fn start_advertising(&self, _: &[u8]) -> Result<(), TransportError> {
         Ok(())
     }
     fn stop_advertising(&self) -> Result<(), TransportError> {
@@ -1228,4 +1240,26 @@ fn the_ingress_outlives_the_transport() {
     });
     radio.on_write_complete("p1", 10);
     assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+}
+
+#[test]
+fn the_adapter_learns_our_id_even_when_we_never_advertise() {
+    use rust_lib_hoppler::transport::ble::BleTransport;
+    let probe = Probe::new();
+    let (sink, _rx) = recorder();
+    let t = BleTransport::new("probe", probe.clone(), sink).unwrap();
+    probe.attach(t.ingress());
+
+    // Discovery off still dials paired peers (R0-F2), and the dialer has to
+    // introduce itself by the id the core knows it by — never by its MAC. If
+    // the adapter only learned the id from start_advertising, a node that
+    // never advertises would have no name to offer.
+    assert_eq!(probe.ids.lock().unwrap().clone(), vec!["probe".to_string()]);
+
+    t.set_local_id("probe-rotated").unwrap();
+    assert_eq!(
+        probe.ids.lock().unwrap().clone(),
+        vec!["probe".to_string(), "probe-rotated".to_string()],
+        "a rotation with nothing advertised must still reach the adapter"
+    );
 }

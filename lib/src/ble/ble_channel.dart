@@ -120,8 +120,14 @@ class BleChannel {
     }
   }
 
-  Future<void> startAdvertising(String localId, Uint8List payload) =>
-      _invoke<void>('startAdvertising', {'localId': localId, 'payload': payload});
+  /// How we are named. Sent at startup and on every rotation, whether or not
+  /// we advertise — a node with Discovery off still dials paired peers and has
+  /// to introduce itself (contract §5.6).
+  Future<void> setLocalId(String localId) =>
+      _invoke<void>('setLocalId', {'localId': localId});
+
+  Future<void> startAdvertising(Uint8List payload) =>
+      _invoke<void>('startAdvertising', {'payload': payload});
 
   Future<void> stopAdvertising() => _invoke<void>('stopAdvertising');
 

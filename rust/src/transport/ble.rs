@@ -79,9 +79,14 @@ const SEND_WINDOW: usize = 64 * 1024;
 ///
 /// Deliberately six commands. Each maps to one Android API call.
 pub trait BlePlatform: Send + Sync {
-    /// Advertise `payload` under `local_id`. Replaces any current
-    /// advertisement. The id is what peers will see and dial.
-    fn start_advertising(&self, local_id: &str, payload: &[u8]) -> Result<(), TransportError>;
+    /// Tell the adapter how we are named. Called at construction and on every
+    /// rotation, *not* only when advertising: a node with Discovery off still
+    /// dials paired peers (R0-F2) and must introduce itself by the id the core
+    /// knows it by, never by its MAC.
+    fn set_local_id(&self, local_id: &str) -> Result<(), TransportError>;
+    /// Advertise `payload` under the current local id. Replaces any current
+    /// advertisement.
+    fn start_advertising(&self, payload: &[u8]) -> Result<(), TransportError>;
     /// Stop advertising. Must be a real radio stop, not a flag (F2).
     fn stop_advertising(&self) -> Result<(), TransportError>;
     /// Begin scanning; sightings come back as `PeerFound`/`PeerLost`.
@@ -196,6 +201,7 @@ impl BleTransport {
         if !is_valid_peer_id(local_id) {
             return Err(TransportError::Io(format!("invalid local id: {local_id}")));
         }
+        platform.set_local_id(local_id)?;
         let (tx, rx) = channel::<TransportEvent>();
         let inner = Arc::new(Inner {
             local_id: Mutex::new(local_id.to_string()),
@@ -463,9 +469,11 @@ impl Transport for BleTransport {
             // Withdraw the old name before publishing the new one: a rotation
             // that leaves both visible is not a rotation (F2).
             self.inner.platform.stop_advertising()?;
+            self.inner.platform.set_local_id(id)?;
             *local = id.to_string();
-            self.inner.platform.start_advertising(id, payload)?;
+            self.inner.platform.start_advertising(payload)?;
         } else {
+            self.inner.platform.set_local_id(id)?;
             *local = id.to_string();
         }
         Ok(())
@@ -478,13 +486,15 @@ impl Transport for BleTransport {
                 max: MAX_ADVERTISING_PAYLOAD,
             });
         }
-        let local = self.inner.local_id.lock().unwrap_or_else(|e| e.into_inner());
+        // Lock order: local_id before advertising. Held together so a
+        // concurrent rotation cannot publish this payload under the old name.
+        let _local = self.inner.local_id.lock().unwrap_or_else(|e| e.into_inner());
         let mut advertising = self
             .inner
             .advertising
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        self.inner.platform.start_advertising(&local, &payload)?;
+        self.inner.platform.start_advertising(&payload)?;
         *advertising = Some(payload);
         Ok(())
     }
@@ -689,7 +699,10 @@ mod tests {
     fn availability_tracks_the_radio() {
         struct Nop;
         impl BlePlatform for Nop {
-            fn start_advertising(&self, _: &str, _: &[u8]) -> Result<(), TransportError> {
+            fn set_local_id(&self, _: &str) -> Result<(), TransportError> {
+                Ok(())
+            }
+            fn start_advertising(&self, _: &[u8]) -> Result<(), TransportError> {
                 Ok(())
             }
             fn stop_advertising(&self) -> Result<(), TransportError> {

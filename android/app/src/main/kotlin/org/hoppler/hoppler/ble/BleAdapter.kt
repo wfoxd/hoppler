@@ -137,8 +137,11 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
         try {
             when (call.method) {
                 "version" -> ok(result, CHANNEL_VERSION)
+                "setLocalId" -> {
+                    localId = call.argument<String>("localId")!!
+                    ok(result)
+                }
                 "startAdvertising" -> startAdvertising(
-                    call.argument<String>("localId")!!,
                     call.argument<ByteArray>("payload")!!,
                     result
                 )
@@ -199,7 +202,9 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
     }
 
     @SuppressLint("MissingPermission")
-    private fun startAdvertising(localId: String, payload: ByteArray, result: MethodChannel.Result) {
+    private fun startAdvertising(payload: ByteArray, result: MethodChannel.Result) {
+        val localId = this.localId
+            ?: return fail(result, "unavailable", "setLocalId has not been called")
         val advertiser = advertiser
             ?: return fail(result, "unavailable", "Bluetooth is off or LE advertising unsupported")
 
@@ -254,9 +259,6 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
                 }
             }
         }
-        // Remembered for the hello a dialer writes: the peer must learn us by
-        // the id we advertise, never by our MAC (§5.4).
-        localIdBytes = localId.toByteArray(Charsets.US_ASCII)
         advertiseCallback = callback
         advertiser.startAdvertisingSet(params, data, null, null, null, callback)
     }
@@ -421,8 +423,8 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
             try {
                 val socket = sighting.device.createInsecureL2capChannel(sighting.psm)
                 socket.connect()
+                val id = (localId ?: "").toByteArray(Charsets.US_ASCII)
                 socket.outputStream.apply {
-                    val id = localIdBytes ?: ByteArray(0)
                     write(byteArrayOf(id.size.toByte()))
                     write(id)
                     flush()
@@ -434,9 +436,13 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
         }
     }
 
-    /** What we last advertised as, for the hello a dialer sends. */
+    /**
+     * How the core names us (§5.5). Set before any advertisement and on every
+     * rotation, because a dialer introduces itself by this id even with
+     * Discovery off — and never by its MAC, which Android rotates underneath us.
+     */
     @Volatile
-    private var localIdBytes: ByteArray? = null
+    private var localId: String? = null
 
     private fun openPipe(peer: String, socket: BluetoothSocket) {
         val existing = pipes.put(peer, Pipe(socket))
