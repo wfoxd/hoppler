@@ -89,7 +89,14 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
     /** Open pipes: id → socket and its serialised writer. */
     private val pipes = ConcurrentHashMap<String, Pipe>()
 
-    private data class Sighting(val device: BluetoothDevice, val psm: Int, var lastSeen: Long)
+    // Not a data class: a generated equals() over a ByteArray compares by
+    // reference, which is exactly the wrong answer for the payload.
+    private class Sighting(
+        val device: BluetoothDevice,
+        val psm: Int,
+        val payload: ByteArray,
+        var lastSeen: Long
+    )
 
     private class Pipe(val socket: BluetoothSocket) {
         /** §5.2: one `send` is one contiguous, ordered write. */
@@ -198,8 +205,21 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
         val idLen = data[2].toInt() and 0xFF
         if (idLen == 0 || data.size < 3 + idLen) return null
         val id = String(data, 3, idLen, Charsets.US_ASCII)
+        // An advertisement is whatever a stranger chose to broadcast. The core
+        // drops ids it does not like, but an unfiltered one would still land in
+        // `seen` on the way there — so anyone in radio range could grow that
+        // map without limit. Enforce the rule here too (§5.4).
+        if (!isValidPeerId(id)) return null
         return Triple(id, psm, data.copyOfRange(3 + idLen, data.size))
     }
+
+    /** The core's rule, mirrored: ASCII alphanumeric and `-`, 1..63, no edges. */
+    private fun isValidPeerId(id: String): Boolean =
+        id.isNotEmpty() &&
+            id.length <= 63 &&
+            !id.startsWith('-') &&
+            !id.endsWith('-') &&
+            id.all { (it.isLetterOrDigit() && it.code < 128) || it == '-' }
 
     @SuppressLint("MissingPermission")
     private fun startAdvertising(payload: ByteArray, result: MethodChannel.Result) {
@@ -293,10 +313,15 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
                 val data = sr?.scanRecord?.getServiceData(SERVICE_PARCEL) ?: return
                 val (id, psm, payload) = unframe(data) ?: return
                 val now = System.currentTimeMillis()
-                val previous = seen.put(id, Sighting(sr.device, psm, now))
-                // Re-sent on payload change; the core treats it as "latest
-                // known", so an unchanged repeat is noise worth suppressing.
-                if (previous == null || previous.psm != psm) {
+                val previous = seen.put(id, Sighting(sr.device, psm, payload, now))
+                // PeerFound is "latest known", so a repeat of the same
+                // advertisement is noise — but a *changed* payload is the
+                // persona changing and must get through. Comparing only the
+                // PSM would strand the core on stale persona data.
+                val changed = previous == null ||
+                    previous.psm != psm ||
+                    !previous.payload.contentEquals(payload)
+                if (changed) {
                     emit(mapOf("type" to "peerFound", "peer" to id, "payload" to payload))
                 }
             }

@@ -173,13 +173,19 @@ class BleChannel {
     final map = raw.cast<Object?, Object?>();
     final type = map['type'];
     String? peer() => map['peer'] as String?;
-    Uint8List bytes(String key) {
+    // Null, not an empty list: substituting a zero-length payload would turn a
+    // malformed frame into a plausible-looking event, which is the opposite of
+    // dropping it — the core would read it as "this peer advertises nothing".
+    Uint8List? bytes(String key) {
       final v = map[key];
-      return v is Uint8List ? v : Uint8List(0);
+      return v is Uint8List ? v : null;
     }
 
     return switch (type) {
-      'peerFound' when peer() != null => PeerFound(peer()!, bytes('payload')),
+      'peerFound' when peer() != null && bytes('payload') != null => PeerFound(
+        peer()!,
+        bytes('payload')!,
+      ),
       'peerLost' when peer() != null => PeerLost(peer()!),
       'pipeOpened' when peer() != null => PipeOpened(peer()!),
       'pipeFailed' when peer() != null => PipeFailed(
@@ -187,7 +193,10 @@ class BleChannel {
         map['why'] as String? ?? 'unspecified',
       ),
       'pipeClosed' when peer() != null => PipeClosed(peer()!),
-      'received' when peer() != null => Received(peer()!, bytes('bytes')),
+      'received' when peer() != null && bytes('bytes') != null => Received(
+        peer()!,
+        bytes('bytes')!,
+      ),
       'availability' => Availability(
         map['available'] as bool? ?? false,
         map['reason'] as String?,

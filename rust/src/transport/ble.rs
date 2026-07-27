@@ -24,8 +24,13 @@
 //! - **Silence after shutdown** (rule 6). Late events from a radio that has not
 //!   finished tearing down are expected, and dropped here.
 //! - **Refusing to rotate under an open pipe** (rule 4).
-//! - **`PipeClosed` for a pipe that never opened** (rule 2). Reported as
-//!   `PipeFailed` if it was a dial, swallowed otherwise.
+//! - **`PipeClosed` for a pipe that never opened** (rule 2). Turned into
+//!   `PipeFailed`, because that is what the core acts on. We deliberately do
+//!   *not* track which peers we dialled in order to tell a failed dial from an
+//!   unsolicited close: that is state the adapter's own reconnection would keep
+//!   invalidating, and an unsolicited `PipeFailed` costs the core nothing —
+//!   whereas a `PipeClosed` for a pipe it never opened would have it tearing
+//!   down state it never built.
 //!
 //! An adapter that gets any of these wrong is still correct from the core's
 //! side, which is what makes per-OEM BLE quirks survivable.

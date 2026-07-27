@@ -168,6 +168,11 @@ void main() {
       final events = await decoded([
         {'type': 'peerFound'}, // no peer
         'not a map',
+        // A payload of the wrong type must drop the event rather than decode
+        // as an empty one — an empty payload is a *valid* advertisement, so
+        // substituting it would launder a bad frame into a plausible sighting.
+        {'type': 'peerFound', 'peer': 'a', 'payload': 'not bytes'},
+        {'type': 'received', 'peer': 'a', 'bytes': 42},
         {'type': 'somethingNewer', 'peer': 'a'}, // forward compatibility (§3)
         {'type': 'pipeOpened', 'peer': 'survivor'},
       ]).toList();
