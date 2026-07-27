@@ -171,6 +171,14 @@ fn conformance(p: Pair) {
     a.connect(&id_b).unwrap();
     opened(&rx_a, &id_b);
 
+    // Rule: the local id cannot rotate while a pipe is open — a connected peer
+    // knows us by the id it dialled (rule 4).
+    assert!(
+        a.set_local_id("rotated-while-open").is_err(),
+        "{}: rotation must be refused while a pipe is open",
+        a.name()
+    );
+
     // Rule: disconnect closes both ends and the pipe stops working.
     a.disconnect(&id_b).unwrap();
     closed(&rx_a, &id_b);
@@ -289,11 +297,23 @@ fn send_is_atomic_under_concurrency() {
         h.join().unwrap();
     }
 
-    // Every run of bytes must be whole: no value changes mid-message.
     let got = received_bytes(&rx_b, 2 * N);
-    let ones = got.iter().filter(|b| **b == 1).count();
-    assert_eq!(ones, N, "bytes were lost or duplicated");
     assert_eq!(got.len(), 2 * N);
+    assert_eq!(
+        got.iter().filter(|b| **b == 1).count(),
+        N,
+        "bytes lost or duplicated"
+    );
+
+    // The real assertion: each send must appear as ONE unbroken run. Counting
+    // bytes alone would happily accept 1,2,1,2,… — precisely the interleaving
+    // this test exists to catch — so count transitions instead. Two atomic
+    // sends in either order give exactly one transition.
+    let transitions = got.windows(2).filter(|w| w[0] != w[1]).count();
+    assert_eq!(
+        transitions, 1,
+        "sends interleaved: {transitions} transitions, expected 1 (bytes were cut apart)"
+    );
 }
 
 /// No Transport method may invoke the sink before it returns: the core calls
@@ -439,4 +459,35 @@ fn lan_discovers_a_peer_over_mdns() {
     // Discovery gave us an address: the pipe opens without a manual dial.
     a.connect("mdns-b").unwrap();
     opened(&rx_a, "mdns-b");
+}
+
+/// A peer that dialled us must be reachable afterwards — which means recording
+/// the *listening* port it advertised, not the ephemeral source port the
+/// kernel assigned to its outbound connection.
+#[test]
+fn lan_records_a_dialable_address_for_an_inbound_peer() {
+    let (sink_a, rx_a) = recorder();
+    let (sink_b, rx_b) = recorder();
+    let a = LanTransport::new("db-a", sink_a).unwrap();
+    let b = LanTransport::new("db-b", sink_b).unwrap();
+
+    // b dials a; a learns about b only from the inbound connection.
+    b.add_peer_addr("db-a", ([127, 0, 0, 1], a.port()).into());
+    b.connect("db-a").unwrap();
+    opened(&rx_a, "db-b");
+    opened(&rx_b, "db-a");
+
+    // The address a recorded must be b's listener, not b's source port.
+    assert!(
+        a.peer_addrs("db-b").iter().any(|s| s.port() == b.port()),
+        "recorded {:?}, expected b's listening port {}",
+        a.peer_addrs("db-b"),
+        b.port()
+    );
+
+    // And it must actually work after the original connection is gone.
+    b.disconnect("db-a").unwrap();
+    closed(&rx_a, "db-b");
+    a.connect("db-b").unwrap();
+    opened(&rx_a, "db-b");
 }

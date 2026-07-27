@@ -153,8 +153,15 @@ pub trait Transport: Send + Sync {
 
     /// Change how we appear to peers. Rotating the local id is how a rung
     /// implements unlinkability (tech spec §4): rotating only the payload while
-    /// a stable name rides alongside it lets an observer link across
-    /// rotations. Open pipes are unaffected. Cadence is the core's decision.
+    /// a stable name rides alongside it lets an observer link across rotations.
+    /// Cadence is the core's decision.
+    ///
+    /// **Refused while any pipe is open** ([`TransportError::Unavailable`]).
+    /// A connected peer knows us by the id it dialled, and rule 4 forbids
+    /// renaming a peer under an open pipe — so the core rotates when idle. A
+    /// future rung whose link layer decouples identity from the advertisement
+    /// (BLE keeps a connection handle valid across RPA rotation) may relax
+    /// this, but only by keeping connected peers' view unchanged.
     fn set_local_id(&self, id: &str) -> Result<(), TransportError>;
 
     /// Advertise `payload` so peers can discover us. Calling again replaces the

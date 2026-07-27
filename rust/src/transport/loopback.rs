@@ -148,6 +148,14 @@ impl Transport for LoopbackTransport {
             return Ok(());
         }
         let mut state = self.net.lock();
+        // Renaming while connected would leave peers holding pipes under an id
+        // that no longer exists, and would rename a peer under an open pipe
+        // (contract rule 4). The core rotates when idle.
+        if state.nodes.get(&*id).is_some_and(|n| !n.pipes.is_empty()) {
+            return Err(TransportError::Unavailable(
+                "cannot rotate the local id while pipes are open".into(),
+            ));
+        }
         let Some(node) = state.nodes.remove(&*id) else {
             return Err(TransportError::Unavailable("node has shut down".into()));
         };

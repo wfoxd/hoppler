@@ -316,7 +316,7 @@ impl LanTransport {
                 return Err(io_err(e));
             }
         };
-        send_hello(&stream, &self.inner.id())?;
+        send_hello(&stream, &self.inner.id(), self.inner.port)?;
         self.inner.adopt(peer.to_string(), stream, Some(addr), true);
         Ok(())
     }
@@ -371,11 +371,22 @@ fn dial_race(candidates: &[SocketAddr]) -> Result<(TcpStream, SocketAddr), Trans
     }
 }
 
-fn send_hello(mut stream: &TcpStream, node_id: &str) -> Result<(), TransportError> {
+/// `[len][node_id][listen_port:2]`.
+///
+/// The port matters: the accepting side sees only the dialer's *ephemeral
+/// source* port, which is useless for dialling back once this connection
+/// closes. Carrying the listening port is what makes "a peer that dialled us
+/// is dialable back" (contract rule 5) actually true rather than nominally so.
+fn send_hello(
+    mut stream: &TcpStream,
+    node_id: &str,
+    listen_port: u16,
+) -> Result<(), TransportError> {
     let bytes = node_id.as_bytes();
-    let mut hello = Vec::with_capacity(1 + bytes.len());
+    let mut hello = Vec::with_capacity(3 + bytes.len());
     hello.push(bytes.len() as u8);
     hello.extend_from_slice(bytes);
+    hello.extend_from_slice(&listen_port.to_be_bytes());
     stream.write_all(&hello).map_err(io_err)
 }
 
@@ -385,7 +396,7 @@ fn send_hello(mut stream: &TcpStream, node_id: &str) -> Result<(), TransportErro
 /// alone would not do: `SO_RCVTIMEO` applies per `read` syscall, so a peer
 /// dribbling one byte at a time resets it indefinitely and holds the
 /// handshake open forever.
-fn read_hello_by(stream: &mut TcpStream, deadline: Instant) -> std::io::Result<String> {
+fn read_hello_by(stream: &mut TcpStream, deadline: Instant) -> std::io::Result<(String, u16)> {
     fn fill(stream: &mut TcpStream, buf: &mut [u8], deadline: Instant) -> std::io::Result<()> {
         let mut filled = 0;
         while filled < buf.len() {
@@ -414,8 +425,11 @@ fn read_hello_by(stream: &mut TcpStream, deadline: Instant) -> std::io::Result<S
     fill(stream, &mut len, deadline)?;
     let mut id = vec![0u8; len[0] as usize];
     fill(stream, &mut id, deadline)?;
-    String::from_utf8(id)
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "node id not utf-8"))
+    let mut port = [0u8; 2];
+    fill(stream, &mut port, deadline)?;
+    let id = String::from_utf8(id)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "node id not utf-8"))?;
+    Ok((id, u16::from_be_bytes(port)))
 }
 
 /// Every address a resolved service might be dialled at, best first, capped at
@@ -493,12 +507,17 @@ fn accept_loop(inner: Arc<Inner>, listener: TcpListener) {
             let pending = Arc::clone(&inner.pending_handshakes);
             let identified = read_hello_by(&mut stream, Instant::now() + HELLO_DEADLINE);
             pending.fetch_sub(1, Ordering::SeqCst);
-            let Ok(peer) = identified else { return };
+            let Ok((peer, listen_port)) = identified else {
+                return;
+            };
             if check_label(&peer).is_err() {
                 return;
             }
             let _ = stream.set_read_timeout(None);
-            inner.adopt(peer, stream, addr, false);
+            // Their source port is ephemeral; pair their IP with the listening
+            // port they told us about, or the address is undialable later.
+            let dialable = addr.map(|a| SocketAddr::new(a.ip(), listen_port));
+            inner.adopt(peer, stream, dialable, false);
         });
     }
 }
@@ -520,8 +539,19 @@ impl Transport for LanTransport {
     }
 
     fn set_local_id(&self, new_id: &str) -> Result<(), TransportError> {
-        if new_id.is_empty() || new_id.len() > 255 {
-            return Err(unavailable("node_id must be 1..=255 bytes"));
+        check_label(new_id)?;
+        // Same rule on every rung: a connected peer knows us by the id it
+        // dialled, so the core rotates when idle (contract rule 4).
+        if !self
+            .inner
+            .pipes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+        {
+            return Err(TransportError::Unavailable(
+                "cannot rotate the local id while pipes are open".into(),
+            ));
         }
         let mut id = self
             .inner
@@ -688,7 +718,7 @@ impl Transport for LanTransport {
                 return Err(e);
             }
         };
-        send_hello(&stream, &self.inner.id())?;
+        send_hello(&stream, &self.inner.id(), self.inner.port)?;
         self.inner.adopt(peer.to_string(), stream, Some(addr), true);
         Ok(())
     }
