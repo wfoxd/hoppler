@@ -90,7 +90,14 @@ impl LoopbackNet {
                 }
             }
         });
-        self.lock().nodes.insert(
+        let mut state = self.lock();
+        // Silently replacing an existing node would strand its transport with
+        // a live handle onto an airspace that no longer knows it.
+        assert!(
+            !state.nodes.contains_key(&id),
+            "loopback id {id:?} is already in this airspace"
+        );
+        state.nodes.insert(
             id.clone(),
             Node {
                 tx: Some(tx),
@@ -99,6 +106,7 @@ impl LoopbackNet {
                 pipes: Vec::new(),
             },
         );
+        drop(state);
         LoopbackTransport {
             id: Mutex::new(id),
             net: self.clone(),

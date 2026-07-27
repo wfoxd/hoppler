@@ -486,11 +486,13 @@ fn check_label(id: &str) -> Result<(), TransportError> {
     if id.is_empty() || id.len() > 63 {
         return Err(unavailable("node_id must be 1..=63 bytes"));
     }
-    if !id
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-    {
-        return Err(unavailable("node_id must be alphanumeric, '-' or '_'"));
+    // The id also becomes a hostname label (`{id}.local.`), where only
+    // alphanumerics and '-' are valid, and '-' may not lead or trail.
+    if !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        return Err(unavailable("node_id must be alphanumeric or '-'"));
+    }
+    if id.starts_with('-') || id.ends_with('-') {
+        return Err(unavailable("node_id must not start or end with '-'"));
     }
     Ok(())
 }
@@ -590,8 +592,13 @@ impl Transport for LanTransport {
             .clone();
         if payload.is_some() {
             // Withdraw the old name before publishing the new one: a rotation
-            // that leaves both visible is not a rotation.
-            let _ = self.inner.mdns.unregister(&Self::fullname(&id));
+            // that leaves both visible is not a rotation. If the withdrawal
+            // fails we must NOT report success — a caller told the id rotated
+            // would believe it unlinkable while the old name still answers.
+            self.inner
+                .mdns
+                .unregister(&Self::fullname(&id))
+                .map_err(unavailable)?;
         }
         *id = new_id.to_string();
         drop(id);
@@ -652,8 +659,14 @@ impl Transport for LanTransport {
                 match event {
                     ServiceEvent::ServiceResolved(info) => {
                         let peer = info.fullname.split('.').next().unwrap_or("").to_string();
-                        if peer.is_empty() || peer == inner.id() {
+                        if peer == inner.id() {
                             continue; // never discover ourselves
+                        }
+                        // The name came off the network: hold it to the same
+                        // rule as our own before it becomes a PeerId and
+                        // travels up to the core.
+                        if check_label(&peer).is_err() {
+                            continue;
                         }
                         let payload = info
                             .txt_properties
@@ -681,7 +694,7 @@ impl Transport for LanTransport {
                     }
                     ServiceEvent::ServiceRemoved(_, fullname) => {
                         let peer = fullname.split('.').next().unwrap_or("").to_string();
-                        if peer.is_empty() || peer == inner.id() {
+                        if peer == inner.id() || check_label(&peer).is_err() {
                             continue;
                         }
                         inner
