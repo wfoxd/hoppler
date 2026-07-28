@@ -127,6 +127,12 @@ impl Response {
     pub fn encode(&self) -> Vec<u8> {
         match self {
             Response::Silence => Vec::new(),
+            // A record too large for the length prefix would be truncated by
+            // the cast below and put a corrupt frame on the wire. `Response` is
+            // public, so this is reachable from outside this module — refuse
+            // through the same silence every other refusal uses rather than
+            // emitting something a peer would mis-parse.
+            Response::Persona(record) if record.len() > MAX_RECORD_LEN => Vec::new(),
             Response::Persona(record) => {
                 let mut out = Vec::with_capacity(3 + record.len());
                 out.push(VERSION);

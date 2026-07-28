@@ -243,17 +243,20 @@ impl Discovery {
     pub fn on_event(&self, event: TransportEvent, now: Instant) {
         match event {
             TransportEvent::PeerFound { peer, .. } => {
+                // Re-sent whenever the advertised payload changes (T08 rule on
+                // PeerFound), so this fires repeatedly for a peer we already
+                // know. Overwriting would discard a persona we have already
+                // fetched and signature-checked, and the UI would watch names
+                // blink out for no reason the user could see.
                 self.inner
                     .sightings
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .insert(
-                        peer.clone(),
-                        Sighting {
-                            peer,
-                            persona: None,
-                        },
-                    );
+                    .entry(peer.clone())
+                    .or_insert(Sighting {
+                        peer,
+                        persona: None,
+                    });
             }
             TransportEvent::PeerLost { peer } => {
                 self.inner
@@ -317,25 +320,37 @@ impl Discovery {
             Requester::Pseudonym(request.pseudonym)
         };
 
-        // Rate limit *before* the blocklist and before any disclosure: the
-        // ordering is what lets us shed load without leaking whether the
-        // pseudonym was one we know.
-        let within_allowance = self
-            .inner
-            .buckets
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .allow(&who, now);
-
-        let blocked = !request.is_first_contact()
-            && self
+        // One `Silence` return, reached three ways. Short-circuiting on the
+        // toggle first means an off device charges nothing: otherwise requests
+        // arriving while off would spend a stranger's allowance and suppress
+        // their first legitimate ask moments after Discovery came back on —
+        // and the bucket map would grow for a device that is answering nobody.
+        //
+        // The order is not observable: every path below sends the same nothing,
+        // and none of them sends it at a different time.
+        let refuse = !self.is_on() || {
+            // Rate limit before the blocklist and before any disclosure, so
+            // load can be shed without leaking whether the pseudonym is one we
+            // recognise.
+            let within_allowance = self
                 .inner
-                .blocked
+                .buckets
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .contains(&request.pseudonym);
+                .allow(&who, now);
 
-        if !within_allowance || blocked || !self.is_on() {
+            let blocked = !request.is_first_contact()
+                && self
+                    .inner
+                    .blocked
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains(&request.pseudonym);
+
+            !within_allowance || blocked
+        };
+
+        if refuse {
             return Response::Silence;
         }
 

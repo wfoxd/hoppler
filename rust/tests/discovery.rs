@@ -80,7 +80,13 @@ fn node(net: &LoopbackNet, id: &str, now: Instant) -> Node {
 /// Everything a requester gets back after asking, as raw bytes.
 fn ask(asker: &Node, responder: &Node, request: &Request, now: Instant) -> Vec<u8> {
     drain(&asker.rx);
-    asker.transport.send(&responder.id, &request.encode()).ok();
+    // Not `.ok()`: a failed send also produces an empty reply, so swallowing it
+    // would let every silence assertion pass without the responder ever having
+    // been asked anything.
+    asker
+        .transport
+        .send(&responder.id, &request.encode())
+        .expect("the request never reached the responder");
     pump(&responder.discovery, &responder.rx, now);
     let mut got = Vec::new();
     while let Ok(event) = asker.rx.recv_timeout(Duration::from_millis(150)) {
@@ -448,4 +454,82 @@ fn the_allowance_is_per_pseudonym_and_recovers() {
         !ask(&asker, &responder, &Request::new(noisy), later).is_empty(),
         "the allowance never recovered"
     );
+}
+
+/// `PeerFound` is re-sent whenever the advertised payload changes, so it fires
+/// repeatedly for a peer we already know. A verified persona must survive that
+/// — otherwise names blink out of the UI for a reason no user could explain.
+#[test]
+fn a_repeat_sighting_does_not_discard_a_verified_persona() {
+    let net = LoopbackNet::new();
+    let now = Instant::now();
+    let watcher = node(&net, "watcher", now);
+    let subject = node(&net, "subject", now);
+    watcher.discovery.start_scanning().unwrap();
+    subject.discovery.set_enabled(true, now).unwrap();
+    pump(&watcher.discovery, &watcher.rx, now);
+
+    let peer = watcher.discovery.sightings()[0].peer.clone();
+    let record = Identity::generate("real", 1).persona_record();
+    watcher.discovery.accept_persona(&peer, &record).unwrap();
+    assert!(watcher.discovery.sightings()[0].persona.is_some());
+
+    // The same peer advertises again — a new payload, the same id.
+    watcher.discovery.on_event(
+        TransportEvent::PeerFound {
+            peer: peer.clone(),
+            payload: b"changed".to_vec(),
+        },
+        now,
+    );
+    assert!(
+        watcher.discovery.sightings()[0].persona.is_some(),
+        "a repeat sighting cleared a persona that had already been verified"
+    );
+}
+
+/// A device that is answering nobody must not spend anybody's allowance.
+/// Otherwise requests arriving while Discovery is off suppress a requester's
+/// first legitimate ask moments after it comes back on — and the bucket map
+/// grows for a device that is not talking to anyone.
+#[test]
+fn requests_while_discovery_is_off_do_not_consume_the_allowance() {
+    let net = LoopbackNet::new();
+    let now = Instant::now();
+    let asker = node(&net, "asker", now);
+    let responder = node(&net, "responder", now);
+    connected(&net, &asker, &responder);
+
+    // Well past the burst, all while off.
+    let who = [21u8; PSEUDONYM_LEN];
+    for _ in 0..50 {
+        assert!(ask(&asker, &responder, &Request::new(who), now).is_empty());
+    }
+
+    // Now open up: the very first ask must be served.
+    responder.discovery.set_enabled(true, now).unwrap();
+    assert!(
+        !ask(&asker, &responder, &Request::new(who), now).is_empty(),
+        "an allowance spent while Discovery was off suppressed the first real \
+         request after it came back on"
+    );
+}
+
+/// `Response` is public, so a record too large for the 2-byte length prefix is
+/// reachable from outside the module. It must refuse rather than emit a frame
+/// whose length field has silently wrapped.
+#[test]
+fn an_oversized_record_is_refused_rather_than_truncated_on_the_wire() {
+    let huge = Response::Persona(vec![0u8; 70_000]);
+    assert_eq!(
+        huge.encode(),
+        Vec::<u8>::new(),
+        "an oversized record was encoded — its length field wrapped, and the \
+         peer would parse a frame that means something else entirely"
+    );
+    // The bound is the protocol's, not u16's: anything above it is refused.
+    let over = Response::Persona(vec![0u8; 4097]);
+    assert!(over.encode().is_empty());
+    let ok = Response::Persona(vec![0u8; 4096]);
+    assert!(!ok.encode().is_empty(), "a legal record was refused");
 }
