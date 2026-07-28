@@ -80,7 +80,7 @@ impl Buckets {
     /// Returns whether this requester is within its allowance, and charges it.
     fn allow(&mut self, who: &Requester, now: Instant) -> bool {
         let entry = self.hits.entry(who.clone()).or_insert((0, now));
-        if now.duration_since(entry.1) >= RATE_LIMIT_WINDOW {
+        if now.saturating_duration_since(entry.1) >= RATE_LIMIT_WINDOW {
             *entry = (0, now);
         }
         entry.0 += 1;
@@ -91,7 +91,7 @@ impl Buckets {
     /// stranger seen, for the life of the process.
     fn sweep(&mut self, now: Instant) {
         self.hits
-            .retain(|_, (_, seen)| now.duration_since(*seen) < RATE_LIMIT_WINDOW);
+            .retain(|_, (_, seen)| now.saturating_duration_since(*seen) < RATE_LIMIT_WINDOW);
     }
 }
 
@@ -204,7 +204,7 @@ impl Discovery {
                 .last_rotation
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            now.duration_since(*last) >= ROTATION_PERIOD
+            now.saturating_duration_since(*last) >= ROTATION_PERIOD
         };
         if due {
             self.rotate(now)?;
