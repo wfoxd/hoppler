@@ -88,6 +88,39 @@ object BleFraming {
             id.all { (it in 'a'..'z') || (it in 'A'..'Z') || (it in '0'..'9') || it == '-' }
 
     /**
+     * The hello a dialer writes immediately on connect: `[len:1][id]`.
+     *
+     * The listener cannot identify a caller any other way — the MAC it sees
+     * rotates and is not what the core knows the peer by.
+     */
+    fun hello(localId: String): ByteArray {
+        val id = localId.toByteArray(Charsets.US_ASCII)
+        require(id.size in 1..MAX_ID) { "local id must be 1..$MAX_ID bytes" }
+        return ByteArray(1 + id.size).also {
+            it[0] = id.size.toByte()
+            id.copyInto(it, 1)
+        }
+    }
+
+    /**
+     * Decode the id out of a hello body, or null if it is not usable.
+     *
+     * Checked as strictly as an advertisement, and for a sharper reason: an
+     * accepted connection costs a socket and a reader thread. An id the core
+     * will reject leaves the adapter holding both for a pipe the core does not
+     * know exists — so it can never ask for it to be closed. Anyone in radio
+     * range could exhaust the device that way.
+     */
+    fun helloId(idBytes: ByteArray): String? {
+        // No separate length guard: US-ASCII gives one char per byte, so
+        // `isValidPeerId` already bounds this. A mutation test showed the extra
+        // check could be deleted without failing anything, which is the
+        // definition of code that is not carrying its weight.
+        val id = String(idBytes, Charsets.US_ASCII)
+        return if (isValidPeerId(id)) id else null
+    }
+
+    /**
      * Whether a fresh sighting is news worth telling the core.
      *
      * `PeerFound` is "latest known", so repeating an unchanged advertisement is

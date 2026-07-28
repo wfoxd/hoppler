@@ -382,7 +382,7 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
     private fun readHello(socket: BluetoothSocket): String? {
         val input = socket.inputStream
         val len = input.read()
-        if (len <= 0 || len > 63) return null
+        if (len <= 0 || len > BleFraming.MAX_ID) return null
         val buf = ByteArray(len)
         var read = 0
         while (read < len) {
@@ -390,7 +390,9 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
             if (n < 0) return null
             read += n
         }
-        return String(buf, Charsets.US_ASCII)
+        // Validated, not merely decoded: an id the core rejects would leave us
+        // holding a socket and a reader thread for a pipe it never hears about.
+        return BleFraming.helloId(buf)
     }
 
     @SuppressLint("MissingPermission")
@@ -405,10 +407,8 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
             try {
                 val socket = sighting.device.createInsecureL2capChannel(sighting.advert.psm)
                 socket.connect()
-                val id = (localId ?: "").toByteArray(Charsets.US_ASCII)
                 socket.outputStream.apply {
-                    write(byteArrayOf(id.size.toByte()))
-                    write(id)
+                    write(BleFraming.hello(localId ?: ""))
                     flush()
                 }
                 openPipe(peer, socket)

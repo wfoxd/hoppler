@@ -114,6 +114,41 @@ class BleFramingTest {
         assertNull(BleFraming.unframe(bytes(0xFF, 0xFF, 0x02, 0x00, 0x01)))
     }
 
+    // ── the hello ───────────────────────────────────────────────────────────
+
+    @Test
+    fun `a hello round trips`() {
+        val hello = BleFraming.hello("node-a")
+        assertEquals(7, hello.size)
+        assertEquals(6, hello[0].toInt())
+        assertEquals("node-a", BleFraming.helloId(hello.copyOfRange(1, hello.size)))
+    }
+
+    @Test
+    fun `an inbound id that breaks the rule is refused`() {
+        // Sharper than the advertisement case: an accepted connection costs a
+        // socket and a reader thread, and an id the core rejects leaves the
+        // adapter holding both for a pipe the core never hears about — so it
+        // can never ask for it to be closed. Anyone in range could exhaust the
+        // device that way.
+        for (bad in listOf("has.dot", "has:colon", "-lead", "trail-", "sp ace", "null\u0000")) {
+            assertNull(
+                "accepted inbound id '$bad'",
+                BleFraming.helloId(bad.toByteArray(Charsets.US_ASCII))
+            )
+        }
+    }
+
+    @Test
+    fun `an empty or oversized hello body is refused`() {
+        assertNull(BleFraming.helloId(ByteArray(0)))
+        assertNull(BleFraming.helloId(ByteArray(BleFraming.MAX_ID + 1) { 'a'.code.toByte() }))
+        assertEquals(
+            "a".repeat(BleFraming.MAX_ID),
+            BleFraming.helloId(ByteArray(BleFraming.MAX_ID) { 'a'.code.toByte() })
+        )
+    }
+
     // ── the sighting decision ───────────────────────────────────────────────
 
     @Test
