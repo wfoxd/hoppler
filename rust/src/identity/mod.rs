@@ -48,6 +48,22 @@ use crate::proto::v0::{PersonaBody, SignedPersona};
 /// Domain-separation label for the pseudonym KDF. Versioned: changing it is a
 /// wire-protocol break, so it is frozen for compatible builds.
 const PSEUDONYM_LABEL: &[u8] = b"hoppler/pseudonym/v1";
+/// Label for the Noise IK static this device answers on.
+///
+/// Derived rather than converted from the Ed25519 signing key, so no one key is
+/// used for both signing and Diffie-Hellman.
+///
+/// The label is belt-and-braces, not the actual separation: this derives from
+/// the *Layer-2* seed salted with the Layer-2 public, while a pseudonym derives
+/// from the *Layer-1* seed salted with a counterpart's key, so the two cannot
+/// collide even under one label. Said plainly because a mutation test showed
+/// swapping this label for `PSEUDONYM_LABEL` changes nothing observable — the
+/// comment claiming the label prevented collisions was overstating it.
+const SESSION_LABEL: &[u8] = b"hoppler/session-static/v1";
+/// Domain separator for the signature binding a persona to the Noise static
+/// presented alongside it. Prefixed to the key bytes so this signature can
+/// never be mistaken for — or replayed as — a signature over anything else.
+const BINDING_LABEL: &[u8] = b"hoppler/session-binding/v1";
 
 /// Hard cap on an untrusted persona record's wire size (parallels
 /// `crypto::envelope::MAX_WIRE_LEN`). A record is ~200 bytes; this is slack.
@@ -112,6 +128,9 @@ pub struct VerifiedPersona {
     pub name: String,
     pub colour: u32,
     pub version: u32,
+    /// The X25519 static to open a Noise IK session toward this device.
+    /// Signed alongside the rest, so it cannot be swapped in flight.
+    pub session_pub: dh::DhPublic,
 }
 
 /// Errors from persona-record verification.
@@ -192,12 +211,31 @@ impl Identity {
     }
 
     /// Encode a self-signed persona record for Discovery and unpaired Pings.
+    /// The X25519 secret this device answers Noise IK on (tech spec §5).
+    ///
+    /// Derived from the Layer-2 seed under its own label. Stable across
+    /// counterparties by necessity — IK requires the initiator to know it in
+    /// advance — which is why it is the *responder's* side only. The
+    /// initiator's static stays [`Self::pseudonym_toward`], so a block still
+    /// binds to Layer-1 and survives a regenerated persona (R0-F10).
+    pub fn session_secret(&self) -> dh::DhSecret {
+        let seed = self.layer2.to_seed();
+        let scalar = kdf::derive_32(&*seed, &self.layer2.public().0, SESSION_LABEL);
+        dh::DhSecret::from_bytes(&scalar)
+    }
+
+    /// The public half, published in the persona record.
+    pub fn session_public(&self) -> dh::DhPublic {
+        self.session_secret().public()
+    }
+
     pub fn persona_record(&self) -> Vec<u8> {
         let body = PersonaBody {
             l2_pub: self.layer2.public().0.to_vec(),
             name: self.persona.name.clone(),
             colour: self.persona.colour,
             version: self.persona.version,
+            session_pub: self.session_public().0.to_vec(),
         };
         let body_bytes = body.encode_to_vec();
         let signature = self.layer2.sign(&body_bytes).0.to_vec();
@@ -206,6 +244,18 @@ impl Identity {
             signature,
         }
         .encode_to_vec()
+    }
+
+    /// Sign a Noise static, binding it to this persona.
+    ///
+    /// Without this a handshake payload proves only that *some* valid persona
+    /// record exists — and records are public, so anyone who has discovered
+    /// Alice can present hers. The counterparty cannot recompute an initiator's
+    /// pseudonym (it comes from a Layer-1 seed only that device holds), so the
+    /// binding has to be asserted by the holder rather than derived by the
+    /// verifier. This is that assertion.
+    pub fn bind_session_static(&self, static_pub: &dh::DhPublic) -> sign::Signature {
+        self.layer2.sign(&binding_message(static_pub))
     }
 
     /// The private pseudonym secret toward a counterpart — the Noise static key
@@ -227,6 +277,29 @@ impl Identity {
     pub fn pseudonym_toward(&self, counterpart_l2: &sign::PublicKey) -> dh::DhPublic {
         self.pseudonym_secret_toward(counterpart_l2).public()
     }
+}
+
+/// The bytes a session binding signs.
+fn binding_message(static_pub: &dh::DhPublic) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(BINDING_LABEL.len() + dh::PUBLIC_LEN);
+    msg.extend_from_slice(BINDING_LABEL);
+    msg.extend_from_slice(&static_pub.0);
+    msg
+}
+
+/// Check that `static_pub` was bound to `l2_pub` by whoever holds that persona.
+///
+/// The counterpart to [`Identity::bind_session_static`]. A handshake that skips
+/// this accepts any valid persona record alongside any proven static, which
+/// means presenting somebody else's persona — they are public — and being
+/// believed.
+pub fn verify_session_binding(
+    l2_pub: &sign::PublicKey,
+    static_pub: &dh::DhPublic,
+    signature: &sign::Signature,
+) -> Result<(), IdentityError> {
+    sign::verify(l2_pub, &binding_message(static_pub), signature)
+        .map_err(|_| IdentityError::RecordSignatureInvalid)
 }
 
 /// Verify a persona record against its own embedded Layer-2 key. Returns the
@@ -259,6 +332,15 @@ pub fn verify_persona_record(wire: &[u8]) -> Result<VerifiedPersona, IdentityErr
         .try_into()
         .map_err(|_| IdentityError::MalformedRecord)?;
 
+    // Length-checked before the signature, like every other field: a record
+    // that verifies but carries a truncated session key would be accepted and
+    // then fail deep inside a handshake, where the cause is far less obvious.
+    let session_bytes: [u8; dh::PUBLIC_LEN] = body
+        .session_pub
+        .as_slice()
+        .try_into()
+        .map_err(|_| IdentityError::MalformedRecord)?;
+
     let l2_pub = sign::PublicKey(l2_bytes);
     let signature = sign::Signature(sig_bytes);
     sign::verify(&l2_pub, &signed.body, &signature)
@@ -269,6 +351,7 @@ pub fn verify_persona_record(wire: &[u8]) -> Result<VerifiedPersona, IdentityErr
         name: body.name,
         colour: body.colour & COLOUR_MASK,
         version: body.version,
+        session_pub: dh::DhPublic(session_bytes),
     })
 }
 
@@ -321,6 +404,7 @@ mod tests {
             name: "Alice".into(),
             colour: 1,
             version: 1,
+            session_pub: alice.session_public().0.to_vec(),
         };
         let body_bytes = body.encode_to_vec();
         let forged = SignedPersona {
@@ -375,6 +459,12 @@ mod tests {
         // Ed25519 signatures are deterministic, so a fixed identity + fields
         // yields fixed record bytes — guards field numbers and the signing
         // input against drift with the generated Dart types.
+        //
+        // Updated once, deliberately, when T10 added `session_pub` (field 5)
+        // for the Noise IK static. The record is a signed wire format, so a
+        // change here is a compatibility break by definition; this test failing
+        // is the intended way to find that out, and the value below was
+        // regenerated rather than the assertion relaxed.
         let id = Identity::from_parts(
             &[1u8; 32],
             &[2u8; 32],
@@ -386,7 +476,7 @@ mod tests {
         );
         assert_eq!(
             hex::encode(id.persona_record()),
-            "0a2c0a208139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b3941202416c18b3c444200112405980c0b297ad871a3d17791c37b3fa3d0c8e59ad256a1b785e19b1aea7a044a7fbbb6d26d2e83217ef9929762ca3d5a1e5420ebb80972fc8d92bb85d94375f00"
+            "0a4e0a208139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b3941202416c18b3c44420012a205d68c2494c6dac04b0b0c1ca0d2428f33238e9758dc813b2fe3ba648ffc1440b12404dce095dae543983530dcf9ac2480a87abaa9d5df3c34f51bc4c0fc21c6ab24e27a0432949f5daf6c80189b3ebc81a44710016da2dfe99417c4a84ad043dbf0e"
         );
     }
 
@@ -429,6 +519,7 @@ mod tests {
             name: "n".repeat(MAX_PERSONA_NAME_LEN + 1),
             colour: 0,
             version: 1,
+            session_pub: vec![0u8; dh::PUBLIC_LEN],
         };
         let body_bytes = body.encode_to_vec();
         let record = SignedPersona {

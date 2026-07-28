@@ -53,6 +53,19 @@ impl DhSecret {
         DhPublic(XPublicKey::from(&self.inner).to_bytes())
     }
 
+    /// The raw scalar, for handing to a vetted Noise implementation that has to
+    /// own the key material itself.
+    ///
+    /// Deliberately `pub(crate)` and deliberately awkward. `DhSecret` has no
+    /// `Debug` and no public accessor precisely so a private key cannot end up
+    /// in a log or a store by accident; this is the one door, it returns a
+    /// `Zeroizing` copy that wipes on drop, and the only caller is
+    /// `session::handshake`. Anything else wanting bytes out of a private key
+    /// is a bug worth arguing about rather than a call worth adding.
+    pub(crate) fn expose_secret(&self) -> Zeroizing<[u8; SECRET_LEN]> {
+        Zeroizing::new(self.inner.to_bytes())
+    }
+
     /// Compute the shared secret with `their_public`.
     ///
     /// Rejects non-contributory exchanges: a low-order (small-subgroup) peer
