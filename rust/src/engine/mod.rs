@@ -34,8 +34,12 @@ use crate::store::{
 
 struct Core {
     store: Store,
-    identity: Identity,
-    discovery_on: bool,
+    /// Shared with [`net::Net`] rather than owned: the persona endpoint must
+    /// serve what a rename produced, not what existed at start-up.
+    identity: Arc<Mutex<Identity>>,
+    /// The radio plane. `None` when no transport could be built — the app still
+    /// runs, reports itself unavailable, and does not pretend to be reachable.
+    net: Option<Arc<net::Net>>,
 }
 
 static CORE: Mutex<Option<Core>> = Mutex::new(None);
@@ -64,6 +68,40 @@ pub fn emit(event: CoreEvent) {
 
 /// Initialise the core at `support_dir`, returning the local persona.
 pub fn init(support_dir: String) -> Result<PersonaDto, String> {
+    let store = open_store(support_dir)?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let sink: crate::transport::EventSink = Box::new(move |e| {
+        let _ = tx.send(e);
+    });
+    let local_id = fresh_node_id();
+
+    // A transport that will not start is not fatal. The app runs, discovery
+    // reports itself unavailable, and every reach fails with a reason — which
+    // is what lets the UI say why instead of showing an empty list that reads
+    // as "nobody is nearby" (R0-F2).
+    let transport = crate::transport::lan::LanTransport::new(&local_id, sink)
+        .ok()
+        .map(|t| Arc::new(t) as Arc<dyn crate::transport::Transport>);
+    install(store, transport, &local_id, rx)
+}
+
+/// Initialise against a caller-supplied transport.
+///
+/// `CORE` is process-wide, so a test cannot stand two engines against each
+/// other; this is how a test drives the real engine over the loopback rung
+/// rather than opening sockets. Deliberately not on the `crate::api` surface —
+/// the bridge has no business offering it.
+pub fn init_with_transport(
+    support_dir: String,
+    transport: Arc<dyn crate::transport::Transport>,
+    local_id: &str,
+    events: std::sync::mpsc::Receiver<crate::transport::TransportEvent>,
+) -> Result<PersonaDto, String> {
+    let store = open_store(support_dir)?;
+    install(store, Some(transport), local_id, events)
+}
+
+fn open_store(support_dir: String) -> Result<Store, String> {
     let dir = PathBuf::from(support_dir);
     let db = dir.join("hoppler.db");
     let files = dir.join("files");
@@ -75,61 +113,144 @@ pub fn init(support_dir: String) -> Result<PersonaDto, String> {
     // failure is propagated with the DB preserved; `crypto_erase` is the only
     // path that may destroy data.
     let had_master = Store::master_is_sealed(keystore.as_ref());
-    let store = match Store::open(keystore.clone(), &db, &files) {
-        Ok(s) => s,
+    match Store::open(keystore.clone(), &db, &files) {
+        Ok(s) => Ok(s),
         Err(_) if !had_master && db.exists() => {
             reset_stale_db(&db)?;
             // The file store is keyed by the same (now absent) master, so its
             // ciphertext is likewise unrecoverable — clear it too.
             let _ = std::fs::remove_dir_all(&files);
-            Store::open(keystore, &db, &files).map_err(stringify)?
+            Store::open(keystore, &db, &files).map_err(stringify)
         }
-        Err(e) => return Err(stringify(e)),
-    };
+        Err(e) => Err(stringify(e)),
+    }
+}
 
-    let identity = Identity::generate("Me", 0x0044_88ff);
-    let dto = persona_dto(identity.persona());
+fn install(
+    store: Store,
+    transport: Option<Arc<dyn crate::transport::Transport>>,
+    local_id: &str,
+    events: std::sync::mpsc::Receiver<crate::transport::TransportEvent>,
+) -> Result<PersonaDto, String> {
+    let identity = Arc::new(Mutex::new(Identity::generate("Me", 0x0044_88ff)));
+    let dto = persona_dto(identity.lock().unwrap_or_else(|e| e.into_inner()).persona());
+
+    let net = transport.map(|t| {
+        let net = Arc::new(net::Net::new(
+            t,
+            identity.clone(),
+            local_id,
+            std::time::Instant::now(),
+        ));
+        spawn_pump(net.clone(), events);
+        net
+    });
+
     *CORE.lock().map_err(|_| "core lock".to_string())? = Some(Core {
         store,
         identity,
-        discovery_on: false,
+        net,
     });
     Ok(dto)
+}
+
+/// Drain transport events into `Net` and turn what it reports into `CoreEvent`s.
+///
+/// On its own thread because the alternative is doing radio work on whatever
+/// thread Dart happens to call in on, and because `emit` must never run while
+/// the store lock is held.
+fn spawn_pump(
+    net: Arc<net::Net>,
+    events: std::sync::mpsc::Receiver<crate::transport::TransportEvent>,
+) {
+    std::thread::Builder::new()
+        .name("hoppler-core-pump".into())
+        .spawn(move || {
+            while let Ok(event) = events.recv() {
+                for out in net.handle(event, std::time::Instant::now()) {
+                    on_net_event(&net, out);
+                }
+            }
+        })
+        .expect("core event pump");
+}
+
+/// A fresh node id for the rung: random, and carrying nothing derived from our
+/// keys, since anything with structure would survive rotation as a fingerprint.
+fn fresh_node_id() -> String {
+    let bytes = rng::random_array::<8>();
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 // ── identity ──────────────────────────────────────────────────────────────────
 
 pub fn current_persona() -> Result<PersonaDto, String> {
-    with_core(|core| Ok(persona_dto(core.identity.persona())))
+    with_core(|core| {
+        let identity = core.identity.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(persona_dto(identity.persona()))
+    })
 }
 
 pub fn update_persona(name: String, colour: u32) -> Result<PersonaDto, String> {
     with_core_mut(|core| {
-        core.identity.update_persona(name, colour);
-        Ok(persona_dto(core.identity.persona()))
+        let mut identity = core.identity.lock().unwrap_or_else(|e| e.into_inner());
+        identity.update_persona(name, colour);
+        Ok(persona_dto(identity.persona()))
     })
 }
 
 // ── discovery ─────────────────────────────────────────────────────────────────
 
 pub fn set_discovery(enabled: bool) -> Result<(), String> {
-    with_core_mut(|core| {
-        core.discovery_on = enabled;
-        Ok(())
-    })?;
-    let devices = if enabled { fake::nearby() } else { Vec::new() };
-    emit(CoreEvent::DiscoveryUpdated { devices });
+    let net = require_net()?;
+    net.discovery()
+        .set_enabled(enabled, std::time::Instant::now())
+        .map_err(|e| e.to_string())?;
+    if enabled {
+        net.discovery()
+            .start_scanning()
+            .map_err(|e| e.to_string())?;
+    }
+    emit(CoreEvent::DiscoveryUpdated {
+        devices: nearby_devices()?,
+    });
     Ok(())
 }
 
+/// The devices currently visible.
+///
+/// Empty while Discovery is off is *our* choice, not the transport's: sightings
+/// survive `stop_scanning` at the rung (a peer seen a moment ago is still
+/// reachable, and rule 5's dial-back depends on the record), and hiding them is
+/// a core-layer decision. See the note on `Transport::peers`.
 pub fn nearby_devices() -> Result<Vec<NearbyDevice>, String> {
-    with_core(|core| {
-        Ok(if core.discovery_on {
-            fake::nearby()
-        } else {
-            Vec::new()
+    let net = match with_core(|core| Ok(core.net.clone()))? {
+        Some(net) => net,
+        None => return Ok(Vec::new()),
+    };
+    if !net.discovery().is_on() {
+        return Ok(Vec::new());
+    }
+    Ok(net
+        .discovery()
+        .sightings()
+        .into_iter()
+        .map(|s| {
+            // A peer whose persona we have not fetched yet is real and
+            // reachable; showing it unnamed beats hiding it until a round trip
+            // completes, which is what "who's nearby" is asking.
+            let (name, colour) = match &s.persona {
+                Some(p) => (p.name.clone(), p.colour),
+                None => (String::new(), 0),
+            };
+            NearbyDevice {
+                device_id: s.peer,
+                name,
+                colour,
+                paired: false,
+            }
         })
-    })
+        .collect())
 }
 
 // ── sessions / threads ────────────────────────────────────────────────────────
@@ -141,15 +262,16 @@ pub fn nearby_devices() -> Result<Vec<NearbyDevice>, String> {
 /// receiver-side rate limiter (tech spec §7) arrive with the session layer
 /// (T09/T10); here reachability is modelled by our own Discovery flag.
 pub fn ping(device_id: String) -> Result<(), String> {
-    let discovering = with_core(|core| Ok(core.discovery_on))?;
-    if !discovering {
+    let net = require_net()?;
+    if !net.discovery().is_on() {
         return Err("discovery is off — no one is reachable".to_string());
     }
-    let name = fake::peer(&device_id)
-        .map(|p| p.name.to_owned())
-        .ok_or_else(|| format!("device {device_id} is not nearby"))?;
-    emit(CoreEvent::Pinged { device_id, name });
-    Ok(())
+    // Acceptance, not delivery. A real peer acknowledges when it answers, so
+    // `Pinged` is now an *inbound* event rather than something this call
+    // produces — the fake used to emit it synchronously and the UI must not
+    // rely on that any more.
+    net.reach(&device_id).map_err(|e| e.to_string())?;
+    net.ping(&device_id, std::time::Instant::now())
 }
 
 /// Send a chat message: writes the outgoing row, then (fake) receives a canned
@@ -160,7 +282,7 @@ pub fn ping(device_id: String) -> Result<(), String> {
 /// event loop (never synchronously during this call). Real transports reply
 /// seconds later; UI must not assume the reply is present when this returns.
 pub fn send_chat(device_id: String, text: String) -> Result<ChatMessageDto, String> {
-    let (dto, reply_event) = with_core_mut(|core| {
+    let dto = with_core_mut(|core| {
         let now = now_millis();
         let thread = ensure_thread(core, &device_id, now)?;
 
@@ -183,27 +305,13 @@ pub fn send_chat(device_id: String, text: String) -> Result<ChatMessageDto, Stri
             created_at: now,
         };
 
-        let reply = fake::canned_reply(&text);
-        let (rep_bytes, rep_hex) = new_msg_id();
-        let rseq = core.store.next_seq(thread, Direction::Incoming)?;
-        core.store.add_message(&NewMessage {
-            thread_id: thread,
-            seq: rseq,
-            msg_id: rep_bytes,
-            body: reply.clone().into_bytes(),
-            direction: Direction::Incoming,
-            state: MessageState::Delivered,
-            created_at: now + 1,
-        })?;
-        let reply_event = CoreEvent::MessageReceived {
-            thread_id: thread,
-            msg_id: rep_hex,
-            text: reply,
-        };
-        Ok((dto, reply_event))
+        Ok(dto)
     })?;
 
-    emit(reply_event); // outside the store lock
+    // On the wire after the row exists, so a send that fails still leaves the
+    // message in the thread as Sent-but-undelivered rather than losing it.
+    let net = require_net()?;
+    net.send_chat(&device_id, &text, std::time::Instant::now())?;
     Ok(dto)
 }
 
@@ -296,6 +404,65 @@ pub fn offer_drop(device_id: String, name: String, size: u64) -> Result<String, 
 
 // ── internals ─────────────────────────────────────────────────────────────────
 
+/// The radio plane, or a reason there is none.
+fn require_net() -> Result<Arc<net::Net>, String> {
+    with_core(|core| Ok(core.net.clone()))?
+        .ok_or_else(|| "no radio available on this device".to_string())
+}
+
+/// Turn what `Net` reports into events Dart can act on, and persist what needs
+/// persisting. Runs on the pump thread, never while the store lock is held.
+fn on_net_event(net: &Arc<net::Net>, event: net::NetEvent) {
+    match event {
+        net::NetEvent::PeersChanged | net::NetEvent::SessionOpened { .. } => {
+            if let Ok(devices) = nearby_devices() {
+                emit(CoreEvent::DiscoveryUpdated { devices });
+            }
+        }
+        net::NetEvent::SessionClosed { .. } => {
+            if let Ok(devices) = nearby_devices() {
+                emit(CoreEvent::DiscoveryUpdated { devices });
+            }
+        }
+        net::NetEvent::Pinged { peer, persona_name } => {
+            emit(CoreEvent::Pinged {
+                device_id: peer,
+                name: persona_name,
+            });
+        }
+        net::NetEvent::ChatReceived { peer, text } => {
+            let _ = net;
+            if let Ok(Some(event)) = store_incoming_chat(&peer, &text) {
+                emit(event);
+            }
+        }
+    }
+}
+
+/// Write an inbound chat line and return the event announcing it.
+fn store_incoming_chat(device_id: &str, text: &str) -> Result<Option<CoreEvent>, String> {
+    with_core_mut(|core| {
+        let now = now_millis();
+        let thread = ensure_thread(core, device_id, now)?;
+        let (bytes, hex) = new_msg_id();
+        let seq = core.store.next_seq(thread, Direction::Incoming)?;
+        core.store.add_message(&NewMessage {
+            thread_id: thread,
+            seq,
+            msg_id: bytes,
+            body: text.as_bytes().to_vec(),
+            direction: Direction::Incoming,
+            state: MessageState::Delivered,
+            created_at: now,
+        })?;
+        Ok(Some(CoreEvent::MessageReceived {
+            thread_id: thread,
+            msg_id: hex,
+            text: text.to_string(),
+        }))
+    })
+}
+
 fn with_core<T>(f: impl FnOnce(&Core) -> Result<T, StoreError>) -> Result<T, String> {
     let guard = CORE.lock().map_err(|_| "core lock".to_string())?;
     let core = guard
@@ -313,6 +480,19 @@ fn with_core_mut<T>(f: impl FnOnce(&mut Core) -> Result<T, StoreError>) -> Resul
 }
 
 /// Find or create the contact + thread for a (fake) device.
+/// Find or create the thread for a device.
+///
+/// **Still keyed by a fake Layer-1 derived from the device id**, which is now
+/// wrong in a way that matters: a device id is an ephemeral radio id and
+/// rotates every twelve minutes, so a conversation would fragment into a new
+/// thread each rotation and the old one would be unreachable.
+///
+/// The right key is the pseudonym the session *proves*
+/// ([`net::Net::pseudonym`]) — stable toward us for the life of the device
+/// (R0-F10) and exactly what a block binds to. That change needs the session to
+/// exist before the thread does, which inverts the current order in
+/// `send_chat`, so it is left for T11/T12 where threads become persistent
+/// rather than smuggled in here.
 fn ensure_thread(core: &Core, device_id: &str, now: i64) -> Result<i64, StoreError> {
     let l1 = fake::fake_l1_pub(device_id);
     let contact_id = match core.store.contact_by_l1(&l1)? {

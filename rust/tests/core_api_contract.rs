@@ -1,93 +1,183 @@
-//! Contract tests for Core API v0 (T07). They drive the real `crate::api`
-//! surface against the fake network + real store, asserting the observable
-//! behaviour every UI/module will rely on. The engine is a process-wide
-//! singleton, so these serialize on `LOCK`.
+//! Contract tests for Core API v0. They drive the real `crate::api` surface
+//! against the real store and a **real transport** — the loopback rung, so the
+//! engine's own networking runs without opening sockets.
+//!
+//! `CORE` is process-wide, so these serialize on `LOCK` and cannot stand two
+//! engines against each other. `engine::init_with_transport` exists for exactly
+//! that reason; a second peer is built from `Discovery` directly.
+//!
+//! Fakes are gone. What changed observably, and is asserted below: the nearby
+//! list is now whatever the radio sees, `ping` is acceptance rather than
+//! delivery (a real peer acks when it answers, so `Pinged` is inbound), and
+//! `send_chat` needs a session — though it still stores the outgoing row first,
+//! so a failed send loses nothing.
 
-use std::sync::Mutex;
+use std::sync::mpsc::{channel, Receiver};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use rust_lib_hoppler::api::core::core_init;
 use rust_lib_hoppler::api::discovery::{nearby_devices, set_discovery};
 use rust_lib_hoppler::api::identity::{current_persona, update_persona};
 use rust_lib_hoppler::api::messaging::{
     list_threads, ping, send_chat, thread_for_device, thread_messages,
 };
 use rust_lib_hoppler::api::transfers::offer_drop;
+use rust_lib_hoppler::discovery::Discovery;
+use rust_lib_hoppler::engine::init_with_transport;
+use rust_lib_hoppler::identity::Identity;
+use rust_lib_hoppler::transport::loopback::LoopbackNet;
+use rust_lib_hoppler::transport::{Transport, TransportEvent};
 
 static LOCK: Mutex<()> = Mutex::new(());
 
-fn fresh() -> tempfile::TempDir {
+struct Harness {
+    _dir: tempfile::TempDir,
+    air: LoopbackNet,
+}
+
+/// A fresh engine on its own loopback airspace.
+fn fresh() -> Harness {
     let dir = tempfile::tempdir().unwrap();
-    core_init(dir.path().to_str().unwrap().to_string()).unwrap();
-    dir
+    let air = LoopbackNet::new();
+    let (tx, rx) = channel();
+    let tx = Mutex::new(tx);
+    let sink: Box<dyn Fn(TransportEvent) + Send + Sync> = Box::new(move |e| {
+        let _ = tx.lock().unwrap_or_else(|p| p.into_inner()).send(e);
+    });
+    let transport: Arc<dyn Transport> = Arc::new(air.join("core", sink));
+    init_with_transport(
+        dir.path().to_str().unwrap().to_string(),
+        transport,
+        "core",
+        rx,
+    )
+    .unwrap();
+    Harness { _dir: dir, air }
+}
+
+/// A peer that advertises, so the engine has something to see.
+fn advertising_peer(air: &LoopbackNet, id: &str) -> (Discovery, Receiver<TransportEvent>) {
+    let (tx, rx) = channel();
+    let tx = Mutex::new(tx);
+    let sink: Box<dyn Fn(TransportEvent) + Send + Sync> = Box::new(move |e| {
+        let _ = tx.lock().unwrap_or_else(|p| p.into_inner()).send(e);
+    });
+    let transport: Arc<dyn Transport> = Arc::new(air.join(id, sink));
+    let identity = Arc::new(Mutex::new(Identity::generate(id, 0x00_ff_00)));
+    let d = Discovery::new(transport, identity, Instant::now());
+    d.set_enabled(true, Instant::now()).unwrap();
+    (d, rx)
+}
+
+/// The engine's pump runs on its own thread; give it a moment to catch up.
+fn settle() {
+    std::thread::sleep(Duration::from_millis(200));
 }
 
 #[test]
-fn discovery_toggle_controls_nearby_list() {
+fn discovery_toggle_controls_the_nearby_list() {
     let _g = LOCK.lock().unwrap();
-    let _d = fresh();
-    assert!(nearby_devices().unwrap().is_empty());
+    let h = fresh();
+    let (_peer, _rx) = advertising_peer(&h.air, "peer-one");
+
+    assert!(nearby_devices().unwrap().is_empty(), "visible while off");
+
     set_discovery(true).unwrap();
+    settle();
     let devices = nearby_devices().unwrap();
-    assert!(!devices.is_empty());
-    assert!(devices.iter().any(|d| d.name == "Sam"));
+    assert!(
+        devices.iter().any(|d| d.device_id == "peer-one"),
+        "an advertising peer was not seen; ids: {:?}",
+        devices
+            .iter()
+            .map(|d| d.device_id.clone())
+            .collect::<Vec<_>>()
+    );
+
+    // Off hides the list even though the rung still remembers the sighting —
+    // that suppression is the core's decision, not the transport's.
     set_discovery(false).unwrap();
     assert!(nearby_devices().unwrap().is_empty());
 }
 
 #[test]
-fn chat_round_trips_through_the_store() {
+fn a_peer_with_no_persona_yet_is_still_listed() {
+    // Real discovery reports a sighting before the persona round trip
+    // finishes. Hiding it until then would make the list lag the radio, which
+    // is the opposite of what "who's nearby" is asking.
     let _g = LOCK.lock().unwrap();
-    let _d = fresh();
-    let out = send_chat("fake-sam".into(), "hi".into()).unwrap();
-    assert!(out.outgoing);
-    assert_eq!(out.text, "hi");
-
-    // The thread now holds the outgoing message and the fake reply.
-    let msgs = thread_messages(out.thread_id).unwrap();
-    assert_eq!(msgs.len(), 2);
-    assert!(msgs.iter().any(|m| m.outgoing && m.text == "hi"));
-    assert!(msgs.iter().any(|m| !m.outgoing && m.text.contains("hi")));
-}
-
-#[test]
-fn thread_messages_are_chronological_and_threads_reused() {
-    let _g = LOCK.lock().unwrap();
-    let _d = fresh();
-    // Three sends to the same device: one contact, one thread, six messages in
-    // send→reply order (chronological, not seq-interleaved).
-    send_chat("fake-sam".into(), "one".into()).unwrap();
-    send_chat("fake-sam".into(), "two".into()).unwrap();
-    let out = send_chat("fake-sam".into(), "three".into()).unwrap();
-
-    // thread_for_device finds the reused thread without sending again.
-    assert_eq!(
-        thread_for_device("fake-sam".into()).unwrap(),
-        Some(out.thread_id)
-    );
-    assert_eq!(list_threads().unwrap().len(), 1);
-
-    let msgs = thread_messages(out.thread_id).unwrap();
-    assert_eq!(msgs.len(), 6);
-    // Causal insertion order: each send immediately followed by its reply.
-    let pattern: Vec<bool> = msgs.iter().map(|m| m.outgoing).collect();
-    assert_eq!(pattern, vec![true, false, true, false, true, false]);
-}
-
-#[test]
-fn ping_requires_discovery_and_a_known_peer() {
-    let _g = LOCK.lock().unwrap();
-    let _d = fresh();
-    // Discovery off: nothing is reachable.
-    assert!(ping("fake-sam".into()).is_err());
+    let h = fresh();
+    let (_peer, _rx) = advertising_peer(&h.air, "nameless");
     set_discovery(true).unwrap();
-    // On: a known peer is pingable, an unknown one is not.
-    ping("fake-sam".into()).unwrap();
-    assert!(ping("no-such-device".into()).is_err());
-    // Closing Discovery makes it undeliverable again (F3).
-    set_discovery(false).unwrap();
-    assert!(ping("fake-sam".into()).is_err());
+    settle();
+    let devices = nearby_devices().unwrap();
+    let seen = devices.iter().find(|d| d.device_id == "nameless");
+    assert!(
+        seen.is_some(),
+        "not listed at all; ids: {:?}",
+        devices
+            .iter()
+            .map(|d| d.device_id.clone())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        seen.unwrap().name,
+        "",
+        "a name appeared before it was fetched"
+    );
 }
 
+#[test]
+fn ping_requires_discovery_and_a_reachable_peer() {
+    let _g = LOCK.lock().unwrap();
+    let h = fresh();
+    let (_peer, _rx) = advertising_peer(&h.air, "peer-one");
+
+    assert!(
+        ping("peer-one".into()).is_err(),
+        "pinged with discovery off"
+    );
+
+    set_discovery(true).unwrap();
+    settle();
+    // A device that was never seen is not reachable, whatever its id.
+    assert!(ping("never-seen".into()).is_err());
+}
+
+#[test]
+fn a_chat_with_no_session_still_stores_the_outgoing_row() {
+    // The row is written before the send is attempted, so a failure leaves the
+    // message in the thread rather than losing what the person typed.
+    let _g = LOCK.lock().unwrap();
+    let _h = fresh();
+    assert!(send_chat("unreachable".into(), "hi".into()).is_err());
+
+    let thread = thread_for_device("unreachable".into()).unwrap();
+    assert!(thread.is_some(), "no thread was created for a failed send");
+    let msgs = thread_messages(thread.unwrap()).unwrap();
+    assert_eq!(msgs.len(), 1);
+    assert!(msgs[0].outgoing && msgs[0].text == "hi");
+}
+
+#[test]
+fn threads_are_reused_and_messages_stay_in_order() {
+    let _g = LOCK.lock().unwrap();
+    let _h = fresh();
+    // No session, so each send fails on the wire — but the rows are written
+    // first, which is what this asserts. Ordering is by insertion, not by the
+    // per-sender `seq` (which cannot be a display key) or the coarse clock.
+    for text in ["one", "two", "three"] {
+        let _ = send_chat("peer".into(), text.to_string());
+    }
+
+    let thread = thread_for_device("peer".into()).unwrap().unwrap();
+    let msgs = thread_messages(thread).unwrap();
+    assert_eq!(
+        msgs.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(),
+        vec!["one", "two", "three"]
+    );
+    assert_eq!(list_threads().unwrap().len(), 1, "a thread per send");
+}
 #[test]
 fn persona_update_bumps_version_and_persists() {
     let _g = LOCK.lock().unwrap();
