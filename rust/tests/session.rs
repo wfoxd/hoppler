@@ -333,3 +333,119 @@ fn a_payload_beyond_the_bound_is_refused_rather_than_allocated() {
     );
     let _ = bob_persona;
 }
+
+// ── framing ─────────────────────────────────────────────────────────────────
+
+mod framing {
+    use rust_lib_hoppler::session::frame::{
+        prefix, Frame, FrameError, FrameKind, Reassembler, MAX_FRAME_PAYLOAD,
+    };
+
+    #[test]
+    fn a_frame_round_trips() {
+        for kind in [FrameKind::Ping, FrameKind::Chat, FrameKind::DropControl] {
+            let f = Frame::new(kind, b"payload".to_vec()).unwrap();
+            assert_eq!(Frame::decode(&f.encode().unwrap()).unwrap(), f);
+        }
+    }
+
+    #[test]
+    fn an_empty_payload_is_legal() {
+        // A Ping carries nothing; it must not be confused with a bad frame.
+        let f = Frame::new(FrameKind::Ping, Vec::new()).unwrap();
+        assert_eq!(Frame::decode(&f.encode().unwrap()).unwrap(), f);
+    }
+
+    #[test]
+    fn an_unknown_kind_is_distinguishable_from_corruption() {
+        // A peer on a newer build must not be able to tear our session down by
+        // sending a frame type we have not heard of — so the caller needs to
+        // tell "ignore this one" from "this stream is broken".
+        assert_eq!(Frame::decode(&[99, 0, 0]), Err(FrameError::UnknownKind(99)));
+        assert_eq!(Frame::decode(&[1, 0]), Err(FrameError::Malformed));
+    }
+
+    #[test]
+    fn trailing_bytes_are_refused_rather_than_ignored() {
+        // One Noise message carries one frame. Leftovers mean the two ends
+        // disagree about the format, and continuing on a guess turns a desync
+        // into silent corruption.
+        let mut wire = Frame::new(FrameKind::Chat, b"hi".to_vec())
+            .unwrap()
+            .encode()
+            .unwrap();
+        wire.push(0);
+        assert_eq!(Frame::decode(&wire), Err(FrameError::Malformed));
+    }
+
+    #[test]
+    fn a_lying_length_is_refused() {
+        // Declared 4096, carries 2.
+        assert_eq!(
+            Frame::decode(&[1, 0x10, 0x00, 1, 2]),
+            Err(FrameError::Malformed)
+        );
+        // Declared beyond the cap entirely.
+        assert_eq!(
+            Frame::decode(&[1, 0xff, 0xff, 1]),
+            Err(FrameError::TooLarge)
+        );
+    }
+
+    #[test]
+    fn an_oversized_payload_is_refused_at_construction() {
+        assert_eq!(
+            Frame::new(FrameKind::Chat, vec![0u8; MAX_FRAME_PAYLOAD + 1]),
+            Err(FrameError::TooLarge)
+        );
+        assert!(Frame::new(FrameKind::Chat, vec![0u8; MAX_FRAME_PAYLOAD]).is_ok());
+    }
+
+    #[test]
+    fn the_reassembler_survives_arbitrary_chunking() {
+        // The transport merges and splits freely (T08 rule 3), so this is the
+        // normal case rather than an edge one.
+        let messages: Vec<Vec<u8>> = vec![vec![1u8; 10], vec![2u8; 300], vec![3u8; 1]];
+        let mut stream = Vec::new();
+        for m in &messages {
+            stream.extend_from_slice(&prefix(m).unwrap());
+        }
+
+        for chunk_size in [1usize, 2, 3, 7, 64, 1024] {
+            let mut r = Reassembler::new();
+            let mut got = Vec::new();
+            for chunk in stream.chunks(chunk_size) {
+                r.push(chunk);
+                while let Some(m) = r.next_message().unwrap() {
+                    got.push(m);
+                }
+            }
+            assert_eq!(got, messages, "chunk size {chunk_size}");
+            assert_eq!(r.buffered(), 0, "chunk size {chunk_size}: bytes left over");
+        }
+    }
+
+    #[test]
+    fn the_reassembler_waits_rather_than_guessing() {
+        let mut r = Reassembler::new();
+        r.push(&[0x00]);
+        assert_eq!(r.next_message().unwrap(), None);
+        r.push(&[0x04, 1, 2]);
+        assert_eq!(
+            r.next_message().unwrap(),
+            None,
+            "returned a partial message"
+        );
+        r.push(&[3, 4]);
+        assert_eq!(r.next_message().unwrap(), Some(vec![1, 2, 3, 4]));
+    }
+
+    #[test]
+    fn a_zero_length_message_is_an_error_not_an_infinite_loop() {
+        // Without this, a caller looping on next_message() spins for ever on a
+        // peer that sends two zero bytes.
+        let mut r = Reassembler::new();
+        r.push(&[0, 0, 1, 2]);
+        assert_eq!(r.next_message(), Err(FrameError::Malformed));
+    }
+}
