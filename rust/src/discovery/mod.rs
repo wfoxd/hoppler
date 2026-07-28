@@ -97,7 +97,7 @@ impl Buckets {
 
 struct Inner {
     transport: Arc<dyn Transport>,
-    identity: Mutex<Identity>,
+    identity: Arc<Mutex<Identity>>,
     on: AtomicBool,
     sightings: Mutex<HashMap<PeerId, Sighting>>,
     blocked: Mutex<Vec<[u8; PSEUDONYM_LEN]>>,
@@ -114,11 +114,19 @@ pub struct Discovery {
 }
 
 impl Discovery {
-    pub fn new(transport: Arc<dyn Transport>, identity: Identity, now: Instant) -> Self {
+    /// The identity is **shared, not copied**. An owned copy would keep serving
+    /// the persona as it was at construction, so a rename would change what the
+    /// UI shows and not what the endpoint hands out — a divergence with no
+    /// symptom on this device and a wrong name on every other one.
+    pub fn new(
+        transport: Arc<dyn Transport>,
+        identity: Arc<Mutex<Identity>>,
+        now: Instant,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 transport,
-                identity: Mutex::new(identity),
+                identity,
                 on: AtomicBool::new(false),
                 sightings: Mutex::new(HashMap::new()),
                 blocked: Mutex::new(Vec::new()),

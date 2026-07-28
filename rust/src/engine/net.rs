@@ -1,0 +1,367 @@
+//! The engine's networking half (T10 part 2b) — discovery, sessions, and the
+//! event loop that joins them.
+//!
+//! Deliberately **not** a singleton, unlike [`super::CORE`]. The engine is
+//! process-wide, so an engine-against-engine test cannot exist; two `Net`s can
+//! talk to each other over the loopback rung, which is the only way the
+//! stranger→session→Ping path gets tested end to end before it meets a radio.
+//!
+//! # Who initiates
+//!
+//! The peer with the lexicographically smaller id, and only that one.
+//!
+//! The obvious rule — "whoever dialled" — does not survive contact. A pipe
+//! opens on *both* sides with nothing to say which end asked, and once two
+//! devices have met, both know each other's persona and both are able to start
+//! a handshake. They then do: each reads the other's message one as the reply
+//! to its own, each fails, each discards its pending handshake, and no session
+//! ever forms. That deadlock is invisible to every layer below — the transport
+//! is healthy, the crypto is correct, the sessions simply never appear.
+//!
+//! A total order both ends can compute without agreeing on anything first is
+//! enough, and the id comparison is the same tie-break the LAN rung already
+//! uses for simultaneous dial. The handshake direction has nothing to do with
+//! the dial direction: the larger id may open the pipe and still wait to be
+//! spoken to.
+//!
+//! # What a stranger costs before they are anybody
+//!
+//! A peer we have never met takes: one sighting, one pipe, and one pending
+//! handshake. Nothing is written to the store until a session is established
+//! and a frame arrives, so a device that connects and says nothing leaves no
+//! trace beyond the transport's own bookkeeping.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use crate::crypto::dh;
+use crate::discovery::protocol::{Request, Response};
+use crate::discovery::Discovery;
+use crate::identity::{Identity, VerifiedPersona};
+use crate::session::frame::{Frame, FrameKind};
+use crate::session::handshake::{Established, Initiator, Responder};
+use crate::session::table::SessionTable;
+use crate::transport::{PeerId, Transport, TransportError, TransportEvent};
+
+/// Something the engine should act on: store a row, emit to Dart, update the UI.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NetEvent {
+    /// The nearby list changed.
+    PeersChanged,
+    /// A session is live with a peer whose persona is now known.
+    SessionOpened { peer: PeerId, persona_name: String },
+    /// A session ended.
+    SessionClosed { peer: PeerId },
+    /// A Ping arrived from a peer we have a session with.
+    Pinged { peer: PeerId, persona_name: String },
+    /// A chat line arrived.
+    ChatReceived { peer: PeerId, text: String },
+}
+
+/// Everything the engine needs a network for.
+pub struct Net {
+    transport: Arc<dyn Transport>,
+    /// Our own id on this rung, for the initiator tie-break.
+    local_id: Mutex<PeerId>,
+    discovery: Discovery,
+    sessions: SessionTable,
+    identity: Arc<Mutex<Identity>>,
+    /// Handshakes we started and are waiting on a reply for.
+    pending: Mutex<HashMap<PeerId, Initiator>>,
+    /// Personas fetched from the discovery endpoint, needed before a Noise IK
+    /// handshake can start (it must know the responder's static in advance).
+    known: Mutex<HashMap<PeerId, VerifiedPersona>>,
+    /// Pseudonyms the user has blocked (R0-F10).
+    blocked: Mutex<Vec<[u8; 32]>>,
+}
+
+impl Net {
+    pub fn new(
+        transport: Arc<dyn Transport>,
+        identity: Arc<Mutex<Identity>>,
+        local_id: &str,
+        now: Instant,
+    ) -> Self {
+        let discovery = Discovery::new(transport.clone(), identity.clone(), now);
+        Self {
+            transport,
+            local_id: Mutex::new(local_id.to_string()),
+            discovery,
+            sessions: SessionTable::new(),
+            identity,
+            pending: Mutex::new(HashMap::new()),
+            known: Mutex::new(HashMap::new()),
+            blocked: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Tell `Net` our id changed, so the tie-break keeps matching what peers
+    /// see. Discovery rotates this on its own cadence.
+    pub fn set_local_id(&self, id: &str) {
+        *self.local_id.lock().unwrap_or_else(|e| e.into_inner()) = id.to_string();
+    }
+
+    /// Whether we are the side that opens the handshake with this peer.
+    fn we_initiate(&self, peer: &str) -> bool {
+        self.local_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_str()
+            < peer
+    }
+
+    pub fn discovery(&self) -> &Discovery {
+        &self.discovery
+    }
+
+    pub fn sessions(&self) -> &SessionTable {
+        &self.sessions
+    }
+
+    pub fn block(&self, pseudonym: [u8; 32]) {
+        self.discovery.block(pseudonym);
+        let mut blocked = self.blocked.lock().unwrap_or_else(|e| e.into_inner());
+        if !blocked.contains(&pseudonym) {
+            blocked.push(pseudonym);
+        }
+    }
+
+    /// Reach a peer: dial if needed. The session follows once the pipe opens.
+    pub fn reach(&self, peer: &str) -> Result<(), TransportError> {
+        if self.sessions.is_open(peer) {
+            return Ok(());
+        }
+        self.transport.connect(peer)
+    }
+
+    /// Send a Ping. Requires a live session — the caller reaches first.
+    pub fn ping(&self, peer: &str, now: Instant) -> Result<(), String> {
+        self.send_frame(peer, FrameKind::Ping, Vec::new(), now)
+    }
+
+    pub fn send_chat(&self, peer: &str, text: &str, now: Instant) -> Result<(), String> {
+        self.send_frame(peer, FrameKind::Chat, text.as_bytes().to_vec(), now)
+    }
+
+    fn send_frame(
+        &self,
+        peer: &str,
+        kind: FrameKind,
+        payload: Vec<u8>,
+        now: Instant,
+    ) -> Result<(), String> {
+        if !self.sessions.is_open(peer) {
+            return Err(format!("no session with {peer} yet"));
+        }
+        let frame = Frame::new(kind, payload).map_err(|e| e.to_string())?;
+        let wire = self
+            .sessions
+            .seal(peer, &frame, now)
+            .map_err(|e| e.to_string())?;
+        self.transport.send(peer, &wire).map_err(|e| e.to_string())
+    }
+
+    /// Feed one transport event in and take whatever the engine should act on.
+    pub fn handle(&self, event: TransportEvent, now: Instant) -> Vec<NetEvent> {
+        // Discovery keeps its own view of sightings and answers the persona
+        // endpoint; this call is what drives both.
+        self.discovery.on_event(event.clone(), now);
+
+        match event {
+            TransportEvent::PeerFound { .. } | TransportEvent::PeerLost { .. } => {
+                vec![NetEvent::PeersChanged]
+            }
+            TransportEvent::PipeOpened { peer } => self.on_pipe_opened(&peer),
+            TransportEvent::PipeClosed { peer } | TransportEvent::PipeFailed { peer, .. } => {
+                self.pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&peer);
+                if self.sessions.close(&peer) {
+                    vec![NetEvent::SessionClosed { peer }]
+                } else {
+                    Vec::new()
+                }
+            }
+            TransportEvent::Received { peer, bytes } => self.on_bytes(&peer, &bytes, now),
+            TransportEvent::Availability { .. } => vec![NetEvent::PeersChanged],
+        }
+    }
+
+    /// A pipe opened. If we know who they are we can start a handshake; if not
+    /// we must ask first, because Noise IK needs their static up front.
+    fn on_pipe_opened(&self, peer: &str) -> Vec<NetEvent> {
+        // The other side will speak first; anything we sent now would collide
+        // with it (see the module docs on who initiates).
+        if !self.we_initiate(peer) {
+            return Vec::new();
+        }
+        let persona = self
+            .known
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(peer)
+            .cloned();
+        match persona {
+            Some(persona) => self.start_handshake(peer, &persona),
+            None => {
+                // First contact: ask for their persona. We cannot present a
+                // pseudonym yet — it is derived from *their* Layer-2 key, which
+                // is exactly what we are asking for.
+                let _ = self
+                    .transport
+                    .send(peer, &Request::first_contact().encode());
+                Vec::new()
+            }
+        }
+    }
+
+    fn start_handshake(&self, peer: &str, persona: &VerifiedPersona) -> Vec<NetEvent> {
+        let identity = self.identity.lock().unwrap_or_else(|e| e.into_inner());
+        match Initiator::start(&identity, persona) {
+            Ok((initiator, msg1)) => {
+                drop(identity);
+                self.pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(peer.to_string(), initiator);
+                let _ = self.transport.send(peer, &msg1);
+            }
+            Err(_) => {
+                self.pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(peer);
+            }
+        }
+        Vec::new()
+    }
+
+    fn on_bytes(&self, peer: &str, bytes: &[u8], now: Instant) -> Vec<NetEvent> {
+        // 1. An established session: ordinary traffic.
+        if self.sessions.is_open(peer) {
+            return self.on_session_bytes(peer, bytes, now);
+        }
+        // 2. A handshake we started: this should be the reply.
+        let waiting = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(peer);
+        if let Some(initiator) = waiting {
+            return match initiator.finish(bytes) {
+                Ok(established) => self.adopt(peer, established, now),
+                Err(_) => Vec::new(),
+            };
+        }
+        // 3. A persona record we asked for during first contact.
+        if let Ok(Some(Response::Persona(record))) = Response::decode(bytes) {
+            if let Ok(persona) = crate::identity::verify_persona_record(&record) {
+                self.known
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(peer.to_string(), persona.clone());
+                let _ = self.discovery.accept_persona(peer, &record);
+                let mut out = self.start_handshake(peer, &persona);
+                out.push(NetEvent::PeersChanged);
+                return out;
+            }
+        }
+        // 4. Otherwise: someone opening a handshake with us.
+        self.on_handshake_offer(peer, bytes, now)
+    }
+
+    /// Someone is dialling us. This is where a block is enforced, and the whole
+    /// enforcement is *not answering* — see `session::handshake` for why the
+    /// type makes that the only option.
+    fn on_handshake_offer(&self, peer: &str, bytes: &[u8], now: Instant) -> Vec<NetEvent> {
+        let identity = self.identity.lock().unwrap_or_else(|e| e.into_inner());
+        let pending = match Responder::read_first(&identity, bytes) {
+            Ok(p) => p,
+            Err(_) => return Vec::new(),
+        };
+
+        if self
+            .blocked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&pending.pseudonym().0)
+        {
+            // Dropped. Not an error frame, not a close — nothing, so a blocked
+            // device cannot tell this from us being out of range (R0-F10).
+            return Vec::new();
+        }
+
+        match pending.accept(&identity) {
+            Ok((established, reply)) => {
+                drop(identity);
+                let _ = self.transport.send(peer, &reply);
+                self.adopt(peer, established, now)
+            }
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn adopt(&self, peer: &str, established: Established, now: Instant) -> Vec<NetEvent> {
+        let name = established.persona.name.clone();
+        self.known
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(peer.to_string(), established.persona.clone());
+        self.sessions.open(peer, established, now);
+        vec![
+            NetEvent::SessionOpened {
+                peer: peer.to_string(),
+                persona_name: name,
+            },
+            NetEvent::PeersChanged,
+        ]
+    }
+
+    fn on_session_bytes(&self, peer: &str, bytes: &[u8], now: Instant) -> Vec<NetEvent> {
+        let frames = match self.sessions.open_frames(peer, bytes, now) {
+            Ok(f) => f,
+            // The session is already dropped by the table; tell the engine so
+            // the UI does not keep showing a thread that cannot receive.
+            Err(_) => {
+                return vec![NetEvent::SessionClosed {
+                    peer: peer.to_string(),
+                }]
+            }
+        };
+
+        let name = self
+            .sessions
+            .persona(peer)
+            .map(|p| p.name)
+            .unwrap_or_default();
+        let mut out = Vec::new();
+        for frame in frames {
+            match frame.kind {
+                FrameKind::Ping => {
+                    out.push(NetEvent::Pinged {
+                        peer: peer.to_string(),
+                        persona_name: name.clone(),
+                    });
+                }
+                FrameKind::Chat => {
+                    // Lossy on purpose: v0 is text, and a peer sending invalid
+                    // UTF-8 should not be able to make us drop a session.
+                    out.push(NetEvent::ChatReceived {
+                        peer: peer.to_string(),
+                        text: String::from_utf8_lossy(&frame.payload).into_owned(),
+                    });
+                }
+                FrameKind::DropControl => {}
+            }
+        }
+        out
+    }
+
+    /// The pseudonym proven for a peer, if a session is live — what a block
+    /// binds to.
+    pub fn pseudonym(&self, peer: &str) -> Option<dh::DhPublic> {
+        self.sessions.pseudonym(peer)
+    }
+}

@@ -68,7 +68,10 @@ struct Node {
 fn node(net: &LoopbackNet, id: &str, now: Instant) -> Node {
     let (sink, rx) = recorder();
     let transport: Arc<dyn Transport> = Arc::new(net.join(id, sink));
-    let identity = Identity::generate(format!("{id}-persona"), 0x00ff00);
+    let identity = Arc::new(Mutex::new(Identity::generate(
+        format!("{id}-persona"),
+        0x00ff00,
+    )));
     Node {
         discovery: Discovery::new(transport.clone(), identity, now),
         transport,

@@ -16,6 +16,7 @@
 //! real pairing before any code trusts them.
 
 pub mod fake;
+pub mod net;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
