@@ -26,11 +26,17 @@ use std::time::{Duration, Instant};
 
 use snow::TransportState;
 
-use super::frame::{self, Frame, FrameError, Reassembler, MAX_FRAME_PAYLOAD};
+use super::frame::{self, Frame, FrameError, Reassembler};
 use super::handshake::Established;
 use crate::crypto::dh;
 use crate::identity::VerifiedPersona;
 use crate::transport::PeerId;
+
+/// Bytes the AEAD adds to a Noise transport message. Named rather than a
+/// round-number slack: an over-allocation that happens to be big enough hides
+/// what the real relationship is, and the next person changing the cipher suite
+/// has nothing to check against.
+const AEAD_TAG_LEN: usize = 16;
 
 /// How long a session may sit unused before it is dropped.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -149,7 +155,7 @@ impl SessionTable {
             .ok_or_else(|| SessionError::Unknown(peer.to_string()))?;
 
         let plain = frame.encode().map_err(SessionError::Frame)?;
-        let mut buf = vec![0u8; plain.len() + 64];
+        let mut buf = vec![0u8; plain.len() + AEAD_TAG_LEN];
         let n = session
             .keys
             .write_message(&plain, &mut buf)
@@ -194,7 +200,9 @@ impl SessionTable {
                     return Err(SessionError::Frame(e));
                 }
             };
-            let mut buf = vec![0u8; message.len().max(MAX_FRAME_PAYLOAD + 64)];
+            // Plaintext is the message minus its tag, so the message's own
+            // length is always enough room.
+            let mut buf = vec![0u8; message.len()];
             let n = match session.keys.read_message(&message, &mut buf) {
                 Ok(n) => n,
                 Err(_) => {
@@ -225,7 +233,12 @@ impl SessionTable {
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         let expired: Vec<PeerId> = sessions
             .iter()
-            .filter(|(_, s)| now.duration_since(s.last_active) >= IDLE_TIMEOUT)
+            // Saturating: `now` comes from the caller, and a clock that went
+            // backwards should read as "not idle yet" rather than as an
+            // arithmetic edge case. `duration_since` already saturates on
+            // current Rust; saying so explicitly means the guarantee does not
+            // rest on which std you happen to build against.
+            .filter(|(_, s)| now.saturating_duration_since(s.last_active) >= IDLE_TIMEOUT)
             .map(|(p, _)| p.clone())
             .collect();
         for peer in &expired {
