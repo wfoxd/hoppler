@@ -16,20 +16,22 @@ import 'package:protobuf/protobuf.dart' as $pb;
 
 export 'package:protobuf/protobuf.dart' show GeneratedMessageGenericExtensions;
 
-/// The signable body of a persona record (tech spec §3). These four fields are
-/// what the Layer-2 key signs; the encoded bytes are signed verbatim.
+/// The signable body of a persona record (tech spec §3). These fields are what
+/// the Layer-2 key signs; the encoded bytes are signed verbatim.
 class PersonaBody extends $pb.GeneratedMessage {
   factory PersonaBody({
     $core.List<$core.int>? l2Pub,
     $core.String? name,
     $core.int? colour,
     $core.int? version,
+    $core.List<$core.int>? sessionPub,
   }) {
     final result = create();
     if (l2Pub != null) result.l2Pub = l2Pub;
     if (name != null) result.name = name;
     if (colour != null) result.colour = colour;
     if (version != null) result.version = version;
+    if (sessionPub != null) result.sessionPub = sessionPub;
     return result;
   }
 
@@ -51,6 +53,8 @@ class PersonaBody extends $pb.GeneratedMessage {
     ..aOS(2, _omitFieldNames ? '' : 'name')
     ..aI(3, _omitFieldNames ? '' : 'colour', fieldType: $pb.PbFieldType.OU3)
     ..aI(4, _omitFieldNames ? '' : 'version', fieldType: $pb.PbFieldType.OU3)
+    ..a<$core.List<$core.int>>(
+        5, _omitFieldNames ? '' : 'sessionPub', $pb.PbFieldType.OY)
     ..hasRequiredFields = false;
 
   @$core.Deprecated('See https://github.com/google/protobuf.dart/issues/998.')
@@ -107,6 +111,19 @@ class PersonaBody extends $pb.GeneratedMessage {
   $core.bool hasVersion() => $_has(3);
   @$pb.TagNumber(4)
   void clearVersion() => $_clearField(4);
+
+  /// X25519 static this device answers Noise IK on (32 bytes). Published here
+  /// because IK requires the initiator to know it before speaking, and signed
+  /// here so it cannot be substituted. Derived from the Layer-2 seed under its
+  /// own label — never the signing key reused for Diffie-Hellman.
+  @$pb.TagNumber(5)
+  $core.List<$core.int> get sessionPub => $_getN(4);
+  @$pb.TagNumber(5)
+  set sessionPub($core.List<$core.int> value) => $_setBytes(4, value);
+  @$pb.TagNumber(5)
+  $core.bool hasSessionPub() => $_has(4);
+  @$pb.TagNumber(5)
+  void clearSessionPub() => $_clearField(5);
 }
 
 /// A PersonaBody plus a self-signature by the l2_pub it contains. The signature

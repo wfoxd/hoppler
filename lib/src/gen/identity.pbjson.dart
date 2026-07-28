@@ -23,13 +23,15 @@ const PersonaBody$json = {
     {'1': 'name', '3': 2, '4': 1, '5': 9, '10': 'name'},
     {'1': 'colour', '3': 3, '4': 1, '5': 13, '10': 'colour'},
     {'1': 'version', '3': 4, '4': 1, '5': 13, '10': 'version'},
+    {'1': 'session_pub', '3': 5, '4': 1, '5': 12, '10': 'sessionPub'},
   ],
 };
 
 /// Descriptor for `PersonaBody`. Decode as a `google.protobuf.DescriptorProto`.
 final $typed_data.Uint8List personaBodyDescriptor = $convert.base64Decode(
     'CgtQZXJzb25hQm9keRIVCgZsMl9wdWIYASABKAxSBWwyUHViEhIKBG5hbWUYAiABKAlSBG5hbW'
-    'USFgoGY29sb3VyGAMgASgNUgZjb2xvdXISGAoHdmVyc2lvbhgEIAEoDVIHdmVyc2lvbg==');
+    'USFgoGY29sb3VyGAMgASgNUgZjb2xvdXISGAoHdmVyc2lvbhgEIAEoDVIHdmVyc2lvbhIfCgtz'
+    'ZXNzaW9uX3B1YhgFIAEoDFIKc2Vzc2lvblB1Yg==');
 
 @$core.Deprecated('Use signedPersonaDescriptor instead')
 const SignedPersona$json = {

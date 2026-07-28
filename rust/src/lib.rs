@@ -5,5 +5,6 @@ pub mod engine;
 mod frb_generated;
 pub mod identity;
 pub mod proto;
+pub mod session;
 pub mod store;
 pub mod transport;

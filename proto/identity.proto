@@ -2,13 +2,18 @@ syntax = "proto3";
 
 package hoppler.v0;
 
-// The signable body of a persona record (tech spec §3). These four fields are
-// what the Layer-2 key signs; the encoded bytes are signed verbatim.
+// The signable body of a persona record (tech spec §3). These fields are what
+// the Layer-2 key signs; the encoded bytes are signed verbatim.
 message PersonaBody {
-  bytes  l2_pub  = 1; // Ed25519 Layer-2 public key (32 bytes)
-  string name    = 2;
-  uint32 colour  = 3; // packed 0xRRGGBB
-  uint32 version = 4;
+  bytes  l2_pub      = 1; // Ed25519 Layer-2 public key (32 bytes)
+  string name        = 2;
+  uint32 colour      = 3; // packed 0xRRGGBB
+  uint32 version     = 4;
+  // X25519 static this device answers Noise IK on (32 bytes). Published here
+  // because IK requires the initiator to know it before speaking, and signed
+  // here so it cannot be substituted. Derived from the Layer-2 seed under its
+  // own label — never the signing key reused for Diffie-Hellman.
+  bytes  session_pub = 5;
 }
 
 // A PersonaBody plus a self-signature by the l2_pub it contains. The signature
