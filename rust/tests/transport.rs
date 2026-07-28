@@ -1363,3 +1363,52 @@ fn ble_shutdown_waits_for_an_in_flight_delivery() {
         t
     });
 }
+
+/// Mirrors `SEND_WINDOW` in the rung; a chunk above it always fails the check.
+const SEND_WINDOW_HINT: usize = 64 * 1024;
+
+/// An adapter that acknowledges more than it was given must not wedge the pipe.
+///
+/// The contract asks for the count that actually reached the radio, so this is
+/// a misbehaving adapter — which is exactly the case the core exists to absorb.
+/// Both the acknowledgement and the window refund subtract saturatingly; a
+/// plain `fetch_sub` would wrap `outstanding` to near `usize::MAX` and the pipe
+/// would report `WouldBlock` for ever.
+///
+/// What this test pins is the acknowledgement side, which is deterministic. The
+/// refund side is prevented **by construction** rather than demonstrated here:
+/// wrapping it requires an acknowledgement to land between a `send` charging
+/// the window and refunding it — a gap of a few instructions that no amount of
+/// hammering reaches reliably. A stress version of this test passed against the
+/// wrapping code 3/3, so it is not carried; saturating arithmetic on both paths
+/// is the guarantee, not the test.
+#[test]
+fn an_over_acknowledging_adapter_cannot_wedge_the_pipe() {
+    let (probe, t, _rx) = probed("p1");
+    probe
+        .ack_inline
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+
+    // Put real bytes in flight, then acknowledge far more than exist.
+    let chunk = vec![0u8; 16 * 1024];
+    t.send("p1", &chunk).unwrap();
+    probe.radio().on_write_complete("p1", usize::MAX / 2);
+
+    // A wrapped counter shows up here: every subsequent send is refused with
+    // WouldBlock and no acknowledgement can ever bring it back down.
+    for i in 0..8 {
+        t.send("p1", &chunk).unwrap_or_else(|e| {
+            panic!("pipe wedged after an over-acknowledgement (send {i}): {e}")
+        });
+        probe.radio().on_write_complete("p1", chunk.len());
+    }
+
+    // And a chunk larger than the whole window is refused rather than wrapping
+    // the counter on its way out through the refund path.
+    assert!(matches!(
+        t.send("p1", &vec![0u8; SEND_WINDOW_HINT + 1]),
+        Err(TransportError::WouldBlock)
+    ));
+    t.send("p1", b"still alive")
+        .expect("the oversized attempt left the window charged");
+}

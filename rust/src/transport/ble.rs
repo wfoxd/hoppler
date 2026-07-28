@@ -134,6 +134,21 @@ pub enum PlatformEvent {
     },
 }
 
+/// Give back window credit that was charged but never spent.
+///
+/// Saturating, and it has to be: `on_write_complete` also saturates at zero, so
+/// an adapter that acknowledges more than it was given can empty the counter
+/// between the charge and the refund. A plain `fetch_sub` would then wrap to
+/// near `usize::MAX` and the pipe would report `WouldBlock` forever — a
+/// permanent wedge from a transient over-count.
+fn refund(pipe: &Pipe, bytes: usize) {
+    let _ = pipe
+        .outstanding
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            Some(n.saturating_sub(bytes))
+        });
+}
+
 struct Pipe {
     /// Serialises writes to this pipe so concurrent sends cannot interleave
     /// (rule 3). Held only for the duration of one `platform.send`.
@@ -640,7 +655,7 @@ impl Transport for BleTransport {
         // before `send` returns, so the credit has to exist to be returned.
         let before = pipe.outstanding.fetch_add(bytes.len(), Ordering::SeqCst);
         if before.saturating_add(bytes.len()) > SEND_WINDOW {
-            pipe.outstanding.fetch_sub(bytes.len(), Ordering::SeqCst);
+            refund(&pipe, bytes.len());
             return Err(TransportError::WouldBlock);
         }
 
@@ -648,13 +663,9 @@ impl Transport for BleTransport {
         match self.inner.platform.send(peer, bytes) {
             Ok(()) => Ok(()),
             Err(e) => {
-                // Refund: nothing reached the radio, so keeping the credit
-                // would shrink the window permanently.
-                let _ = pipe
-                    .outstanding
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                        Some(n.saturating_sub(bytes.len()))
-                    });
+                // Nothing reached the radio, so keeping the credit would shrink
+                // the window permanently.
+                refund(&pipe, bytes.len());
                 Err(e)
             }
         }
