@@ -1,5 +1,6 @@
 pub mod api;
 pub mod crypto;
+pub mod discovery;
 pub mod engine;
 mod frb_generated;
 pub mod identity;
