@@ -449,3 +449,239 @@ mod framing {
         assert_eq!(r.next_message(), Err(FrameError::Malformed));
     }
 }
+
+// ── the session table ───────────────────────────────────────────────────────
+
+mod table {
+    use super::*;
+    use rust_lib_hoppler::session::frame::{Frame, FrameKind};
+    use rust_lib_hoppler::session::table::{SessionError, SessionTable, IDLE_TIMEOUT};
+    use std::time::{Duration, Instant};
+
+    /// Two tables with a live session between them, as a real pair would have.
+    fn linked() -> (SessionTable, SessionTable, Instant) {
+        let (alice, bob, bob_persona) = pair();
+        let now = Instant::now();
+        let (initiator, msg1) = Initiator::start(&alice, &bob_persona).unwrap();
+        let pending = Responder::read_first(&bob, &msg1).unwrap();
+        let (bob_side, msg2) = pending.accept(&bob).unwrap();
+        let alice_side = initiator.finish(&msg2).unwrap();
+
+        let a = SessionTable::new();
+        let b = SessionTable::new();
+        a.open("bob", alice_side, now);
+        b.open("alice", bob_side, now);
+        (a, b, now)
+    }
+
+    #[test]
+    fn frames_cross_a_session_intact() {
+        let (a, b, now) = linked();
+        for kind in [FrameKind::Ping, FrameKind::Chat, FrameKind::DropControl] {
+            let sent = Frame::new(kind, format!("{kind:?} payload").into_bytes()).unwrap();
+            let wire = a.seal("bob", &sent, now).unwrap();
+            assert_eq!(b.open_frames("alice", &wire, now).unwrap(), vec![sent]);
+        }
+    }
+
+    #[test]
+    fn a_session_survives_the_transport_chopping_the_stream_up() {
+        // The rung merges and splits freely (T08 rule 3), so this is ordinary.
+        let (a, b, now) = linked();
+        let frames: Vec<Frame> = (0..5)
+            .map(|i| Frame::new(FrameKind::Chat, format!("line {i}").into_bytes()).unwrap())
+            .collect();
+        let mut wire = Vec::new();
+        for f in &frames {
+            wire.extend_from_slice(&a.seal("bob", f, now).unwrap());
+        }
+
+        let mut got = Vec::new();
+        for chunk in wire.chunks(3) {
+            got.extend(b.open_frames("alice", chunk, now).unwrap());
+        }
+        assert_eq!(got, frames);
+    }
+
+    #[test]
+    fn who_we_are_talking_to_is_the_proven_identity() {
+        let (a, _, _) = linked();
+        assert_eq!(a.persona("bob").unwrap().name, "Bob");
+        assert!(a.pseudonym("bob").is_some());
+        assert!(a.persona("nobody").is_none());
+    }
+
+    #[test]
+    fn tampered_ciphertext_ends_the_session_rather_than_being_skipped() {
+        let (a, b, now) = linked();
+        let f = Frame::new(FrameKind::Chat, b"secret".to_vec()).unwrap();
+        let mut wire = a.seal("bob", &f, now).unwrap();
+        let last = wire.len() - 1;
+        wire[last] ^= 1;
+
+        assert_eq!(
+            b.open_frames("alice", &wire, now),
+            Err(SessionError::Crypto)
+        );
+        // The entry is gone, so a caller cannot keep using a session whose
+        // stream it can no longer interpret.
+        assert!(
+            !b.is_open("alice"),
+            "a session survived a failed decryption — there is no \
+             resynchronisation point, so continuing means reading noise"
+        );
+    }
+
+    #[test]
+    fn a_replayed_frame_is_refused() {
+        let (a, b, now) = linked();
+        let f = Frame::new(FrameKind::Ping, Vec::new()).unwrap();
+        let wire = a.seal("bob", &f, now).unwrap();
+        assert_eq!(b.open_frames("alice", &wire, now).unwrap().len(), 1);
+        // Noise's nonce discipline (T04's rule, enforced by snow here) means a
+        // second delivery of the same bytes cannot decrypt.
+        assert_eq!(
+            b.open_frames("alice", &wire, now),
+            Err(SessionError::Crypto),
+            "a replayed frame was accepted a second time"
+        );
+    }
+
+    #[test]
+    fn a_reopened_session_replaces_the_old_keys() {
+        let (alice, bob, bob_persona) = pair();
+        let now = Instant::now();
+        let a = SessionTable::new();
+        let b = SessionTable::new();
+
+        // Asymmetric on purpose, which is also the realistic case: Alice's
+        // first attempt is lost after she stored her half, so only she holds
+        // session one. Her redial is the session that actually exists.
+        //
+        // Rebuilding both sides in lockstep would not test anything — they
+        // would agree on the *stale* keys just as happily as on the fresh ones.
+        let (first, msg1) = Initiator::start(&alice, &bob_persona).unwrap();
+        let (_, msg2) = Responder::read_first(&bob, &msg1)
+            .unwrap()
+            .accept(&bob)
+            .unwrap();
+        a.open("bob", first.finish(&msg2).unwrap(), now);
+
+        let (second, msg1b) = Initiator::start(&alice, &bob_persona).unwrap();
+        let (bob_side, msg2b) = Responder::read_first(&bob, &msg1b)
+            .unwrap()
+            .accept(&bob)
+            .unwrap();
+        a.open("bob", second.finish(&msg2b).unwrap(), now);
+        b.open("alice", bob_side, now);
+
+        assert_eq!(a.peers(), vec!["bob".to_string()]);
+
+        // The real check: a frame must cross. Holding the *first* session's
+        // keys would seal something the peer's current session cannot read,
+        // which no count of entries would reveal.
+        let f = Frame::new(FrameKind::Chat, b"after the rebuild".to_vec()).unwrap();
+        let wire = a.seal("bob", &f, now).unwrap();
+        assert_eq!(
+            b.open_frames("alice", &wire, now).unwrap(),
+            vec![f],
+            "the reopened session is still using the superseded keys"
+        );
+    }
+
+    #[test]
+    fn idle_sessions_are_swept_and_active_ones_are_not() {
+        let (a, _b, now) = linked();
+        assert!(a
+            .sweep(now + IDLE_TIMEOUT - Duration::from_secs(1))
+            .is_empty());
+        assert!(a.is_open("bob"));
+
+        // Activity resets the clock.
+        let f = Frame::new(FrameKind::Ping, Vec::new()).unwrap();
+        let later = now + IDLE_TIMEOUT - Duration::from_secs(1);
+        a.seal("bob", &f, later).unwrap();
+        assert!(a
+            .sweep(later + IDLE_TIMEOUT - Duration::from_secs(1))
+            .is_empty());
+
+        let expired = a.sweep(later + IDLE_TIMEOUT);
+        assert_eq!(expired, vec!["bob".to_string()]);
+        assert!(!a.is_open("bob"));
+    }
+
+    #[test]
+    fn a_dribbling_peer_ends_the_session_rather_than_growing_it() {
+        // A length prefix followed by a slow trickle is the slowloris shape the
+        // LAN rung already paid for once, at a different layer. Here the
+        // framing bounds it: the prefix is two bytes, so an incomplete message
+        // is at most 65537 bytes, and once it completes it fails to decrypt and
+        // takes the session with it.
+        let (_a, b, now) = linked();
+        let mut header = vec![0xff, 0xff]; // claims the largest legal message
+        header.extend_from_slice(&[0u8; 1024]);
+
+        let mut err = None;
+        for _ in 0..200 {
+            if let Err(e) = b.open_frames("alice", &header, now) {
+                err = Some(e);
+                break;
+            }
+        }
+        assert_eq!(
+            err,
+            Some(SessionError::Crypto),
+            "a peer dribbled indefinitely without the session ever ending"
+        );
+        assert!(!b.is_open("alice"), "the session outlived its stream");
+    }
+
+    #[test]
+    fn sending_to_a_closed_session_is_an_error_not_a_silent_drop() {
+        let (a, _b, now) = linked();
+        a.close("bob");
+        let f = Frame::new(FrameKind::Ping, Vec::new()).unwrap();
+        assert_eq!(
+            a.seal("bob", &f, now),
+            Err(SessionError::Unknown("bob".into()))
+        );
+    }
+}
+
+/// The structural bound behind the removed budget: however much a peer
+/// dribbles, an unfinished message cannot exceed the length prefix's ceiling.
+#[test]
+fn reassembly_memory_is_bounded_by_the_length_prefix() {
+    use rust_lib_hoppler::session::frame::Reassembler;
+    const CEILING: usize = 2 + u16::MAX as usize;
+    let mut r = Reassembler::new();
+    r.push(&[0xff, 0xff]); // declares the largest legal message
+
+    let mut completed = false;
+    for _ in 0..200 {
+        r.push(&[0u8; 1024]);
+        while r.next_message().unwrap().is_some() {
+            completed = true;
+        }
+        // Checked *after* draining, which is where the invariant actually
+        // holds: mid-push the buffer can transiently carry a finished message
+        // plus the start of the next, so the bound is "under the ceiling once
+        // everything complete has been taken", not "never above it".
+        assert!(
+            r.buffered() < CEILING,
+            "a dribbling peer left {} bytes held after draining",
+            r.buffered()
+        );
+        if completed {
+            break;
+        }
+    }
+    assert!(
+        completed,
+        "the message never completed, so nothing was bounded"
+    );
+    assert!(
+        r.buffered() < 1024,
+        "completing a message did not release its bytes"
+    );
+}
