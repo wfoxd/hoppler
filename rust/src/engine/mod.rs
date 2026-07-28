@@ -282,11 +282,12 @@ pub fn ping(device_id: String) -> Result<(), String> {
 /// event loop (never synchronously during this call). Real transports reply
 /// seconds later; UI must not assume the reply is present when this returns.
 pub fn send_chat(device_id: String, text: String) -> Result<ChatMessageDto, String> {
-    let dto = with_core_mut(|core| {
+    let (dto, msg_id_bytes) = with_core_mut(|core| {
         let now = now_millis();
         let thread = ensure_thread(core, &device_id, now)?;
 
         let (out_bytes, out_hex) = new_msg_id();
+        let out_bytes_for_state = out_bytes.clone();
         let seq = core.store.next_seq(thread, Direction::Outgoing)?;
         core.store.add_message(&NewMessage {
             thread_id: thread,
@@ -294,7 +295,10 @@ pub fn send_chat(device_id: String, text: String) -> Result<ChatMessageDto, Stri
             msg_id: out_bytes,
             body: text.clone().into_bytes(),
             direction: Direction::Outgoing,
-            state: MessageState::Sent,
+            // Queued, not Sent: nothing has left the device yet. Writing
+            // Sent here and hoping would make the row lie whenever the send
+            // fails, and a resend queue would have no way to find it.
+            state: MessageState::Queued,
             created_at: now,
         })?;
         let dto = ChatMessageDto {
@@ -305,13 +309,20 @@ pub fn send_chat(device_id: String, text: String) -> Result<ChatMessageDto, Stri
             created_at: now,
         };
 
-        Ok(dto)
+        Ok((dto, out_bytes_for_state))
     })?;
 
-    // On the wire after the row exists, so a send that fails still leaves the
-    // message in the thread as Sent-but-undelivered rather than losing it.
+    // On the wire only after the row exists, so a failed send leaves the
+    // message in the thread rather than losing what the person typed. The row
+    // is promoted to Sent only once the bytes are actually away — a caller
+    // that sees Sent can trust it.
     let net = require_net()?;
     net.send_chat(&device_id, &text, std::time::Instant::now())?;
+    with_core(|core| {
+        core.store
+            .set_message_state(&msg_id_bytes, MessageState::Sent)?;
+        Ok(())
+    })?;
     Ok(dto)
 }
 
@@ -480,10 +491,8 @@ fn with_core_mut<T>(f: impl FnOnce(&mut Core) -> Result<T, StoreError>) -> Resul
 }
 
 /// Find or create the contact + thread for a (fake) device.
-/// Find or create the thread for a device.
-///
-/// **Still keyed by a fake Layer-1 derived from the device id**, which is now
-/// wrong in a way that matters: a device id is an ephemeral radio id and
+/// Find or create the thread for a device, **still keyed by a fake Layer-1 derived from
+/// the device id — which is now wrong in a way that matters: a device id is an ephemeral radio id and
 /// rotates every twelve minutes, so a conversation would fragment into a new
 /// thread each rotation and the old one would be unreachable.
 ///

@@ -69,9 +69,21 @@ fn advertising_peer(air: &LoopbackNet, id: &str) -> (Discovery, Receiver<Transpo
     (d, rx)
 }
 
-/// The engine's pump runs on its own thread; give it a moment to catch up.
-fn settle() {
-    std::thread::sleep(Duration::from_millis(200));
+/// Wait until the pump thread has produced what the caller is waiting for.
+///
+/// A fixed sleep would be a flake on a loaded machine and a wasted second on a
+/// fast one — and when it did fail it would say nothing about why. This polls
+/// to a deadline and the caller says what it is waiting *for*, so a failure
+/// names the condition that never came true.
+fn until(what: &str, cond: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if cond() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("timed out waiting for {what}");
 }
 
 #[test]
@@ -83,7 +95,11 @@ fn discovery_toggle_controls_the_nearby_list() {
     assert!(nearby_devices().unwrap().is_empty(), "visible while off");
 
     set_discovery(true).unwrap();
-    settle();
+    until("an advertising peer to appear", || {
+        nearby_devices()
+            .map(|d| d.iter().any(|d| d.device_id == "peer-one"))
+            .unwrap_or(false)
+    });
     let devices = nearby_devices().unwrap();
     assert!(
         devices.iter().any(|d| d.device_id == "peer-one"),
@@ -109,7 +125,11 @@ fn a_peer_with_no_persona_yet_is_still_listed() {
     let h = fresh();
     let (_peer, _rx) = advertising_peer(&h.air, "nameless");
     set_discovery(true).unwrap();
-    settle();
+    until("the sighting to arrive", || {
+        nearby_devices()
+            .map(|d| d.iter().any(|d| d.device_id == "nameless"))
+            .unwrap_or(false)
+    });
     let devices = nearby_devices().unwrap();
     let seen = devices.iter().find(|d| d.device_id == "nameless");
     assert!(
@@ -139,8 +159,8 @@ fn ping_requires_discovery_and_a_reachable_peer() {
     );
 
     set_discovery(true).unwrap();
-    settle();
-    // A device that was never seen is not reachable, whatever its id.
+    // A device that was never seen is not reachable, whatever its id — no wait
+    // needed, since nothing is expected to arrive.
     assert!(ping("never-seen".into()).is_err());
 }
 
@@ -157,6 +177,12 @@ fn a_chat_with_no_session_still_stores_the_outgoing_row() {
     let msgs = thread_messages(thread.unwrap()).unwrap();
     assert_eq!(msgs.len(), 1);
     assert!(msgs[0].outgoing && msgs[0].text == "hi");
+    // Not asserted here: that the row is still `Queued` rather than `Sent`.
+    // `state` is not on the DTO and no API surface exposes it, and inventing
+    // one for a test would be growing the bridge to suit the suite. The
+    // transition is covered where it belongs — `store::records` already tests
+    // `messages_by_state` — and a real assertion arrives with the resend queue
+    // in T12/T16, which is the first caller that needs to read it.
 }
 
 #[test]
