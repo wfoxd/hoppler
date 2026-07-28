@@ -299,3 +299,52 @@ fn a_peer_with_discovery_off_yields_no_session() {
     assert!(opened_with(&a_events).is_none(), "{a_events:?}");
     assert!(opened_with(&b_events).is_none(), "{b_events:?}");
 }
+
+/// The tie-break must keep working after the id rotates.
+///
+/// Review caught that `Net` cached its own id while `Discovery` owned rotation:
+/// twelve minutes later the two would disagree, both sides could believe they
+/// were the smaller id — or neither would — and the double-initiator deadlock
+/// the tie-break exists to prevent would return, now on a timer. The id is read
+/// from `Discovery` every time instead, and this holds that in place.
+#[test]
+fn a_session_still_forms_after_the_local_id_rotates() {
+    let air = air();
+    let now = Instant::now();
+    // "zz-…" so Alice starts as the *larger* id and rotation flips her side of
+    // the comparison — a cached id would give the wrong answer afterwards.
+    let alice = node(&air, "zz-alice", "Alice", now);
+    let bob = node(&air, "bob", "Bob", now);
+
+    bob.net.discovery().set_enabled(true, now).unwrap();
+    alice.net.discovery().start_scanning().unwrap();
+    settle(&alice, &bob, now);
+
+    alice.net.discovery().set_enabled(true, now).unwrap();
+    // Rotate until the new id sorts *below* Bob's, so the comparison genuinely
+    // flips: Alice was the larger id and is now the smaller. Left to chance,
+    // roughly a quarter of rotations land the other way and the test passes
+    // whether the id is read live or cached — which is no test at all.
+    let mut rotated = String::new();
+    for _ in 0..40 {
+        alice.net.discovery().rotate(now).unwrap();
+        rotated = alice.net.discovery().local_id();
+        if rotated.as_str() < "bob" {
+            break;
+        }
+    }
+    assert!(
+        !rotated.is_empty() && rotated.as_str() < "bob",
+        "could not rotate into an id below Bob's: {rotated}"
+    );
+
+    // Bob reaches for Alice under her new id; whichever side initiates, exactly
+    // one must, and a session must appear.
+    bob.net.reach(&rotated).unwrap();
+    let (a_events, b_events) = settle(&alice, &bob, now);
+    assert!(
+        opened_with(&a_events).is_some() && opened_with(&b_events).is_some(),
+        "no session after rotation — the tie-break disagreed with itself\n\
+         alice: {a_events:?}\nbob: {b_events:?}"
+    );
+}

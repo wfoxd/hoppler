@@ -48,8 +48,10 @@ pub struct PipeFrame {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum PipeError {
-    /// A payload too large for the length field.
-    TooLarge,
+    /// A payload outside the range a frame can carry: empty, or beyond the
+    /// length field. One variant because both are the same caller mistake —
+    /// handing the pipe something it cannot express.
+    BadLength,
     /// A frame that cannot be part of any legitimate stream.
     Malformed,
 }
@@ -57,7 +59,9 @@ pub enum PipeError {
 impl std::fmt::Display for PipeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PipeError::TooLarge => write!(f, "pipe payload exceeds {MAX_PAYLOAD} bytes"),
+            PipeError::BadLength => {
+                write!(f, "pipe payload must be 1..={MAX_PAYLOAD} bytes")
+            }
             PipeError::Malformed => write!(f, "malformed pipe frame"),
         }
     }
@@ -68,7 +72,7 @@ impl std::error::Error for PipeError {}
 /// Wrap a payload for the pipe.
 pub fn encode(channel: u8, payload: &[u8]) -> Result<Vec<u8>, PipeError> {
     if payload.is_empty() || payload.len() > MAX_PAYLOAD {
-        return Err(PipeError::TooLarge);
+        return Err(PipeError::BadLength);
     }
     let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
     out.push(channel);
@@ -200,7 +204,7 @@ mod tests {
 
     #[test]
     fn an_empty_payload_cannot_be_encoded() {
-        assert_eq!(encode(CHANNEL_SESSION, &[]), Err(PipeError::TooLarge));
+        assert_eq!(encode(CHANNEL_SESSION, &[]), Err(PipeError::BadLength));
     }
 
     #[test]

@@ -63,8 +63,6 @@ pub enum NetEvent {
 /// Everything the engine needs a network for.
 pub struct Net {
     transport: Arc<dyn Transport>,
-    /// Our own id on this rung, for the initiator tie-break.
-    local_id: Mutex<PeerId>,
     discovery: Discovery,
     sessions: SessionTable,
     identity: Arc<Mutex<Identity>>,
@@ -88,9 +86,11 @@ impl Net {
         now: Instant,
     ) -> Self {
         let discovery = Discovery::new(transport.clone(), identity.clone(), now);
+        // Seed discovery with the id the transport was built under, so the
+        // tie-break has the right answer before the first advertisement.
+        discovery.set_local_id_for_tiebreak(local_id);
         Self {
             transport,
-            local_id: Mutex::new(local_id.to_string()),
             discovery,
             sessions: SessionTable::new(),
             identity,
@@ -101,19 +101,16 @@ impl Net {
         }
     }
 
-    /// Tell `Net` our id changed, so the tie-break keeps matching what peers
-    /// see. Discovery rotates this on its own cadence.
-    pub fn set_local_id(&self, id: &str) {
-        *self.local_id.lock().unwrap_or_else(|e| e.into_inner()) = id.to_string();
-    }
-
     /// Whether we are the side that opens the handshake with this peer.
+    ///
+    /// Reads the id from `Discovery` every time rather than caching it. A cached
+    /// copy would go stale on the next rotation — both sides could then believe
+    /// they were the smaller id, or neither would — and the double-initiator
+    /// deadlock this tie-break exists to prevent would come straight back, now
+    /// only after a twelve-minute timer. One source of truth is the fix; keeping
+    /// two in sync is the bug waiting to happen.
     fn we_initiate(&self, peer: &str) -> bool {
-        self.local_id
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_str()
-            < peer
+        self.discovery.local_id().as_str() < peer
     }
 
     pub fn discovery(&self) -> &Discovery {

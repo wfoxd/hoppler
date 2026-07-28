@@ -97,6 +97,10 @@ impl Buckets {
 
 struct Inner {
     transport: Arc<dyn Transport>,
+    /// The id we are currently known by. Set at construction and on every
+    /// rotation, so anything needing it reads one value rather than keeping a
+    /// copy that goes stale twelve minutes later.
+    local_id: Mutex<PeerId>,
     identity: Arc<Mutex<Identity>>,
     on: AtomicBool,
     sightings: Mutex<HashMap<PeerId, Sighting>>,
@@ -123,6 +127,7 @@ impl Discovery {
         Self {
             inner: Arc::new(Inner {
                 transport,
+                local_id: Mutex::new(String::new()),
                 identity,
                 on: AtomicBool::new(false),
                 sightings: Mutex::new(HashMap::new()),
@@ -133,6 +138,33 @@ impl Discovery {
                 last_rotation: Mutex::new(now),
             }),
         }
+    }
+
+    /// How we currently appear to peers.
+    ///
+    /// The single source of truth: rotation happens here, so anything that
+    /// needs our id — the initiator tie-break in `engine::net`, for one — must
+    /// read it rather than keep a copy. A second copy would silently go stale
+    /// on the next rotation.
+    pub fn local_id(&self) -> PeerId {
+        self.inner
+            .local_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Adopt an id we are already known by, without touching the radio.
+    ///
+    /// Used at construction, when the transport was built under an id that
+    /// discovery did not choose. Rotation proper goes through
+    /// [`Self::rotate`], which withdraws the old name first.
+    pub fn set_local_id_for_tiebreak(&self, id: &str) {
+        *self
+            .inner
+            .local_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = id.to_string();
     }
 
     pub fn is_on(&self) -> bool {
@@ -223,6 +255,11 @@ impl Discovery {
         let fresh = ephemeral_id();
         match self.inner.transport.set_local_id(&fresh) {
             Ok(()) => {
+                *self
+                    .inner
+                    .local_id
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = fresh.clone();
                 *self
                     .inner
                     .last_rotation
@@ -354,19 +391,6 @@ impl Discovery {
                 .unwrap_or_else(|e| e.into_inner())
                 .persona_record(),
         )
-    }
-
-    /// Ask a peer for its persona, presenting ours-toward-them first.
-    pub fn request_persona(
-        &self,
-        peer: &str,
-        pseudonym: Option<[u8; PSEUDONYM_LEN]>,
-    ) -> Result<(), TransportError> {
-        let request = match pseudonym {
-            Some(p) => Request::new(p),
-            None => Request::first_contact(),
-        };
-        self.inner.transport.send(peer, &request.encode())
     }
 
     /// Record a persona we were sent, if it verifies.
