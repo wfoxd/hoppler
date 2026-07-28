@@ -60,6 +60,10 @@ const PSEUDONYM_LABEL: &[u8] = b"hoppler/pseudonym/v1";
 /// swapping this label for `PSEUDONYM_LABEL` changes nothing observable — the
 /// comment claiming the label prevented collisions was overstating it.
 const SESSION_LABEL: &[u8] = b"hoppler/session-static/v1";
+/// Domain separator for the signature binding a persona to the Noise static
+/// presented alongside it. Prefixed to the key bytes so this signature can
+/// never be mistaken for — or replayed as — a signature over anything else.
+const BINDING_LABEL: &[u8] = b"hoppler/session-binding/v1";
 
 /// Hard cap on an untrusted persona record's wire size (parallels
 /// `crypto::envelope::MAX_WIRE_LEN`). A record is ~200 bytes; this is slack.
@@ -242,6 +246,18 @@ impl Identity {
         .encode_to_vec()
     }
 
+    /// Sign a Noise static, binding it to this persona.
+    ///
+    /// Without this a handshake payload proves only that *some* valid persona
+    /// record exists — and records are public, so anyone who has discovered
+    /// Alice can present hers. The counterparty cannot recompute an initiator's
+    /// pseudonym (it comes from a Layer-1 seed only that device holds), so the
+    /// binding has to be asserted by the holder rather than derived by the
+    /// verifier. This is that assertion.
+    pub fn bind_session_static(&self, static_pub: &dh::DhPublic) -> sign::Signature {
+        self.layer2.sign(&binding_message(static_pub))
+    }
+
     /// The private pseudonym secret toward a counterpart — the Noise static key
     /// for a session with them (tech spec §5).
     ///
@@ -261,6 +277,29 @@ impl Identity {
     pub fn pseudonym_toward(&self, counterpart_l2: &sign::PublicKey) -> dh::DhPublic {
         self.pseudonym_secret_toward(counterpart_l2).public()
     }
+}
+
+/// The bytes a session binding signs.
+fn binding_message(static_pub: &dh::DhPublic) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(BINDING_LABEL.len() + dh::PUBLIC_LEN);
+    msg.extend_from_slice(BINDING_LABEL);
+    msg.extend_from_slice(&static_pub.0);
+    msg
+}
+
+/// Check that `static_pub` was bound to `l2_pub` by whoever holds that persona.
+///
+/// The counterpart to [`Identity::bind_session_static`]. A handshake that skips
+/// this accepts any valid persona record alongside any proven static, which
+/// means presenting somebody else's persona — they are public — and being
+/// believed.
+pub fn verify_session_binding(
+    l2_pub: &sign::PublicKey,
+    static_pub: &dh::DhPublic,
+    signature: &sign::Signature,
+) -> Result<(), IdentityError> {
+    sign::verify(l2_pub, &binding_message(static_pub), signature)
+        .map_err(|_| IdentityError::RecordSignatureInvalid)
 }
 
 /// Verify a persona record against its own embedded Layer-2 key. Returns the

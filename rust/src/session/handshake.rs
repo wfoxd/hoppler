@@ -47,7 +47,7 @@
 use snow::params::NoiseParams;
 use snow::{Builder, HandshakeState, TransportState};
 
-use crate::crypto::dh;
+use crate::crypto::{dh, sign};
 use crate::identity::{self, Identity, VerifiedPersona};
 
 /// The suite, pinned. Recorded for T22 rather than left to a default:
@@ -69,7 +69,10 @@ pub enum HandshakeError {
     Noise(String),
     /// The handshake completed but the persona inside it did not verify.
     Persona(identity::IdentityError),
-    /// The initiator's proven static did not match the persona it presented.
+    /// The static Noise proved does not match the persona presented alongside
+    /// it. Raised on either side — an initiator replaying someone else's
+    /// record, or a responder answering with a persona that is not the one
+    /// whose key it used.
     PseudonymMismatch,
     /// A payload larger than [`MAX_HANDSHAKE_PAYLOAD`].
     PayloadTooLarge,
@@ -81,7 +84,7 @@ impl std::fmt::Display for HandshakeError {
             HandshakeError::Noise(e) => write!(f, "noise handshake failed: {e}"),
             HandshakeError::Persona(e) => write!(f, "persona in handshake invalid: {e}"),
             HandshakeError::PseudonymMismatch => {
-                write!(f, "initiator's static did not match its persona")
+                write!(f, "static key does not match the persona presented with it")
             }
             HandshakeError::PayloadTooLarge => write!(f, "handshake payload too large"),
         }
@@ -89,6 +92,59 @@ impl std::fmt::Display for HandshakeError {
 }
 
 impl std::error::Error for HandshakeError {}
+
+/// The handshake payload: `[record_len:2][persona record][signature:64]`.
+///
+/// The signature binds the persona to the static this side is presenting. It
+/// has to travel with the record because the verifier cannot derive it: an
+/// initiator's static is its pseudonym, from a Layer-1 seed only that device
+/// holds. Without the binding a handshake proves that *a* valid persona record
+/// exists — and records are public — so anyone who has discovered Alice could
+/// present hers and be believed.
+fn encode_intro(us: &Identity, our_static: &dh::DhPublic) -> Result<Vec<u8>, HandshakeError> {
+    let record = us.persona_record();
+    if record.len() > MAX_HANDSHAKE_PAYLOAD {
+        return Err(HandshakeError::PayloadTooLarge);
+    }
+    let signature = us.bind_session_static(our_static);
+    let mut out = Vec::with_capacity(2 + record.len() + sign::SIGNATURE_LEN);
+    out.extend_from_slice(&(record.len() as u16).to_be_bytes());
+    out.extend_from_slice(&record);
+    out.extend_from_slice(&signature.0);
+    Ok(out)
+}
+
+/// Decode and fully check an intro against the static Noise proved.
+fn decode_intro(
+    payload: &[u8],
+    proven_static: &dh::DhPublic,
+) -> Result<VerifiedPersona, HandshakeError> {
+    if payload.len() > MAX_HANDSHAKE_PAYLOAD {
+        return Err(HandshakeError::PayloadTooLarge);
+    }
+    if payload.len() < 2 + sign::SIGNATURE_LEN {
+        return Err(HandshakeError::Persona(
+            identity::IdentityError::MalformedRecord,
+        ));
+    }
+    let record_len = u16::from_be_bytes([payload[0], payload[1]]) as usize;
+    if payload.len() != 2 + record_len + sign::SIGNATURE_LEN {
+        return Err(HandshakeError::Persona(
+            identity::IdentityError::MalformedRecord,
+        ));
+    }
+    let record = &payload[2..2 + record_len];
+    let sig_bytes: [u8; sign::SIGNATURE_LEN] = payload[2 + record_len..]
+        .try_into()
+        .map_err(|_| HandshakeError::Persona(identity::IdentityError::MalformedRecord))?;
+
+    let persona = identity::verify_persona_record(record).map_err(HandshakeError::Persona)?;
+    // The record is valid — but so is a copy of anyone else's. This is the
+    // check that makes it *theirs*.
+    identity::verify_session_binding(&persona.l2_pub, proven_static, &sign::Signature(sig_bytes))
+        .map_err(|_| HandshakeError::PseudonymMismatch)?;
+    Ok(persona)
+}
 
 fn params() -> NoiseParams {
     NOISE_PARAMS
@@ -126,10 +182,7 @@ impl Initiator {
             .build_initiator()
             .map_err(|e| HandshakeError::Noise(e.to_string()))?;
 
-        let payload = us.persona_record();
-        if payload.len() > MAX_HANDSHAKE_PAYLOAD {
-            return Err(HandshakeError::PayloadTooLarge);
-        }
+        let payload = encode_intro(us, &our_static.public())?;
         let mut buf = vec![0u8; MAX_NOISE_MESSAGE];
         let n = state
             .write_message(&payload, &mut buf)
@@ -147,12 +200,13 @@ impl Initiator {
             .map_err(|e| HandshakeError::Noise(e.to_string()))?;
         buf.truncate(n);
 
-        let persona = identity::verify_persona_record(&buf).map_err(HandshakeError::Persona)?;
         let remote_static = remote_static_of(&self.state)?;
+        let persona = decode_intro(&buf, &remote_static)?;
 
-        // The responder's static must be the one its signed persona publishes,
-        // or we have completed a handshake with somebody else's key and would
-        // attribute the whole session to the wrong persona.
+        // Belt and braces on the responder's side: its static is *published* in
+        // the signed record, so it must also match that. The binding above
+        // would catch a substitution anyway; this catches a record whose own
+        // published key disagrees with the key it just used.
         if remote_static.0 != persona.session_pub.0 {
             return Err(HandshakeError::PseudonymMismatch);
         }
@@ -197,13 +251,13 @@ impl Responder {
             .map_err(|e| HandshakeError::Noise(e.to_string()))?;
         buf.truncate(n);
 
-        let persona = identity::verify_persona_record(&buf).map_err(HandshakeError::Persona)?;
         let remote_static = remote_static_of(&state)?;
+        // Binds the persona to the static Noise just proved they hold. Without
+        // it an initiator could present a third party's record — records are
+        // public — while authenticating with its own key, and we would
+        // attribute the whole session to the wrong person.
+        let persona = decode_intro(&buf, &remote_static)?;
 
-        // The static Noise proved they hold must be the pseudonym their persona
-        // implies toward us. Without this a caller could present someone else's
-        // persona alongside their own key, and a block keyed to that persona
-        // would miss.
         Ok(Pending {
             state,
             persona,
@@ -238,10 +292,7 @@ impl Pending {
     /// Answer, completing the handshake. The only path in this module that
     /// produces responder bytes.
     pub fn accept(mut self, us: &Identity) -> Result<(Established, Vec<u8>), HandshakeError> {
-        let payload = us.persona_record();
-        if payload.len() > MAX_HANDSHAKE_PAYLOAD {
-            return Err(HandshakeError::PayloadTooLarge);
-        }
+        let payload = encode_intro(us, &us.session_public())?;
         let mut buf = vec![0u8; MAX_NOISE_MESSAGE];
         let n = self
             .state
@@ -272,4 +323,121 @@ fn remote_static_of(state: &HandshakeState) -> Result<dh::DhPublic, HandshakeErr
         .try_into()
         .map_err(|_| HandshakeError::Noise("remote static had the wrong length".into()))?;
     Ok(dh::DhPublic(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// These live inside the crate rather than in `tests/session.rs` because
+    /// they must build a handshake by hand — a forgery the honest API gives no
+    /// way to express. The alternative was widening `DhSecret::expose_secret`
+    /// to `pub` so an integration test could reach it, which would have traded
+    /// a real API guarantee for test convenience.
+    fn forged_first_message(us: &Identity, them: &VerifiedPersona, payload: &[u8]) -> Vec<u8> {
+        let our_static = us.pseudonym_secret_toward(&them.l2_pub);
+        let mut state = Builder::new(params())
+            .local_private_key(&*our_static.expose_secret())
+            .unwrap()
+            .remote_public_key(&them.session_pub.0)
+            .unwrap()
+            .build_initiator()
+            .unwrap();
+        let mut buf = vec![0u8; MAX_NOISE_MESSAGE];
+        let n = state.write_message(payload, &mut buf).unwrap();
+        buf.truncate(n);
+        buf
+    }
+
+    fn pair() -> (Identity, Identity, VerifiedPersona) {
+        let alice = Identity::generate("Alice", 1);
+        let bob = Identity::generate("Bob", 2);
+        let bob_persona = identity::verify_persona_record(&bob.persona_record()).unwrap();
+        (alice, bob, bob_persona)
+    }
+
+    /// The impersonation the binding exists to stop.
+    ///
+    /// A persona record is public — anyone who has discovered Alice holds hers.
+    /// If the handshake only checked that the record *verifies*, Mallory could
+    /// present Alice's record while authenticating with her own key, and the
+    /// responder would attribute the whole session to Alice.
+    ///
+    /// The responder cannot catch this by derivation: an initiator's static is
+    /// its pseudonym, from a Layer-1 seed only that device holds. So the
+    /// binding is asserted by the holder and checked here.
+    #[test]
+    fn replaying_a_third_partys_persona_record_is_rejected() {
+        let (alice, bob, bob_persona) = pair();
+        let mallory = Identity::generate("Mallory", 9);
+        let alice_record = alice.persona_record();
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(alice_record.len() as u16).to_be_bytes());
+        payload.extend_from_slice(&alice_record);
+        payload.extend_from_slice(&[0u8; sign::SIGNATURE_LEN]);
+        let forged = forged_first_message(&mallory, &bob_persona, &payload);
+
+        assert!(
+            matches!(
+                Responder::read_first(&bob, &forged),
+                Err(HandshakeError::PseudonymMismatch)
+            ),
+            "Bob accepted Alice's persona from Mallory's handshake"
+        );
+    }
+
+    /// Even Mallory's *own* signature over her *own* static cannot carry
+    /// Alice's record: the binding is verified against the record's Layer-2
+    /// key, not against whoever happened to sign.
+    #[test]
+    fn a_binding_signed_by_the_wrong_key_is_rejected() {
+        let (alice, bob, bob_persona) = pair();
+        let mallory = Identity::generate("Mallory", 9);
+        let alice_record = alice.persona_record();
+        let mallory_static = mallory.pseudonym_toward(&bob_persona.l2_pub);
+        let sig = mallory.bind_session_static(&mallory_static);
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(alice_record.len() as u16).to_be_bytes());
+        payload.extend_from_slice(&alice_record);
+        payload.extend_from_slice(&sig.0);
+        let forged = forged_first_message(&mallory, &bob_persona, &payload);
+
+        assert!(matches!(
+            Responder::read_first(&bob, &forged),
+            Err(HandshakeError::PseudonymMismatch)
+        ));
+    }
+
+    /// The cap is this layer's own invariant, not one inherited from whatever
+    /// the persona verifier happens to allow.
+    #[test]
+    fn an_oversized_payload_is_refused_on_read() {
+        let (alice, bob, bob_persona) = pair();
+        let bloated = forged_first_message(&alice, &bob_persona, &vec![0u8; 8192]);
+        assert!(matches!(
+            Responder::read_first(&bob, &bloated),
+            Err(HandshakeError::PayloadTooLarge)
+        ));
+    }
+
+    /// A malformed intro must not be read as a short one.
+    #[test]
+    fn an_intro_whose_lengths_disagree_is_refused() {
+        let (alice, bob, bob_persona) = pair();
+        for payload in [vec![], vec![0u8; 10], {
+            // Declares a 4096-byte record but carries almost nothing.
+            let mut p = vec![0x10, 0x00];
+            p.extend_from_slice(&[0u8; sign::SIGNATURE_LEN]);
+            p
+        }] {
+            let msg = forged_first_message(&alice, &bob_persona, &payload);
+            assert!(
+                Responder::read_first(&bob, &msg).is_err(),
+                "accepted an intro of {} bytes",
+                payload.len()
+            );
+        }
+    }
 }

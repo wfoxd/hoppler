@@ -33,4 +33,5 @@ prost-build = "0.14.4"
 
 [dev-dependencies]
 proptest = "1.11.0"
+snow = "0.10.0"
 tempfile = "3.27.0"
