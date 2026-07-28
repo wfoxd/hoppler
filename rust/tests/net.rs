@@ -27,6 +27,20 @@ struct Node {
     identity: Arc<Mutex<Identity>>,
 }
 
+/// Every test builds its airspace here, and every one of them fragments.
+///
+/// Fragmentation is the *normal* case on the rung this ships to — T08's
+/// contract says a rung may split or merge freely and BLE certainly will — so a
+/// suite that only exercised whole messages would be testing a transport
+/// Hoppler does not have. Review caught exactly that: the handshake path had no
+/// reassembly at all, and the boundary-preserving default was hiding it.
+///
+/// Seven bytes: small enough to split a 3-byte pipe header across chunks, which
+/// is the case a length-prefix reader is most likely to get wrong.
+fn air() -> LoopbackNet {
+    LoopbackNet::with_max_chunk(7)
+}
+
 fn node(air: &LoopbackNet, id: &str, name: &str, now: Instant) -> Node {
     let (tx, rx) = channel();
     let tx = Mutex::new(tx);
@@ -83,7 +97,7 @@ fn opened_with(events: &[NetEvent]) -> Option<String> {
 /// belongs on real hardware rather than a loopback rung that would always pass.
 #[test]
 fn two_strangers_go_from_sighting_to_a_ping() {
-    let air = LoopbackNet::new();
+    let air = air();
     let now = Instant::now();
     let alice = node(&air, "alice", "Alice", now);
     let bob = node(&air, "bob", "Bob", now);
@@ -126,7 +140,7 @@ fn two_strangers_go_from_sighting_to_a_ping() {
 
 #[test]
 fn chat_crosses_a_real_session() {
-    let air = LoopbackNet::new();
+    let air = air();
     let now = Instant::now();
     let alice = node(&air, "alice", "Alice", now);
     let bob = node(&air, "bob", "Bob", now);
@@ -154,7 +168,7 @@ fn chat_crosses_a_real_session() {
 /// us being out of range.
 #[test]
 fn a_blocked_peer_gets_no_session_and_no_signal() {
-    let air = LoopbackNet::new();
+    let air = air();
     let now = Instant::now();
     let alice = node(&air, "alice", "Alice", now);
     let bob = node(&air, "bob", "Bob", now);
@@ -200,7 +214,7 @@ fn a_blocked_peer_gets_no_session_and_no_signal() {
 
 #[test]
 fn a_severed_pipe_closes_the_session_and_it_can_be_rebuilt() {
-    let air = LoopbackNet::new();
+    let air = air();
     let now = Instant::now();
     let alice = node(&air, "alice", "Alice", now);
     let bob = node(&air, "bob", "Bob", now);
@@ -238,7 +252,7 @@ fn a_severed_pipe_closes_the_session_and_it_can_be_rebuilt() {
 /// button will actually take.
 #[test]
 fn a_live_session_exposes_the_pseudonym_a_block_would_use() {
-    let air = LoopbackNet::new();
+    let air = air();
     let now = Instant::now();
     let alice = node(&air, "alice", "Alice", now);
     let bob = node(&air, "bob", "Bob", now);
@@ -271,7 +285,7 @@ fn a_live_session_exposes_the_pseudonym_a_block_would_use() {
 /// Discovery off means unreachable, not merely invisible.
 #[test]
 fn a_peer_with_discovery_off_yields_no_session() {
-    let air = LoopbackNet::new();
+    let air = air();
     let now = Instant::now();
     let alice = node(&air, "alice", "Alice", now);
     let bob = node(&air, "bob", "Bob", now);

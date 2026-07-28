@@ -17,6 +17,7 @@
 
 pub mod fake;
 pub mod net;
+pub mod pipe;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};

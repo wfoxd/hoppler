@@ -81,23 +81,16 @@ fn node(net: &LoopbackNet, id: &str, now: Instant) -> Node {
 }
 
 /// Everything a requester gets back after asking, as raw bytes.
-fn ask(asker: &Node, responder: &Node, request: &Request, now: Instant) -> Vec<u8> {
-    drain(&asker.rx);
-    // Not `.ok()`: a failed send also produces an empty reply, so swallowing it
-    // would let every silence assertion pass without the responder ever having
-    // been asked anything.
-    asker
-        .transport
-        .send(&responder.id, &request.encode())
-        .expect("the request never reached the responder");
-    pump(&responder.discovery, &responder.rx, now);
-    let mut got = Vec::new();
-    while let Ok(event) = asker.rx.recv_timeout(Duration::from_millis(150)) {
-        if let TransportEvent::Received { bytes, .. } = event {
-            got.extend_from_slice(&bytes);
-        }
-    }
-    got
+///
+/// Calls the responder's endpoint directly. Discovery no longer reads a raw
+/// stream — the pipe carries two protocols and telling them apart by content
+/// cannot be made reliable (see `engine::pipe`), so demultiplexing moved up and
+/// this is now the whole entry point.
+fn ask(_asker: &Node, responder: &Node, request: &Request, now: Instant) -> Vec<u8> {
+    responder
+        .discovery
+        .answer("asker", &request.encode(), now)
+        .unwrap_or_default()
 }
 
 fn connected(net: &LoopbackNet, a: &Node, b: &Node) {
@@ -151,20 +144,17 @@ fn the_null_response_is_and_stays_nothing() {
     }
     let limited = ask(&asker, &responder, &Request::new(flooder), now);
 
-    // 4. A frame we could not parse at all.
-    drain(&asker.rx);
-    asker.transport.send(&responder.id, b"junk").unwrap();
-    asker
-        .transport
-        .send(&responder.id, &vec![0xff; REQUEST_LEN])
-        .unwrap();
-    pump(&responder.discovery, &responder.rx, now);
-    let mut malformed = Vec::new();
-    while let Ok(TransportEvent::Received { bytes, .. }) =
-        asker.rx.recv_timeout(Duration::from_millis(150))
-    {
-        malformed.extend_from_slice(&bytes);
-    }
+    // 4. Frames we could not parse at all.
+    let mut malformed = responder
+        .discovery
+        .answer("asker", b"junk", now)
+        .unwrap_or_default();
+    malformed.extend(
+        responder
+            .discovery
+            .answer("asker", &vec![0xff; REQUEST_LEN], now)
+            .unwrap_or_default(),
+    );
 
     for (what, bytes) in [
         ("discovery off", &off),
@@ -189,44 +179,33 @@ fn the_null_response_is_and_stays_nothing() {
     );
 }
 
+/// Requester-first, at the only layer that can still express it: a request that
+/// is not a whole request earns silence.
+///
+/// Reassembly moved to `engine::pipe`, so "half a request" now means "33 bytes
+/// that are not a valid request" rather than "a short read".
 #[test]
-fn a_persona_is_only_disclosed_after_the_requester_identifies_itself() {
+fn a_partial_or_malformed_request_is_not_answered() {
     let net = LoopbackNet::new();
     let now = Instant::now();
-    let asker = node(&net, "asker", now);
     let responder = node(&net, "responder", now);
-    connected(&net, &asker, &responder);
     responder.discovery.set_enabled(true, now).unwrap();
 
-    // A partial request must not be answered: the responder speaks only after a
-    // whole pseudonym has landed (tech spec §4, requester-first).
-    drain(&asker.rx);
-    asker
-        .transport
-        .send(&responder.id, &Request::first_contact().encode()[..10])
-        .unwrap();
-    pump(&responder.discovery, &responder.rx, now);
-    assert!(
-        asker.rx.recv_timeout(Duration::from_millis(150)).is_err(),
-        "the responder answered a partial request"
-    );
-
-    // The rest of it arrives and now it answers.
-    asker
-        .transport
-        .send(&responder.id, &Request::first_contact().encode()[10..])
-        .unwrap();
-    pump(&responder.discovery, &responder.rx, now);
-    let mut got = Vec::new();
-    while let Ok(TransportEvent::Received { bytes, .. }) =
-        asker.rx.recv_timeout(Duration::from_millis(150))
-    {
-        got.extend_from_slice(&bytes);
+    for bad in [
+        Vec::new(),
+        b"short".to_vec(),
+        Request::first_contact().encode()[..10].to_vec(),
+        vec![0u8; REQUEST_LEN], // wrong version byte
+    ] {
+        assert!(
+            responder.discovery.answer("asker", &bad, now).is_none(),
+            "answered a request that was not one: {bad:?}"
+        );
     }
-    assert!(
-        matches!(Response::decode(&got), Ok(Some(Response::Persona(_)))),
-        "a reassembled request was not answered: {got:?}"
-    );
+    assert!(responder
+        .discovery
+        .answer("asker", &Request::first_contact().encode(), now)
+        .is_some());
 }
 
 // ── rotation ────────────────────────────────────────────────────────────────

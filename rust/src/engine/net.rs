@@ -35,6 +35,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use super::pipe::{self, PipeReader, CHANNEL_DISCOVERY, CHANNEL_SESSION};
 use crate::crypto::dh;
 use crate::discovery::protocol::{Request, Response};
 use crate::discovery::Discovery;
@@ -74,6 +75,9 @@ pub struct Net {
     known: Mutex<HashMap<PeerId, VerifiedPersona>>,
     /// Pseudonyms the user has blocked (R0-F10).
     blocked: Mutex<Vec<[u8; 32]>>,
+    /// Per-peer stream reassembly. The rung splits and merges freely (T08 rule
+    /// 3), so nothing arriving here is a whole message until this says so.
+    readers: Mutex<HashMap<PeerId, PipeReader>>,
 }
 
 impl Net {
@@ -93,6 +97,7 @@ impl Net {
             pending: Mutex::new(HashMap::new()),
             known: Mutex::new(HashMap::new()),
             blocked: Mutex::new(Vec::new()),
+            readers: Mutex::new(HashMap::new()),
         }
     }
 
@@ -155,11 +160,18 @@ impl Net {
             return Err(format!("no session with {peer} yet"));
         }
         let frame = Frame::new(kind, payload).map_err(|e| e.to_string())?;
-        let wire = self
+        let sealed = self
             .sessions
             .seal(peer, &frame, now)
             .map_err(|e| e.to_string())?;
-        self.transport.send(peer, &wire).map_err(|e| e.to_string())
+        self.send_on(peer, CHANNEL_SESSION, &sealed)
+            .map_err(|e| e.to_string())
+    }
+
+    fn send_on(&self, peer: &str, channel: u8, payload: &[u8]) -> Result<(), TransportError> {
+        let framed =
+            pipe::encode(channel, payload).map_err(|e| TransportError::Io(e.to_string()))?;
+        self.transport.send(peer, &framed)
     }
 
     /// Feed one transport event in and take whatever the engine should act on.
@@ -178,13 +190,17 @@ impl Net {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(&peer);
+                self.readers
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&peer);
                 if self.sessions.close(&peer) {
                     vec![NetEvent::SessionClosed { peer }]
                 } else {
                     Vec::new()
                 }
             }
-            TransportEvent::Received { peer, bytes } => self.on_bytes(&peer, &bytes, now),
+            TransportEvent::Received { peer, bytes } => self.on_stream(&peer, &bytes, now),
             TransportEvent::Availability { .. } => vec![NetEvent::PeersChanged],
         }
     }
@@ -209,9 +225,7 @@ impl Net {
                 // First contact: ask for their persona. We cannot present a
                 // pseudonym yet — it is derived from *their* Layer-2 key, which
                 // is exactly what we are asking for.
-                let _ = self
-                    .transport
-                    .send(peer, &Request::first_contact().encode());
+                let _ = self.send_on(peer, CHANNEL_DISCOVERY, &Request::first_contact().encode());
                 Vec::new()
             }
         }
@@ -226,7 +240,7 @@ impl Net {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(peer.to_string(), initiator);
-                let _ = self.transport.send(peer, &msg1);
+                let _ = self.send_on(peer, CHANNEL_SESSION, &msg1);
             }
             Err(_) => {
                 self.pending
@@ -238,7 +252,68 @@ impl Net {
         Vec::new()
     }
 
-    fn on_bytes(&self, peer: &str, bytes: &[u8], now: Instant) -> Vec<NetEvent> {
+    /// Reassemble, then route by channel. Nothing here decides what a payload
+    /// is by looking at it — that is what `engine::pipe` exists to make
+    /// unnecessary.
+    fn on_stream(&self, peer: &str, bytes: &[u8], now: Instant) -> Vec<NetEvent> {
+        let frames = {
+            let mut readers = self.readers.lock().unwrap_or_else(|e| e.into_inner());
+            let reader = readers.entry(peer.to_string()).or_default();
+            reader.push(bytes);
+            let mut frames = Vec::new();
+            loop {
+                match reader.next_frame() {
+                    Ok(Some(f)) => frames.push(f),
+                    Ok(None) => break,
+                    // Unrecoverable: there is no resynchronisation marker, so
+                    // the pipe goes rather than being guessed at.
+                    Err(_) => {
+                        readers.remove(peer);
+                        let _ = self.transport.disconnect(peer);
+                        return Vec::new();
+                    }
+                }
+            }
+            frames
+        };
+
+        let mut out = Vec::new();
+        for frame in frames {
+            match frame.channel {
+                CHANNEL_DISCOVERY => out.extend(self.on_discovery(peer, &frame.payload, now)),
+                CHANNEL_SESSION => out.extend(self.on_session(peer, &frame.payload, now)),
+                // A channel this build does not know: ignored, so a peer on a
+                // newer build cannot end the pipe by using one.
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// A discovery request to answer, or the persona we asked for.
+    fn on_discovery(&self, peer: &str, payload: &[u8], now: Instant) -> Vec<NetEvent> {
+        // A response to our own request?
+        if let Ok(Some(Response::Persona(record))) = Response::decode(payload) {
+            if let Ok(persona) = crate::identity::verify_persona_record(&record) {
+                self.known
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(peer.to_string(), persona.clone());
+                let _ = self.discovery.accept_persona(peer, &record);
+                let mut out = self.start_handshake(peer, &persona);
+                out.push(NetEvent::PeersChanged);
+                return out;
+            }
+        }
+        // Otherwise it is a request for ours. Silence is a `None`, and the
+        // caller cannot tell which refusal produced it.
+        if let Some(reply) = self.discovery.answer(peer, payload, now) {
+            let _ = self.send_on(peer, CHANNEL_DISCOVERY, &reply);
+        }
+        Vec::new()
+    }
+
+    fn on_session(&self, peer: &str, bytes: &[u8], now: Instant) -> Vec<NetEvent> {
         // 1. An established session: ordinary traffic.
         if self.sessions.is_open(peer) {
             return self.on_session_bytes(peer, bytes, now);
@@ -255,20 +330,7 @@ impl Net {
                 Err(_) => Vec::new(),
             };
         }
-        // 3. A persona record we asked for during first contact.
-        if let Ok(Some(Response::Persona(record))) = Response::decode(bytes) {
-            if let Ok(persona) = crate::identity::verify_persona_record(&record) {
-                self.known
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(peer.to_string(), persona.clone());
-                let _ = self.discovery.accept_persona(peer, &record);
-                let mut out = self.start_handshake(peer, &persona);
-                out.push(NetEvent::PeersChanged);
-                return out;
-            }
-        }
-        // 4. Otherwise: someone opening a handshake with us.
+        // 3. Otherwise: someone opening a handshake with us.
         self.on_handshake_offer(peer, bytes, now)
     }
 
@@ -296,7 +358,7 @@ impl Net {
         match pending.accept(&identity) {
             Ok((established, reply)) => {
                 drop(identity);
-                let _ = self.transport.send(peer, &reply);
+                let _ = self.send_on(peer, CHANNEL_SESSION, &reply);
                 self.adopt(peer, established, now)
             }
             Err(_) => Vec::new(),
