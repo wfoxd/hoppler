@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 
 use crate::identity::{self, Identity};
 use crate::transport::{PeerId, Transport, TransportError, TransportEvent};
-use protocol::{ProtocolError, Request, Response, PSEUDONYM_LEN, REQUEST_LEN};
+use protocol::{ProtocolError, Request, Response, PSEUDONYM_LEN};
 
 /// How often the advertised id rotates (tech spec §4: 10–15 min, aligned with
 /// the radio's own address rotation).
@@ -97,14 +97,15 @@ impl Buckets {
 
 struct Inner {
     transport: Arc<dyn Transport>,
-    identity: Mutex<Identity>,
+    /// The id we are currently known by. Set at construction and on every
+    /// rotation, so anything needing it reads one value rather than keeping a
+    /// copy that goes stale twelve minutes later.
+    local_id: Mutex<PeerId>,
+    identity: Arc<Mutex<Identity>>,
     on: AtomicBool,
     sightings: Mutex<HashMap<PeerId, Sighting>>,
     blocked: Mutex<Vec<[u8; PSEUDONYM_LEN]>>,
     buckets: Mutex<Buckets>,
-    /// Partial requests, per peer. The rung does not preserve message
-    /// boundaries (T08 rule 3), so a 33-byte request can arrive in pieces.
-    inbound: Mutex<HashMap<PeerId, Vec<u8>>>,
     last_rotation: Mutex<Instant>,
 }
 
@@ -114,21 +115,56 @@ pub struct Discovery {
 }
 
 impl Discovery {
-    pub fn new(transport: Arc<dyn Transport>, identity: Identity, now: Instant) -> Self {
+    /// The identity is **shared, not copied**. An owned copy would keep serving
+    /// the persona as it was at construction, so a rename would change what the
+    /// UI shows and not what the endpoint hands out — a divergence with no
+    /// symptom on this device and a wrong name on every other one.
+    pub fn new(
+        transport: Arc<dyn Transport>,
+        identity: Arc<Mutex<Identity>>,
+        now: Instant,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 transport,
-                identity: Mutex::new(identity),
+                local_id: Mutex::new(String::new()),
+                identity,
                 on: AtomicBool::new(false),
                 sightings: Mutex::new(HashMap::new()),
                 blocked: Mutex::new(Vec::new()),
                 buckets: Mutex::new(Buckets {
                     hits: HashMap::new(),
                 }),
-                inbound: Mutex::new(HashMap::new()),
                 last_rotation: Mutex::new(now),
             }),
         }
+    }
+
+    /// How we currently appear to peers.
+    ///
+    /// The single source of truth: rotation happens here, so anything that
+    /// needs our id — the initiator tie-break in `engine::net`, for one — must
+    /// read it rather than keep a copy. A second copy would silently go stale
+    /// on the next rotation.
+    pub fn local_id(&self) -> PeerId {
+        self.inner
+            .local_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Adopt an id we are already known by, without touching the radio.
+    ///
+    /// Used at construction, when the transport was built under an id that
+    /// discovery did not choose. Rotation proper goes through
+    /// [`Self::rotate`], which withdraws the old name first.
+    pub fn set_local_id_for_tiebreak(&self, id: &str) {
+        *self
+            .inner
+            .local_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = id.to_string();
     }
 
     pub fn is_on(&self) -> bool {
@@ -221,6 +257,11 @@ impl Discovery {
             Ok(()) => {
                 *self
                     .inner
+                    .local_id
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = fresh.clone();
+                *self
+                    .inner
                     .last_rotation
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()) = now;
@@ -240,7 +281,7 @@ impl Discovery {
     }
 
     /// Feed a transport event in.
-    pub fn on_event(&self, event: TransportEvent, now: Instant) {
+    pub fn on_event(&self, event: TransportEvent, _now: Instant) {
         match event {
             TransportEvent::PeerFound { peer, .. } => {
                 // Re-sent whenever the advertised payload changes (T08 rule on
@@ -265,47 +306,36 @@ impl Discovery {
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(&peer);
             }
-            TransportEvent::PipeClosed { peer } | TransportEvent::PipeFailed { peer, .. } => {
-                self.inner
-                    .inbound
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&peer);
-            }
-            TransportEvent::Received { peer, bytes } => self.on_bytes(&peer, &bytes, now),
+            // Bytes are *not* handled here any more. The pipe carries two
+            // protocols, and telling them apart by inspecting content cannot be
+            // made reliable — see `engine::pipe`. The caller demultiplexes and
+            // hands whole requests to `answer`.
             _ => {}
         }
     }
 
-    /// Accumulate bytes from a peer and answer once a whole request has landed.
-    fn on_bytes(&self, peer: &str, bytes: &[u8], now: Instant) {
-        let request = {
-            let mut inbound = self.inner.inbound.lock().unwrap_or_else(|e| e.into_inner());
-            let buf = inbound.entry(peer.to_string()).or_default();
-            buf.extend_from_slice(bytes);
-            if buf.len() < REQUEST_LEN {
-                return;
-            }
-            // Exactly one request per connection. Anything after it is not part
-            // of this exchange, and a peer that keeps talking does not get to
-            // grow a buffer in us.
-            let frame: Vec<u8> = buf.drain(..REQUEST_LEN).collect();
-            buf.clear();
-            Request::decode(&frame)
-        };
-
-        let reply = match request {
+    /// Answer one complete discovery request.
+    ///
+    /// Returns the bytes to send back, or `None` for silence — which is every
+    /// refusal: Discovery off, blocked, rate-limited, or unparseable. The
+    /// caller cannot tell them apart and neither can the requester (R0-F10).
+    ///
+    /// Takes a whole request rather than a stream: framing and reassembly are
+    /// the pipe layer's job, and doing it here meant guessing where a request
+    /// ended in a stream that also carried session ciphertext.
+    pub fn answer(&self, peer: &str, request: &[u8], now: Instant) -> Option<Vec<u8>> {
+        let reply = match Request::decode(request) {
             Ok(request) => self.respond(peer, &request, now),
-            // A frame we cannot parse earns the same nothing as a refusal:
-            // an error reply would distinguish "malformed" from "blocked".
+            // A frame we cannot parse earns the same nothing as a refusal; an
+            // error reply would distinguish "malformed" from "blocked".
             Err(ProtocolError::Malformed) | Err(ProtocolError::Version(_)) => Response::Silence,
         };
-
         let wire = reply.encode();
         if wire.is_empty() {
-            return;
+            None
+        } else {
+            Some(wire)
         }
-        let _ = self.inner.transport.send(peer, &wire);
     }
 
     /// Decide what a requester is told.
@@ -361,19 +391,6 @@ impl Discovery {
                 .unwrap_or_else(|e| e.into_inner())
                 .persona_record(),
         )
-    }
-
-    /// Ask a peer for its persona, presenting ours-toward-them first.
-    pub fn request_persona(
-        &self,
-        peer: &str,
-        pseudonym: Option<[u8; PSEUDONYM_LEN]>,
-    ) -> Result<(), TransportError> {
-        let request = match pseudonym {
-            Some(p) => Request::new(p),
-            None => Request::first_contact(),
-        };
-        self.inner.transport.send(peer, &request.encode())
     }
 
     /// Record a persona we were sent, if it verifies.
