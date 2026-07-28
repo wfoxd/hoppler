@@ -712,3 +712,703 @@ fn lan_shutdown_beats_an_in_flight_handshake() {
         a.pipes()
     );
 }
+
+// ── the BLE rung ────────────────────────────────────────────────────────────
+//
+// BLE needs two radios, so the rung is built as a thin adapter over a seam
+// (`BlePlatform`) with every contract rule decided in Rust above it. That makes
+// the Rust half testable here against the same suite as every other rung: what
+// `fake_radio` replaces is the radio, not the logic under test.
+//
+// What this cannot cover is the adapter itself — advertising actually stopping,
+// L2CAP throughput, OEM quirks. Those are the two-device acceptance in
+// `docs/ring0/T08-ble-adapters.md`, and nothing here should be read as
+// standing in for them.
+
+mod fake_radio {
+    use super::*;
+    use rust_lib_hoppler::transport::ble::{BleIngress, BlePlatform, PlatformEvent};
+
+    #[derive(Default)]
+    struct Node {
+        id: String,
+        advertising: Option<Vec<u8>>,
+        scanning: bool,
+        ingress: Option<BleIngress>,
+    }
+
+    #[derive(Default)]
+    struct Air {
+        nodes: Vec<Node>,
+    }
+
+    impl Air {
+        fn index_of(&self, id: &str) -> Option<usize> {
+            self.nodes.iter().position(|n| n.id == id)
+        }
+    }
+
+    /// A shared in-process airspace standing in for the radio.
+    #[derive(Clone, Default)]
+    pub struct FakeRadio {
+        air: Arc<Mutex<Air>>,
+    }
+
+    /// One node's view of the airspace — what the Android adapter implements.
+    pub struct FakePlatform {
+        air: Arc<Mutex<Air>>,
+        handle: usize,
+    }
+
+    impl FakeRadio {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Register a node and hand back its platform. The ingress is attached
+        /// afterwards, because the transport does not exist yet — the same
+        /// order the real adapter is wired in.
+        pub fn attach(&self, id: &str) -> Arc<FakePlatform> {
+            let mut air = self.air.lock().unwrap_or_else(|e| e.into_inner());
+            air.nodes.push(Node {
+                id: id.to_string(),
+                ..Default::default()
+            });
+            Arc::new(FakePlatform {
+                air: self.air.clone(),
+                handle: air.nodes.len() - 1,
+            })
+        }
+    }
+
+    impl FakePlatform {
+        pub fn set_ingress(&self, ingress: BleIngress) {
+            let mut air = self.air.lock().unwrap_or_else(|e| e.into_inner());
+            air.nodes[self.handle].ingress = Some(ingress);
+        }
+
+        /// Deliver after releasing the airspace lock. Calling into a transport
+        /// under the lock would put the adapter's lock beneath the core's,
+        /// which is the inversion the LAN rung already paid for once.
+        fn dispatch(air: &Arc<Mutex<Air>>, deliveries: Vec<(usize, PlatformEvent)>) {
+            let sinks: Vec<_> = {
+                let air = air.lock().unwrap_or_else(|e| e.into_inner());
+                deliveries
+                    .into_iter()
+                    .filter_map(|(i, e)| air.nodes.get(i)?.ingress.clone().map(|g| (g, e)))
+                    .collect()
+            };
+            for (ingress, event) in sinks {
+                ingress.on_platform_event(event);
+            }
+        }
+
+        fn my_id(&self) -> String {
+            self.air.lock().unwrap_or_else(|e| e.into_inner()).nodes[self.handle]
+                .id
+                .clone()
+        }
+    }
+
+    impl BlePlatform for FakePlatform {
+        fn set_local_id(&self, local_id: &str) -> Result<(), TransportError> {
+            self.air.lock().unwrap_or_else(|e| e.into_inner()).nodes[self.handle].id =
+                local_id.to_string();
+            Ok(())
+        }
+
+        fn start_advertising(&self, payload: &[u8]) -> Result<(), TransportError> {
+            let deliveries = {
+                let mut air = self.air.lock().unwrap_or_else(|e| e.into_inner());
+                let local_id = air.nodes[self.handle].id.clone();
+                air.nodes[self.handle].advertising = Some(payload.to_vec());
+                air.nodes
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, n)| *i != self.handle && n.scanning)
+                    .map(|(i, _)| {
+                        (
+                            i,
+                            PlatformEvent::PeerFound {
+                                peer: local_id.clone(),
+                                payload: payload.to_vec(),
+                            },
+                        )
+                    })
+                    .collect()
+            };
+            Self::dispatch(&self.air, deliveries);
+            Ok(())
+        }
+
+        fn stop_advertising(&self) -> Result<(), TransportError> {
+            let deliveries = {
+                let mut air = self.air.lock().unwrap_or_else(|e| e.into_inner());
+                let id = air.nodes[self.handle].id.clone();
+                if air.nodes[self.handle].advertising.take().is_none() {
+                    Vec::new()
+                } else {
+                    air.nodes
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, n)| *i != self.handle && n.scanning)
+                        .map(|(i, _)| (i, PlatformEvent::PeerLost { peer: id.clone() }))
+                        .collect()
+                }
+            };
+            Self::dispatch(&self.air, deliveries);
+            Ok(())
+        }
+
+        fn start_scanning(&self) -> Result<(), TransportError> {
+            let deliveries = {
+                let mut air = self.air.lock().unwrap_or_else(|e| e.into_inner());
+                air.nodes[self.handle].scanning = true;
+                air.nodes
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != self.handle)
+                    .filter_map(|(_, n)| {
+                        n.advertising.as_ref().map(|p| {
+                            (
+                                self.handle,
+                                PlatformEvent::PeerFound {
+                                    peer: n.id.clone(),
+                                    payload: p.clone(),
+                                },
+                            )
+                        })
+                    })
+                    .collect()
+            };
+            Self::dispatch(&self.air, deliveries);
+            Ok(())
+        }
+
+        fn stop_scanning(&self) -> Result<(), TransportError> {
+            self.air.lock().unwrap_or_else(|e| e.into_inner()).nodes[self.handle].scanning = false;
+            Ok(())
+        }
+
+        fn connect(&self, peer: &str) -> Result<(), TransportError> {
+            let me = self.my_id();
+            let deliveries = {
+                let air = self.air.lock().unwrap_or_else(|e| e.into_inner());
+                match air.index_of(peer) {
+                    Some(target) => vec![
+                        (
+                            self.handle,
+                            PlatformEvent::PipeOpened {
+                                peer: peer.to_string(),
+                            },
+                        ),
+                        (target, PlatformEvent::PipeOpened { peer: me }),
+                    ],
+                    None => vec![(
+                        self.handle,
+                        PlatformEvent::PipeFailed {
+                            peer: peer.to_string(),
+                            why: "not in range".into(),
+                        },
+                    )],
+                }
+            };
+            Self::dispatch(&self.air, deliveries);
+            Ok(())
+        }
+
+        fn send(&self, peer: &str, bytes: &[u8]) -> Result<(), TransportError> {
+            let me = self.my_id();
+            let target = {
+                let air = self.air.lock().unwrap_or_else(|e| e.into_inner());
+                air.index_of(peer)
+            };
+            let Some(target) = target else {
+                return Err(TransportError::NoSuchPeer(peer.to_string()));
+            };
+            Self::dispatch(
+                &self.air,
+                vec![(
+                    target,
+                    PlatformEvent::Received {
+                        peer: me,
+                        bytes: bytes.to_vec(),
+                    },
+                )],
+            );
+            // A real adapter acknowledges once the radio has the bytes; doing it
+            // here keeps the send window from closing during the suite.
+            let ingress = {
+                let air = self.air.lock().unwrap_or_else(|e| e.into_inner());
+                air.nodes[self.handle].ingress.clone()
+            };
+            if let Some(ingress) = ingress {
+                ingress.on_write_complete(peer, bytes.len());
+            }
+            Ok(())
+        }
+
+        fn disconnect(&self, peer: &str) -> Result<(), TransportError> {
+            let me = self.my_id();
+            let target = {
+                let air = self.air.lock().unwrap_or_else(|e| e.into_inner());
+                air.index_of(peer)
+            };
+            if let Some(target) = target {
+                Self::dispatch(
+                    &self.air,
+                    vec![(target, PlatformEvent::PipeClosed { peer: me })],
+                );
+            }
+            Ok(())
+        }
+
+        fn shutdown(&self) {
+            let mut air = self.air.lock().unwrap_or_else(|e| e.into_inner());
+            air.nodes[self.handle].advertising = None;
+            air.nodes[self.handle].scanning = false;
+        }
+    }
+}
+
+#[test]
+fn ble_meets_the_contract() {
+    use fake_radio::FakeRadio;
+    use rust_lib_hoppler::transport::ble::BleTransport;
+
+    let radio = FakeRadio::new();
+    let (sink_a, rx_a) = recorder();
+    let (sink_b, rx_b) = recorder();
+
+    let pa = radio.attach("ble-a");
+    let a = BleTransport::new("ble-a", pa.clone(), sink_a).unwrap();
+    pa.set_ingress(a.ingress());
+
+    let pb = radio.attach("ble-b");
+    let b = BleTransport::new("ble-b", pb.clone(), sink_b).unwrap();
+    pb.set_ingress(b.ingress());
+
+    conformance(Pair {
+        a: Box::new(a),
+        b: Box::new(b),
+        rx_a,
+        rx_b,
+        id_a: "ble-a".into(),
+        id_b: "ble-b".into(),
+        // The fake airspace has no multicast problem, so discovery is exercised.
+        discovery_works: true,
+    });
+}
+
+// ── BLE: what the adapter is deliberately not trusted with ──────────────────
+//
+// The conformance suite proves the rung honours the contract when the radio
+// behaves. These cover the opposite case — the module's claim that a
+// misbehaving adapter still cannot break the core — because that claim is the
+// entire reason the split exists, and per-OEM BLE misbehaviour is the norm.
+
+/// A platform whose behaviour the test dictates, standing in for an OEM stack
+/// with its own ideas.
+struct Probe {
+    ingress: Mutex<Option<rust_lib_hoppler::transport::ble::BleIngress>>,
+    sent: Mutex<Vec<(String, usize)>>,
+    ids: Mutex<Vec<String>>,
+    /// Whether to acknowledge writes from inside `send`, as a fast inline
+    /// write does.
+    ack_inline: std::sync::atomic::AtomicBool,
+}
+
+impl Probe {
+    fn new() -> Arc<Self> {
+        Arc::new(Probe {
+            ingress: Mutex::new(None),
+            sent: Mutex::new(Vec::new()),
+            ids: Mutex::new(Vec::new()),
+            ack_inline: std::sync::atomic::AtomicBool::new(true),
+        })
+    }
+    fn attach(&self, ingress: rust_lib_hoppler::transport::ble::BleIngress) {
+        *self.ingress.lock().unwrap() = Some(ingress);
+    }
+    fn radio(&self) -> rust_lib_hoppler::transport::ble::BleIngress {
+        self.ingress.lock().unwrap().clone().expect("attached")
+    }
+    fn sent_bytes(&self) -> usize {
+        self.sent.lock().unwrap().iter().map(|(_, n)| n).sum()
+    }
+}
+
+impl rust_lib_hoppler::transport::ble::BlePlatform for Probe {
+    fn set_local_id(&self, id: &str) -> Result<(), TransportError> {
+        self.ids.lock().unwrap().push(id.to_string());
+        Ok(())
+    }
+    fn start_advertising(&self, _: &[u8]) -> Result<(), TransportError> {
+        Ok(())
+    }
+    fn stop_advertising(&self) -> Result<(), TransportError> {
+        Ok(())
+    }
+    fn start_scanning(&self) -> Result<(), TransportError> {
+        Ok(())
+    }
+    fn stop_scanning(&self) -> Result<(), TransportError> {
+        Ok(())
+    }
+    fn connect(&self, _: &str) -> Result<(), TransportError> {
+        Ok(())
+    }
+    fn send(&self, peer: &str, bytes: &[u8]) -> Result<(), TransportError> {
+        self.sent
+            .lock()
+            .unwrap()
+            .push((peer.to_string(), bytes.len()));
+        if self.ack_inline.load(std::sync::atomic::Ordering::SeqCst) {
+            // Re-entering the core from inside `send` — the case that
+            // deadlocked before the pipes map stopped being held across it.
+            self.radio().on_write_complete(peer, bytes.len());
+        }
+        Ok(())
+    }
+    fn disconnect(&self, _: &str) -> Result<(), TransportError> {
+        Ok(())
+    }
+    fn shutdown(&self) {}
+}
+
+/// Build a transport wired to a probe, with one pipe already open.
+fn probed(
+    peer: &str,
+) -> (
+    Arc<Probe>,
+    rust_lib_hoppler::transport::ble::BleTransport,
+    Events,
+) {
+    use rust_lib_hoppler::transport::ble::{BleTransport, PlatformEvent};
+    let probe = Probe::new();
+    let (sink, rx) = recorder();
+    let t = BleTransport::new("probe", probe.clone(), sink).unwrap();
+    probe.attach(t.ingress());
+    probe.radio().on_platform_event(PlatformEvent::PipeOpened {
+        peer: peer.to_string(),
+    });
+    opened(&rx, peer);
+    (probe, t, rx)
+}
+
+#[test]
+fn an_adapter_that_acknowledges_inline_does_not_deadlock() {
+    let (probe, t, _rx) = probed("p1");
+    // Would hang, not fail, if `send` held the pipes map across the adapter
+    // call — so the useful signal is that this test finishes at all.
+    for _ in 0..200 {
+        t.send("p1", &[0u8; 1024]).unwrap();
+    }
+    assert_eq!(probe.sent_bytes(), 200 * 1024);
+}
+
+#[test]
+fn the_send_window_pushes_back_and_reopens() {
+    let (probe, t, _rx) = probed("p1");
+    probe
+        .ack_inline
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+
+    // Fill the window without acknowledging: a radio that never drains must
+    // not let the core queue without bound.
+    let chunk = vec![0u8; 16 * 1024];
+    let mut accepted = 0usize;
+    let mut blocked = false;
+    for _ in 0..8 {
+        match t.send("p1", &chunk) {
+            Ok(()) => accepted += chunk.len(),
+            Err(TransportError::WouldBlock) => {
+                blocked = true;
+                break;
+            }
+            Err(e) => panic!("unexpected error: {e}"),
+        }
+    }
+    assert!(
+        blocked,
+        "the window never closed: {accepted} bytes accepted"
+    );
+
+    // Acknowledging returns credit, and the pipe is usable again.
+    probe.radio().on_write_complete("p1", accepted);
+    t.send("p1", &chunk).expect("credit was not returned");
+}
+
+#[test]
+fn a_radio_reporting_one_pipe_twice_opens_it_once() {
+    use rust_lib_hoppler::transport::ble::PlatformEvent;
+    let (probe, t, rx) = probed("p1");
+    // Both ends dialling at once is routine on BLE.
+    probe
+        .radio()
+        .on_platform_event(PlatformEvent::PipeOpened { peer: "p1".into() });
+    // The map holding one entry is not the point — a second PipeOpened on the
+    // stream would have the core believing in two pipes.
+    assert!(
+        rx.recv_timeout(Duration::from_millis(200)).is_err(),
+        "a duplicate open was re-announced to the core"
+    );
+    assert_eq!(t.pipes(), vec!["p1".to_string()]);
+    // One close must therefore be enough to close it.
+    probe
+        .radio()
+        .on_platform_event(PlatformEvent::PipeClosed { peer: "p1".into() });
+    closed(&rx, "p1");
+    assert!(t.pipes().is_empty(), "a duplicate open left a second pipe");
+}
+
+#[test]
+fn a_link_that_dies_before_opening_is_a_failure_not_a_close() {
+    use rust_lib_hoppler::transport::ble::{BleTransport, PlatformEvent};
+    let probe = Probe::new();
+    let (sink, rx) = recorder();
+    let t = BleTransport::new("probe", probe.clone(), sink).unwrap();
+    probe.attach(t.ingress());
+
+    // Android reports a disconnect for a dial that never completed. The core
+    // treats PipeClosed as proof a pipe existed, so passing it through would
+    // have it tear down state it never built (rule 2).
+    probe
+        .radio()
+        .on_platform_event(PlatformEvent::PipeClosed { peer: "p1".into() });
+    match rx.recv_timeout(Duration::from_secs(5)).expect("no event") {
+        TransportEvent::PipeFailed { peer, .. } => assert_eq!(peer, "p1"),
+        other => panic!("expected PipeFailed, got {other:?}"),
+    }
+    drop(t);
+}
+
+#[test]
+fn bytes_on_a_pipe_the_core_closed_are_dropped() {
+    use rust_lib_hoppler::transport::ble::PlatformEvent;
+    let (probe, t, rx) = probed("p1");
+    t.disconnect("p1").unwrap();
+    closed(&rx, "p1");
+    // A radio with bytes already in flight when we hung up. Delivering them
+    // would put Received after PipeClosed, which the core may treat as
+    // impossible.
+    probe.radio().on_platform_event(PlatformEvent::Received {
+        peer: "p1".into(),
+        bytes: b"late".to_vec(),
+    });
+    assert!(
+        rx.recv_timeout(Duration::from_millis(200)).is_err(),
+        "bytes arrived after the pipe closed"
+    );
+}
+
+#[test]
+fn a_malformed_radio_id_never_reaches_the_core() {
+    use rust_lib_hoppler::transport::ble::{BleTransport, PlatformEvent};
+    let probe = Probe::new();
+    let (sink, rx) = recorder();
+    let t = BleTransport::new("probe", probe.clone(), sink).unwrap();
+    probe.attach(t.ingress());
+
+    // Ids cross rungs in composite form ("ble:1f3a"), and a `.` or `:` splits
+    // differently on the two ends of a pipe — one connection, two PeerIds.
+    for bad in ["has.dot", "has:colon", "-leading", "", &"x".repeat(64)] {
+        probe.radio().on_platform_event(PlatformEvent::PeerFound {
+            peer: bad.to_string(),
+            payload: b"p".to_vec(),
+        });
+    }
+    assert!(
+        rx.recv_timeout(Duration::from_millis(200)).is_err(),
+        "a malformed radio id reached the core"
+    );
+    assert!(t.peers().is_empty());
+}
+
+#[test]
+fn the_ingress_outlives_the_transport() {
+    use rust_lib_hoppler::transport::ble::{BleTransport, PlatformEvent};
+    let probe = Probe::new();
+    let (sink, rx) = recorder();
+    let t = BleTransport::new("probe", probe.clone(), sink).unwrap();
+    probe.attach(t.ingress());
+    let radio = probe.radio();
+    drop(t);
+    // Wait for the dispatch thread to release its own reference, so the events
+    // below genuinely land on a freed transport rather than a live one that
+    // happens to be quiet — otherwise this passes without testing anything.
+    let freed = Instant::now();
+    while radio.is_live() && freed.elapsed() < Duration::from_secs(5) {
+        std::thread::yield_now();
+    }
+    assert!(!radio.is_live(), "the transport was never freed");
+
+    // An adapter cannot un-schedule work already queued on a radio callback
+    // thread, so a dropped transport must absorb late events rather than the
+    // adapter having to prevent them.
+    radio.on_platform_event(PlatformEvent::PeerFound {
+        peer: "p1".into(),
+        payload: b"p".to_vec(),
+    });
+    radio.on_write_complete("p1", 10);
+    assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+}
+
+#[test]
+fn the_adapter_learns_our_id_even_when_we_never_advertise() {
+    use rust_lib_hoppler::transport::ble::BleTransport;
+    let probe = Probe::new();
+    let (sink, _rx) = recorder();
+    let t = BleTransport::new("probe", probe.clone(), sink).unwrap();
+    probe.attach(t.ingress());
+
+    // Discovery off still dials paired peers (R0-F2), and the dialer has to
+    // introduce itself by the id the core knows it by — never by its MAC. If
+    // the adapter only learned the id from start_advertising, a node that
+    // never advertises would have no name to offer.
+    assert_eq!(probe.ids.lock().unwrap().clone(), vec!["probe".to_string()]);
+
+    t.set_local_id("probe-rotated").unwrap();
+    assert_eq!(
+        probe.ids.lock().unwrap().clone(),
+        vec!["probe".to_string(), "probe-rotated".to_string()],
+        "a rotation with nothing advertised must still reach the adapter"
+    );
+}
+
+/// Rule 6 says the rung is silent *once `shutdown` returns*. That is a claim
+/// about a delivery already in flight, which the suite's drain-then-check can
+/// only catch by luck — and did not: the BLE rung shipped cloning the sink out
+/// and releasing the lock before calling it, so `shutdown` returned while a
+/// delivery was still running.
+///
+/// Run against every rung rather than the one that had the bug, because the
+/// next rung is where it would come back.
+fn shutdown_waits_for_in_flight_delivery(
+    rung: &str,
+    make: impl FnOnce(Box<dyn Fn(TransportEvent) + Send + Sync>) -> Arc<dyn Transport>,
+) {
+    use std::sync::Condvar;
+
+    let entered = Arc::new((Mutex::new(false), Condvar::new()));
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let (e, r) = (entered.clone(), release.clone());
+
+    let t = make(Box::new(move |_| {
+        *e.0.lock().unwrap() = true;
+        e.1.notify_all();
+        let mut go = r.0.lock().unwrap();
+        while !*go {
+            go = r.1.wait(go).unwrap();
+        }
+    }));
+
+    // Dialling an unknown peer emits PipeFailed on every rung, so it is the one
+    // event this helper can provoke without a second node.
+    let _ = t.connect("ghost");
+
+    {
+        let mut in_sink = entered.0.lock().unwrap();
+        while !*in_sink {
+            let (guard, timeout) = entered
+                .1
+                .wait_timeout(in_sink, Duration::from_secs(5))
+                .unwrap();
+            in_sink = guard;
+            assert!(!timeout.timed_out(), "{rung}: the sink was never called");
+        }
+    }
+
+    let (done_tx, done_rx) = channel();
+    let shutting = t.clone();
+    let handle = std::thread::spawn(move || {
+        shutting.shutdown();
+        let _ = done_tx.send(());
+    });
+
+    assert!(
+        done_rx.recv_timeout(Duration::from_millis(500)).is_err(),
+        "{rung}: shutdown returned while a delivery was still running — the sink \
+         can then be called after the caller believes the rung is silent"
+    );
+
+    *release.0.lock().unwrap() = true;
+    release.1.notify_all();
+    done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("shutdown never completed once the sink returned");
+    handle.join().unwrap();
+}
+
+#[test]
+fn loopback_shutdown_waits_for_an_in_flight_delivery() {
+    let net = LoopbackNet::new();
+    shutdown_waits_for_in_flight_delivery("loopback", |sink| Arc::new(net.join("sd", sink)));
+}
+
+#[test]
+fn lan_shutdown_waits_for_an_in_flight_delivery() {
+    shutdown_waits_for_in_flight_delivery("lan", |sink| {
+        Arc::new(LanTransport::new("sd-lan", sink).unwrap())
+    });
+}
+
+#[test]
+fn ble_shutdown_waits_for_an_in_flight_delivery() {
+    use rust_lib_hoppler::transport::ble::BleTransport;
+    shutdown_waits_for_in_flight_delivery("ble", |sink| {
+        let probe = Probe::new();
+        let t = Arc::new(BleTransport::new("sd-ble", probe.clone(), sink).unwrap());
+        probe.attach(t.ingress());
+        t
+    });
+}
+
+/// Mirrors `SEND_WINDOW` in the rung; a chunk above it always fails the check.
+const SEND_WINDOW_HINT: usize = 64 * 1024;
+
+/// An adapter that acknowledges more than it was given must not wedge the pipe.
+///
+/// The contract asks for the count that actually reached the radio, so this is
+/// a misbehaving adapter — which is exactly the case the core exists to absorb.
+/// Both the acknowledgement and the window refund subtract saturatingly; a
+/// plain `fetch_sub` would wrap `outstanding` to near `usize::MAX` and the pipe
+/// would report `WouldBlock` for ever.
+///
+/// What this test pins is the acknowledgement side, which is deterministic. The
+/// refund side is prevented **by construction** rather than demonstrated here:
+/// wrapping it requires an acknowledgement to land between a `send` charging
+/// the window and refunding it — a gap of a few instructions that no amount of
+/// hammering reaches reliably. A stress version of this test passed against the
+/// wrapping code 3/3, so it is not carried; saturating arithmetic on both paths
+/// is the guarantee, not the test.
+#[test]
+fn an_over_acknowledging_adapter_cannot_wedge_the_pipe() {
+    let (probe, t, _rx) = probed("p1");
+    probe
+        .ack_inline
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+
+    // Put real bytes in flight, then acknowledge far more than exist.
+    let chunk = vec![0u8; 16 * 1024];
+    t.send("p1", &chunk).unwrap();
+    probe.radio().on_write_complete("p1", usize::MAX / 2);
+
+    // A wrapped counter shows up here: every subsequent send is refused with
+    // WouldBlock and no acknowledgement can ever bring it back down.
+    for i in 0..8 {
+        t.send("p1", &chunk).unwrap_or_else(|e| {
+            panic!("pipe wedged after an over-acknowledgement (send {i}): {e}")
+        });
+        probe.radio().on_write_complete("p1", chunk.len());
+    }
+
+    // And a chunk larger than the whole window is refused rather than wrapping
+    // the counter on its way out through the refund path.
+    assert!(matches!(
+        t.send("p1", &vec![0u8; SEND_WINDOW_HINT + 1]),
+        Err(TransportError::WouldBlock)
+    ));
+    t.send("p1", b"still alive")
+        .expect("the oversized attempt left the window charged");
+}
