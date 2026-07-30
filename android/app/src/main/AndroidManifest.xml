@@ -8,6 +8,9 @@
          advertises fine and simply never hears anyone — which presents as
          one-way discovery, not as an error. -->
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <!-- To notice when the interface is replaced (aeroplane mode, Wi-Fi
+         reconnect) so the multicast lock can be re-taken against the new one. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
     <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
     <uses-permission
