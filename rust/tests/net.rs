@@ -208,8 +208,21 @@ fn a_blocked_peer_gets_no_session_and_no_signal() {
         "the refusal was observable as a close: {a_events:?}"
     );
 
-    // Sending is refused locally rather than silently dropped.
-    assert!(alice.net.ping(&bob.id, now).is_err());
+    // A Ping is *accepted* and simply never arrives. It must not report an
+    // error: an error is a signal, and telling Alice her Ping failed here is
+    // precisely how she would learn she is blocked rather than out of range —
+    // the distinction R0-F10 exists to deny her.
+    alice
+        .net
+        .ping(&bob.id, now)
+        .expect("a blocked peer's Ping reported failure, which is a signal");
+    let (_, b_events) = settle(&alice, &bob, now);
+    assert!(
+        !b_events
+            .iter()
+            .any(|e| matches!(e, NetEvent::Pinged { .. })),
+        "a blocked peer's Ping was delivered: {b_events:?}"
+    );
 }
 
 #[test]
@@ -346,5 +359,38 @@ fn a_session_still_forms_after_the_local_id_rotates() {
         opened_with(&a_events).is_some() && opened_with(&b_events).is_some(),
         "no session after rotation — the tie-break disagreed with itself\n\
          alice: {a_events:?}\nbob: {b_events:?}"
+    );
+}
+
+/// The first Ping to a peer must work.
+///
+/// `reach` returns on acceptance, and a session needs a pipe, a persona fetch
+/// and a handshake — so sending straight after it always failed the first time
+/// and worked the second. On hardware that is "I have to tap Ping twice".
+#[test]
+fn the_first_ping_to_a_peer_arrives_without_a_second_tap() {
+    let air = air();
+    let now = Instant::now();
+    let alice = node(&air, "alice", "Alice", now);
+    let bob = node(&air, "bob", "Bob", now);
+
+    bob.net.discovery().set_enabled(true, now).unwrap();
+    alice.net.discovery().start_scanning().unwrap();
+    settle(&alice, &bob, now);
+
+    // No session yet — this is the tap that used to fail.
+    assert!(!alice.net.sessions().is_open(&bob.id));
+    alice
+        .net
+        .ping(&bob.id, now)
+        .expect("the first ping was refused");
+
+    let (_, b_events) = settle(&alice, &bob, now);
+    assert!(
+        b_events.contains(&NetEvent::Pinged {
+            peer: alice.id.clone(),
+            persona_name: "Alice".into(),
+        }),
+        "the first ping never arrived: {b_events:?}"
     );
 }
