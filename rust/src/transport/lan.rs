@@ -51,6 +51,22 @@ const HELLO_DEADLINE: Duration = Duration::from_secs(5);
 /// Ceiling on connections awaiting a hello. Beyond this we drop new ones rather
 /// than let an attacker spawn unbounded handshake threads.
 const MAX_PENDING_HANDSHAKES: usize = 64;
+/// How long a pipe may sit idle before the kernel starts probing the peer.
+///
+/// A phone that vanishes — aeroplane mode, out of range, a battery pull — sends
+/// no FIN and no RST: its interface simply stops existing. Nothing arrives to
+/// tell us, so without probes the socket stays open for the life of the
+/// process: `read` blocks forever, `send` keeps returning `Ok` into a kernel
+/// buffer that will never drain, and no `PipeClosed` is ever emitted. Every
+/// layer above then believes a dead peer is reachable. The kernel default is two
+/// hours, which for a device that walks out of a room is indistinguishable from
+/// never.
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(10);
+/// Gap between probes once one has gone unanswered.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+/// Unanswered probes before the kernel declares the connection dead.
+/// `10s + 3 × 5s` puts a vanished peer's `PipeClosed` at roughly 25 seconds.
+const KEEPALIVE_RETRIES: u32 = 3;
 
 fn io_err(e: impl std::fmt::Display) -> TransportError {
     TransportError::Io(e.to_string())
@@ -174,6 +190,11 @@ impl Inner {
         addr: Option<SocketAddr>,
         we_dialled: bool,
     ) {
+        // Both directions funnel through here, so one call covers dialer and
+        // accepter. Keepalive lives on the file description, so the clones below
+        // — the reader that has to unblock, and the teardown handle — inherit it.
+        arm_keepalive(&stream);
+
         let (read_half, teardown) = match (stream.try_clone(), stream.try_clone()) {
             (Ok(r), Ok(t)) => (r, t),
             _ => {
@@ -502,6 +523,21 @@ fn bind_dual_stack() -> std::io::Result<TcpListener> {
         Ok(sock.into())
     };
     attempt().or_else(|_| TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)))
+}
+
+/// Ask the kernel to notice a peer that leaves without saying goodbye.
+///
+/// See [`KEEPALIVE_IDLE`] for why this is not optional on a rung whose peers are
+/// phones. Best-effort: a platform that refuses one of these knobs still gets a
+/// working pipe, only a slower-to-fail one, which is not worth refusing the
+/// connection over. All three are settable on Linux, Android and Apple targets;
+/// a platform without `TCP_KEEPCNT` would need `with_retries` cfg'd out.
+fn arm_keepalive(stream: &TcpStream) {
+    let probe = socket2::TcpKeepalive::new()
+        .with_time(KEEPALIVE_IDLE)
+        .with_interval(KEEPALIVE_INTERVAL)
+        .with_retries(KEEPALIVE_RETRIES);
+    let _ = socket2::SockRef::from(stream).set_tcp_keepalive(&probe);
 }
 
 /// Why a write could not be completed.
@@ -1089,5 +1125,66 @@ impl Transport for LanTransport {
 impl Drop for LanTransport {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pipe must be probed for liveness, or a peer that vanishes without a FIN
+    /// is never noticed: `read` blocks forever, `send` succeeds into a buffer
+    /// that will never drain, and no `PipeClosed` is emitted. That is a real
+    /// hardware failure, not a hypothetical — aeroplane mode reproduces it, and
+    /// the symptom was a Ping that produced no outcome at all until the app was
+    /// force-closed.
+    ///
+    /// Asserted on the socket rather than at the call site because the point is
+    /// that the option reaches the file description both halves share. The
+    /// interval is checked too: `SO_KEEPALIVE` alone inherits the kernel's
+    /// two-hour idle default, which for a phone leaving a room is no better than
+    /// never noticing.
+    ///
+    /// Lives here rather than in `tests/transport.rs` because it reads private
+    /// state; an integration test would need a public accessor that exists for
+    /// no other reason.
+    #[test]
+    fn an_adopted_pipe_is_probed_for_liveness() {
+        let t = LanTransport::new("ka-local", Box::new(|_| {})).unwrap();
+
+        // Act as a peer directly: this exercises the accept path, and `adopt` is
+        // the shared funnel, so covering one direction covers both.
+        let stream = TcpStream::connect((Ipv4Addr::LOCALHOST, t.inner.port))
+            .or_else(|_| TcpStream::connect((Ipv6Addr::LOCALHOST, t.inner.port)))
+            .expect("the listener should accept a local dial");
+        send_hello(&stream, "ka-peer", 4321).expect("hello should be accepted");
+
+        // The hello is read on a worker, so the pipe appears asynchronously.
+        // Cloning the handle out mirrors `send`: never hold the pipes lock
+        // across the per-pipe one.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let write = loop {
+            let found = {
+                let pipes = t.inner.pipes.lock().unwrap_or_else(|e| e.into_inner());
+                pipes.get("ka-peer").map(|e| Arc::clone(&e.write))
+            };
+            if let Some(w) = found {
+                break w;
+            }
+            assert!(Instant::now() < deadline, "the pipe never opened");
+            thread::sleep(Duration::from_millis(20));
+        };
+
+        let socket = write.lock().unwrap_or_else(|e| e.into_inner());
+        let socket = socket2::SockRef::from(&*socket);
+        assert!(
+            socket.keepalive().unwrap_or(false),
+            "an adopted pipe must have keepalive armed, or a vanished peer is never detected"
+        );
+        assert!(
+            socket.tcp_keepalive_time().expect("keepalive time readable")
+                <= Duration::from_secs(60),
+            "the kernel's default idle time is hours; a phone that leaves must surface in seconds"
+        );
     }
 }
