@@ -43,6 +43,13 @@ pub enum CoreEvent {
     DiscoveryUpdated { devices: Vec<NearbyDevice> },
     /// A device pinged us (or our ping was acknowledged).
     Pinged { device_id: String, name: String },
+    /// A Ping could not be delivered — the pipe never opened.
+    ///
+    /// Only ever raised for a peer we failed to *reach*. A blocked peer accepts
+    /// the connection and then goes quiet during the handshake, so it produces
+    /// no event at all — which is what keeps "blocked" indistinguishable from
+    /// "not there" (R0-F10).
+    PingFailed { device_id: String, reason: String },
     /// A message arrived on a thread.
     MessageReceived {
         thread_id: i64,

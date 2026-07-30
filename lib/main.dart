@@ -72,6 +72,11 @@ class _HomePageState extends State<HomePage> {
           _devices = devices;
         case CoreEvent_Pinged(:final name):
           _log.insert(0, 'Ping ↔ $name');
+        // Only ever raised when we could not *reach* the device. A blocked
+        // peer accepts the pipe and goes quiet, so it produces nothing here —
+        // which is what keeps "blocked" indistinguishable from "not there".
+        case CoreEvent_PingFailed(:final reason):
+          _log.insert(0, 'Ping failed: $reason');
         case CoreEvent_MessageReceived(:final text):
           _log.insert(0, 'Message: $text');
         case CoreEvent_TransferProgress(:final received, :final total):

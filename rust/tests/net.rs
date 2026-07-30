@@ -394,3 +394,70 @@ fn the_first_ping_to_a_peer_arrives_without_a_second_tap() {
         "the first ping never arrived: {b_events:?}"
     );
 }
+
+/// A Ping that cannot be delivered must say so.
+///
+/// Queueing (added the same day) fixed "the first tap always fails" but made
+/// an undeliverable Ping silent, which is worse: a wrong message is a lead, no
+/// message is a blind alley.
+#[test]
+fn a_ping_to_an_unreachable_peer_reports_failure() {
+    let air = air();
+    let now = Instant::now();
+    let alice = node(&air, "alice", "Alice", now);
+
+    // A peer that was seen and has since gone. `connect` fails, and the queued
+    // Ping has to surface rather than evaporate.
+    let _ = alice.net.ping("ghost", now);
+    let events: Vec<NetEvent> = {
+        let mut out = Vec::new();
+        while let Ok(e) = alice.rx.recv_timeout(Duration::from_millis(100)) {
+            out.extend(alice.net.handle(e, now));
+        }
+        out
+    };
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, NetEvent::PingUndeliverable { .. })),
+        "an undeliverable Ping vanished without a word: {events:?}"
+    );
+}
+
+/// ...but a *blocked* peer must still produce nothing.
+///
+/// The distinction that makes the above safe for R0-F10: an unreachable peer
+/// fails at connect, while a blocked one accepts the pipe and goes quiet during
+/// the handshake. Only the first reaches the failure path.
+#[test]
+fn a_blocked_peer_still_produces_no_ping_failure() {
+    let air = air();
+    let now = Instant::now();
+    let alice = node(&air, "alice", "Alice", now);
+    let bob = node(&air, "bob", "Bob", now);
+    bob.net.discovery().set_enabled(true, now).unwrap();
+    alice.net.discovery().start_scanning().unwrap();
+    settle(&alice, &bob, now);
+
+    let bob_persona = rust_lib_hoppler::identity::verify_persona_record(
+        &bob.identity.lock().unwrap().persona_record(),
+    )
+    .unwrap();
+    let pseudonym = alice
+        .identity
+        .lock()
+        .unwrap()
+        .pseudonym_toward(&bob_persona.l2_pub)
+        .0;
+    bob.net.block(pseudonym);
+
+    alice.net.ping(&bob.id, now).unwrap();
+    let (a_events, _) = settle(&alice, &bob, now);
+    assert!(
+        !a_events
+            .iter()
+            .any(|e| matches!(e, NetEvent::PingUndeliverable { .. })),
+        "a blocked peer produced a delivery failure, which tells the sender it \
+         was refused rather than absent: {a_events:?}"
+    );
+}

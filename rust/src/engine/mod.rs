@@ -441,6 +441,12 @@ fn on_net_event(net: &Arc<net::Net>, event: net::NetEvent) {
                 name: persona_name,
             });
         }
+        net::NetEvent::PingUndeliverable { peer, why } => {
+            emit(CoreEvent::PingFailed {
+                device_id: peer,
+                reason: why,
+            });
+        }
         net::NetEvent::ChatReceived { peer, text } => {
             let _ = net;
             if let Ok(Some(event)) = store_incoming_chat(&peer, &text) {
