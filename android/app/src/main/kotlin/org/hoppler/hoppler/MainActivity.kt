@@ -1,6 +1,10 @@
 package org.hoppler.hoppler
 
 import android.content.Context
+import android.net.LinkProperties
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.wifi.WifiManager
@@ -9,6 +13,8 @@ import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodChannel
 import org.hoppler.hoppler.ble.BleAdapter
+
+private const val TAG = "hoppler"
 
 class MainActivity : FlutterActivity() {
     private var ble: BleAdapter? = null
@@ -61,10 +67,13 @@ class MainActivity : FlutterActivity() {
     override fun onPause() {
         // Released rather than held for the process lifetime: an app that is
         // not on screen is not discovering, and the radio cost is real.
+        main.removeCallbacksAndMessages(null)
         stopWatchingForNetworkChanges()
         releaseMulticastLock()
         super.onPause()
     }
+
+    private val main = Handler(Looper.getMainLooper())
 
     /** Take a fresh lock, dropping any held against a previous interface. */
     private fun acquireMulticastLock() {
@@ -78,6 +87,7 @@ class MainActivity : FlutterActivity() {
             setReferenceCounted(false)
             acquire()
         }
+        Log.i(TAG, "multicast lock acquired (held=${multicastLock?.isHeld})")
     }
 
     private fun releaseMulticastLock() {
@@ -91,13 +101,47 @@ class MainActivity : FlutterActivity() {
             as? ConnectivityManager ?: return
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                // A new interface: whatever we hold is against the old one.
-                runOnUiThread { acquireMulticastLock() }
+                Log.i(TAG, "network available: $network")
+                reacquireSoon("onAvailable")
+            }
+
+            /**
+             * Fires when the addresses on a network change, which is the event
+             * that actually matters here — `onAvailable` can arrive while the
+             * interface is still settling, and a lock taken then does not
+             * always stick.
+             */
+            override fun onLinkPropertiesChanged(network: Network, props: LinkProperties) {
+                Log.i(TAG, "link properties changed: ${props.interfaceName}")
+                reacquireSoon("onLinkPropertiesChanged")
             }
         }
         networkCallback = callback
         runCatching { cm.registerDefaultNetworkCallback(callback) }
-            .onFailure { networkCallback = null }
+            .onSuccess { Log.i(TAG, "watching for network changes") }
+            .onFailure {
+                // Silently losing the callback here is how the first attempt at
+                // this fix would have failed invisibly.
+                Log.w(TAG, "could not watch for network changes: $it")
+                networkCallback = null
+            }
+    }
+
+    /**
+     * Re-take the lock now and again shortly after.
+     *
+     * The delayed second attempt is deliberate: the callbacks can fire while
+     * the interface is still coming up, and a lock acquired against a
+     * half-ready interface does not always take. Acquiring twice is harmless —
+     * the lock is not reference counted and the first thing `acquire` does is
+     * drop whatever was held.
+     */
+    private fun reacquireSoon(why: String) {
+        runOnUiThread { acquireMulticastLock() }
+        main.postDelayed({
+            Log.i(TAG, "re-acquiring multicast lock after $why")
+            acquireMulticastLock()
+        }, 2_000)
     }
 
     private fun stopWatchingForNetworkChanges() {
