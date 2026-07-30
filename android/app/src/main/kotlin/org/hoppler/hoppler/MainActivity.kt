@@ -37,7 +37,11 @@ class MainActivity : FlutterActivity() {
     override fun onResume() {
         super.onResume()
         if (multicastLock == null) {
-            val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            // Safe cast: the service can be absent on stripped or unusual
+            // builds, and a hard cast would take the activity down on resume —
+            // trading "discovery is degraded" for "the app will not open".
+            val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+                ?: return
             multicastLock = wifi.createMulticastLock("hoppler-mdns").apply {
                 setReferenceCounted(false)
                 acquire()
