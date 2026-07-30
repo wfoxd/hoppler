@@ -31,7 +31,7 @@
 //! and a frame arrives, so a device that connects and says nothing leaves no
 //! trace beyond the transport's own bookkeeping.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -73,6 +73,8 @@ pub struct Net {
     known: Mutex<HashMap<PeerId, VerifiedPersona>>,
     /// Pseudonyms the user has blocked (R0-F10).
     blocked: Mutex<Vec<[u8; 32]>>,
+    /// Pings asked for before a session existed, to be sent once it does.
+    pending_pings: Mutex<HashSet<PeerId>>,
     /// Per-peer stream reassembly. The rung splits and merges freely (T08 rule
     /// 3), so nothing arriving here is a whole message until this says so.
     readers: Mutex<HashMap<PeerId, PipeReader>>,
@@ -98,6 +100,7 @@ impl Net {
             known: Mutex::new(HashMap::new()),
             blocked: Mutex::new(Vec::new()),
             readers: Mutex::new(HashMap::new()),
+            pending_pings: Mutex::new(HashSet::new()),
         }
     }
 
@@ -137,9 +140,27 @@ impl Net {
         self.transport.connect(peer)
     }
 
-    /// Send a Ping. Requires a live session — the caller reaches first.
+    /// Send a Ping, establishing a session first if there is not one.
+    ///
+    /// The obvious version — reach, then send — cannot work. `reach` returns on
+    /// *acceptance* (T08 rule 2), and a session needs the pipe to open, the
+    /// persona to be fetched and an IK handshake to complete: several round
+    /// trips. Sending immediately after means the very first Ping to any peer
+    /// always fails and the second succeeds, which is what a person would
+    /// report as "I have to tap it twice".
+    ///
+    /// So a Ping with no session is queued and flushed when the session opens.
+    /// `Ok` means accepted, as it already did — the peer's screen is still the
+    /// only proof of delivery.
     pub fn ping(&self, peer: &str, now: Instant) -> Result<(), String> {
-        self.send_frame(peer, FrameKind::Ping, Vec::new(), now)
+        if self.sessions.is_open(peer) {
+            return self.send_frame(peer, FrameKind::Ping, Vec::new(), now);
+        }
+        self.pending_pings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(peer.to_string());
+        self.reach(peer).map_err(|e| e.to_string())
     }
 
     pub fn send_chat(&self, peer: &str, text: &str, now: Instant) -> Result<(), String> {
@@ -188,6 +209,10 @@ impl Net {
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(&peer);
                 self.readers
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&peer);
+                self.pending_pings
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(&peer);
@@ -369,6 +394,15 @@ impl Net {
             .unwrap_or_else(|e| e.into_inner())
             .insert(peer.to_string(), established.persona.clone());
         self.sessions.open(peer, established, now);
+        // Anything asked for before the session existed goes now.
+        if self
+            .pending_pings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(peer)
+        {
+            let _ = self.send_frame(peer, FrameKind::Ping, Vec::new(), now);
+        }
         vec![
             NetEvent::SessionOpened {
                 peer: peer.to_string(),
