@@ -3,6 +3,12 @@
          permissions; neverForLocation on the scan lets us decline location
          entirely, which matches G-2 (nothing leaves the device) and avoids
          asking for a permission Hoppler has no use for. -->
+    <!-- mDNS discovery (LAN rung). Android's Wi-Fi hardware filters *incoming*
+         multicast unless a MulticastLock is held, so without this a device
+         advertises fine and simply never hears anyone — which presents as
+         one-way discovery, not as an error. -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+
     <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
     <uses-permission
         android:name="android.permission.BLUETOOTH_SCAN"
