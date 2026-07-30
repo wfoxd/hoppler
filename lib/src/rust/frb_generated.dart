@@ -632,18 +632,23 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           name: dco_decode_String(raw[2]),
         );
       case 2:
+        return CoreEvent_PingFailed(
+          deviceId: dco_decode_String(raw[1]),
+          reason: dco_decode_String(raw[2]),
+        );
+      case 3:
         return CoreEvent_MessageReceived(
           threadId: dco_decode_i_64(raw[1]),
           msgId: dco_decode_String(raw[2]),
           text: dco_decode_String(raw[3]),
         );
-      case 3:
+      case 4:
         return CoreEvent_TransferProgress(
           transferId: dco_decode_String(raw[1]),
           received: dco_decode_u_64(raw[2]),
           total: dco_decode_u_64(raw[3]),
         );
-      case 4:
+      case 5:
         return CoreEvent_TransferCompleted(
           transferId: dco_decode_String(raw[1]),
           success: dco_decode_bool(raw[2]),
@@ -818,6 +823,10 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         var var_name = sse_decode_String(deserializer);
         return CoreEvent_Pinged(deviceId: var_deviceId, name: var_name);
       case 2:
+        var var_deviceId = sse_decode_String(deserializer);
+        var var_reason = sse_decode_String(deserializer);
+        return CoreEvent_PingFailed(deviceId: var_deviceId, reason: var_reason);
+      case 3:
         var var_threadId = sse_decode_i_64(deserializer);
         var var_msgId = sse_decode_String(deserializer);
         var var_text = sse_decode_String(deserializer);
@@ -826,7 +835,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           msgId: var_msgId,
           text: var_text,
         );
-      case 3:
+      case 4:
         var var_transferId = sse_decode_String(deserializer);
         var var_received = sse_decode_u_64(deserializer);
         var var_total = sse_decode_u_64(deserializer);
@@ -835,7 +844,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           received: var_received,
           total: var_total,
         );
-      case 4:
+      case 5:
         var var_transferId = sse_decode_String(deserializer);
         var var_success = sse_decode_bool(deserializer);
         return CoreEvent_TransferCompleted(
@@ -1050,12 +1059,16 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         sse_encode_i_32(1, serializer);
         sse_encode_String(deviceId, serializer);
         sse_encode_String(name, serializer);
+      case CoreEvent_PingFailed(deviceId: final deviceId, reason: final reason):
+        sse_encode_i_32(2, serializer);
+        sse_encode_String(deviceId, serializer);
+        sse_encode_String(reason, serializer);
       case CoreEvent_MessageReceived(
         threadId: final threadId,
         msgId: final msgId,
         text: final text,
       ):
-        sse_encode_i_32(2, serializer);
+        sse_encode_i_32(3, serializer);
         sse_encode_i_64(threadId, serializer);
         sse_encode_String(msgId, serializer);
         sse_encode_String(text, serializer);
@@ -1064,7 +1077,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         received: final received,
         total: final total,
       ):
-        sse_encode_i_32(3, serializer);
+        sse_encode_i_32(4, serializer);
         sse_encode_String(transferId, serializer);
         sse_encode_u_64(received, serializer);
         sse_encode_u_64(total, serializer);
@@ -1072,7 +1085,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         transferId: final transferId,
         success: final success,
       ):
-        sse_encode_i_32(4, serializer);
+        sse_encode_i_32(5, serializer);
         sse_encode_String(transferId, serializer);
         sse_encode_bool(success, serializer);
     }

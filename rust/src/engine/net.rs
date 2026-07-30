@@ -58,6 +58,8 @@ pub enum NetEvent {
     Pinged { peer: PeerId, persona_name: String },
     /// A chat line arrived.
     ChatReceived { peer: PeerId, text: String },
+    /// A queued Ping was dropped because the pipe never opened.
+    PingUndeliverable { peer: PeerId, why: String },
 }
 
 /// Everything the engine needs a network for.
@@ -208,19 +210,30 @@ impl Net {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(&peer);
+                // A Ping waiting on a pipe that will never open. Reported only
+                // here, where we failed to *reach* the peer — a blocked peer's
+                // pipe opens and then goes quiet, so it never lands in this
+                // branch and stays silent, as R0-F10 requires.
+                let dropped_ping = self
+                    .pending_pings
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&peer);
                 self.readers
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(&peer);
-                self.pending_pings
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&peer);
-                if self.sessions.close(&peer) {
-                    vec![NetEvent::SessionClosed { peer }]
-                } else {
-                    Vec::new()
+                let mut out = Vec::new();
+                if dropped_ping {
+                    out.push(NetEvent::PingUndeliverable {
+                        peer: peer.clone(),
+                        why: "could not reach that device".into(),
+                    });
                 }
+                if self.sessions.close(&peer) {
+                    out.push(NetEvent::SessionClosed { peer });
+                }
+                out
             }
             TransportEvent::Received { peer, bytes } => self.on_stream(&peer, &bytes, now),
             TransportEvent::Availability { .. } => vec![NetEvent::PeersChanged],

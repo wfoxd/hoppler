@@ -59,6 +59,17 @@ sealed class CoreEvent with _$CoreEvent {
     required String name,
   }) = CoreEvent_Pinged;
 
+  /// A Ping could not be delivered — the pipe never opened.
+  ///
+  /// Only ever raised for a peer we failed to *reach*. A blocked peer accepts
+  /// the connection and then goes quiet during the handshake, so it produces
+  /// no event at all — which is what keeps "blocked" indistinguishable from
+  /// "not there" (R0-F10).
+  const factory CoreEvent.pingFailed({
+    required String deviceId,
+    required String reason,
+  }) = CoreEvent_PingFailed;
+
   /// A message arrived on a thread.
   const factory CoreEvent.messageReceived({
     required PlatformInt64 threadId,

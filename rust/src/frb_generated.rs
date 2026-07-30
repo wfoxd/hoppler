@@ -616,6 +616,14 @@ impl SseDecode for crate::api::types::CoreEvent {
                 };
             }
             2 => {
+                let mut var_deviceId = <String>::sse_decode(deserializer);
+                let mut var_reason = <String>::sse_decode(deserializer);
+                return crate::api::types::CoreEvent::PingFailed {
+                    device_id: var_deviceId,
+                    reason: var_reason,
+                };
+            }
+            3 => {
                 let mut var_threadId = <i64>::sse_decode(deserializer);
                 let mut var_msgId = <String>::sse_decode(deserializer);
                 let mut var_text = <String>::sse_decode(deserializer);
@@ -625,7 +633,7 @@ impl SseDecode for crate::api::types::CoreEvent {
                     text: var_text,
                 };
             }
-            3 => {
+            4 => {
                 let mut var_transferId = <String>::sse_decode(deserializer);
                 let mut var_received = <u64>::sse_decode(deserializer);
                 let mut var_total = <u64>::sse_decode(deserializer);
@@ -635,7 +643,7 @@ impl SseDecode for crate::api::types::CoreEvent {
                     total: var_total,
                 };
             }
-            4 => {
+            5 => {
                 let mut var_transferId = <String>::sse_decode(deserializer);
                 let mut var_success = <bool>::sse_decode(deserializer);
                 return crate::api::types::CoreEvent::TransferCompleted {
@@ -876,12 +884,18 @@ impl flutter_rust_bridge::IntoDart for crate::api::types::CoreEvent {
                 name.into_into_dart().into_dart(),
             ]
             .into_dart(),
+            crate::api::types::CoreEvent::PingFailed { device_id, reason } => [
+                2.into_dart(),
+                device_id.into_into_dart().into_dart(),
+                reason.into_into_dart().into_dart(),
+            ]
+            .into_dart(),
             crate::api::types::CoreEvent::MessageReceived {
                 thread_id,
                 msg_id,
                 text,
             } => [
-                2.into_dart(),
+                3.into_dart(),
                 thread_id.into_into_dart().into_dart(),
                 msg_id.into_into_dart().into_dart(),
                 text.into_into_dart().into_dart(),
@@ -892,7 +906,7 @@ impl flutter_rust_bridge::IntoDart for crate::api::types::CoreEvent {
                 received,
                 total,
             } => [
-                3.into_dart(),
+                4.into_dart(),
                 transfer_id.into_into_dart().into_dart(),
                 received.into_into_dart().into_dart(),
                 total.into_into_dart().into_dart(),
@@ -902,7 +916,7 @@ impl flutter_rust_bridge::IntoDart for crate::api::types::CoreEvent {
                 transfer_id,
                 success,
             } => [
-                4.into_dart(),
+                5.into_dart(),
                 transfer_id.into_into_dart().into_dart(),
                 success.into_into_dart().into_dart(),
             ]
@@ -1040,12 +1054,17 @@ impl SseEncode for crate::api::types::CoreEvent {
                 <String>::sse_encode(device_id, serializer);
                 <String>::sse_encode(name, serializer);
             }
+            crate::api::types::CoreEvent::PingFailed { device_id, reason } => {
+                <i32>::sse_encode(2, serializer);
+                <String>::sse_encode(device_id, serializer);
+                <String>::sse_encode(reason, serializer);
+            }
             crate::api::types::CoreEvent::MessageReceived {
                 thread_id,
                 msg_id,
                 text,
             } => {
-                <i32>::sse_encode(2, serializer);
+                <i32>::sse_encode(3, serializer);
                 <i64>::sse_encode(thread_id, serializer);
                 <String>::sse_encode(msg_id, serializer);
                 <String>::sse_encode(text, serializer);
@@ -1055,7 +1074,7 @@ impl SseEncode for crate::api::types::CoreEvent {
                 received,
                 total,
             } => {
-                <i32>::sse_encode(3, serializer);
+                <i32>::sse_encode(4, serializer);
                 <String>::sse_encode(transfer_id, serializer);
                 <u64>::sse_encode(received, serializer);
                 <u64>::sse_encode(total, serializer);
@@ -1064,7 +1083,7 @@ impl SseEncode for crate::api::types::CoreEvent {
                 transfer_id,
                 success,
             } => {
-                <i32>::sse_encode(4, serializer);
+                <i32>::sse_encode(5, serializer);
                 <String>::sse_encode(transfer_id, serializer);
                 <bool>::sse_encode(success, serializer);
             }
