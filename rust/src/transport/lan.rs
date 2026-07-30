@@ -1182,7 +1182,9 @@ mod tests {
             "an adopted pipe must have keepalive armed, or a vanished peer is never detected"
         );
         assert!(
-            socket.tcp_keepalive_time().expect("keepalive time readable")
+            socket
+                .tcp_keepalive_time()
+                .expect("keepalive time readable")
                 <= Duration::from_secs(60),
             "the kernel's default idle time is hours; a phone that leaves must surface in seconds"
         );
