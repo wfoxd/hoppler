@@ -49,6 +49,28 @@ class MainActivity : FlutterActivity() {
      */
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
+    /**
+     * Whether re-acquiring is still wanted. Read from other threads, so
+     * `@Volatile`.
+     *
+     * `unregisterNetworkCallback` does not promise that a callback already
+     * running has finished, and both re-acquire attempts are *posted* rather
+     * than run inline. So without a guard the ordering below is reachable:
+     *
+     * 1. `onPause` unregisters and releases the lock;
+     * 2. a callback already in flight posts an acquire;
+     * 3. the acquire runs — and the lock is now held with the app backgrounded,
+     *    until some later `onPause` happens to release it.
+     *
+     * That is precisely the foreground scoping the lock exists to respect
+     * (R0-N6), inverted. Cancelling the queue is not enough on its own:
+     * `runOnUiThread` posts to the activity's own handler, which
+     * `main.removeCallbacksAndMessages` does not touch — so the flag is checked
+     * inside each posted block as well as on entry.
+     */
+    @Volatile
+    private var watching = false
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         val adapter = BleAdapter(applicationContext)
@@ -67,8 +89,11 @@ class MainActivity : FlutterActivity() {
     override fun onPause() {
         // Released rather than held for the process lifetime: an app that is
         // not on screen is not discovering, and the radio cost is real.
-        main.removeCallbacksAndMessages(null)
+        //
+        // Order matters: clearing `watching` first means anything that slips
+        // through afterwards finds the gate already shut.
         stopWatchingForNetworkChanges()
+        main.removeCallbacksAndMessages(null)
         releaseMulticastLock()
         super.onPause()
     }
@@ -118,7 +143,10 @@ class MainActivity : FlutterActivity() {
         }
         networkCallback = callback
         runCatching { cm.registerDefaultNetworkCallback(callback) }
-            .onSuccess { Log.i(TAG, "watching for network changes") }
+            .onSuccess {
+                watching = true
+                Log.i(TAG, "watching for network changes")
+            }
             .onFailure {
                 // Silently losing the callback here is how the first attempt at
                 // this fix would have failed invisibly.
@@ -137,14 +165,20 @@ class MainActivity : FlutterActivity() {
      * drop whatever was held.
      */
     private fun reacquireSoon(why: String) {
-        runOnUiThread { acquireMulticastLock() }
+        if (!watching) return
+        runOnUiThread { if (watching) acquireMulticastLock() }
         main.postDelayed({
+            if (!watching) return@postDelayed
             Log.i(TAG, "re-acquiring multicast lock after $why")
             acquireMulticastLock()
         }, 2_000)
     }
 
     private fun stopWatchingForNetworkChanges() {
+        // Before unregistering, not after: a callback running concurrently on
+        // ConnectivityManager's thread must see the gate shut even if it got
+        // past the unregister.
+        watching = false
         val cm = applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE)
             as? ConnectivityManager
         networkCallback?.let { cb -> runCatching { cm?.unregisterNetworkCallback(cb) } }
