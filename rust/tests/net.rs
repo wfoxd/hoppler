@@ -14,7 +14,7 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use rust_lib_hoppler::engine::net::{Net, NetEvent};
+use rust_lib_hoppler::engine::net::{Net, NetEvent, PING_DEADLINE};
 use rust_lib_hoppler::identity::Identity;
 use rust_lib_hoppler::transport::loopback::LoopbackNet;
 use rust_lib_hoppler::transport::{Transport, TransportEvent};
@@ -392,6 +392,121 @@ fn the_first_ping_to_a_peer_arrives_without_a_second_tap() {
             persona_name: "Alice".into(),
         }),
         "the first ping never arrived: {b_events:?}"
+    );
+}
+
+/// A Ping that cannot be delivered must say so.
+///
+/// Queueing (added the same day) fixed "the first tap always fails" but made
+/// an undeliverable Ping silent, which is worse: a wrong message is a lead, no
+/// message is a blind alley.
+#[test]
+fn a_ping_to_an_unreachable_peer_reports_failure() {
+    let air = air();
+    let now = Instant::now();
+    let alice = node(&air, "alice", "Alice", now);
+
+    // A peer that was seen and has since gone. `connect` fails, and the queued
+    // Ping has to surface rather than evaporate.
+    let _ = alice.net.ping("ghost", now);
+    let events: Vec<NetEvent> = {
+        let mut out = Vec::new();
+        while let Ok(e) = alice.rx.recv_timeout(Duration::from_millis(100)) {
+            out.extend(alice.net.handle(e, now));
+        }
+        out
+    };
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, NetEvent::PingUndeliverable { .. })),
+        "an undeliverable Ping vanished without a word: {events:?}"
+    );
+}
+
+/// ...but a *blocked* peer must still produce nothing.
+///
+/// The distinction that makes the above safe for R0-F10: an unreachable peer
+/// fails at connect, while a blocked one accepts the pipe and goes quiet during
+/// the handshake. Only the first reaches the failure path.
+#[test]
+fn a_blocked_peer_is_indistinguishable_from_an_absent_one() {
+    let air = air();
+    let now = Instant::now();
+    let alice = node(&air, "alice", "Alice", now);
+    let bob = node(&air, "bob", "Bob", now);
+    bob.net.discovery().set_enabled(true, now).unwrap();
+    alice.net.discovery().start_scanning().unwrap();
+    settle(&alice, &bob, now);
+
+    let bob_persona = rust_lib_hoppler::identity::verify_persona_record(
+        &bob.identity.lock().unwrap().persona_record(),
+    )
+    .unwrap();
+    let pseudonym = alice
+        .identity
+        .lock()
+        .unwrap()
+        .pseudonym_toward(&bob_persona.l2_pub)
+        .0;
+    bob.net.block(pseudonym);
+
+    // What an absent peer looks like, to compare against.
+    let _ = alice.net.ping("ghost", now);
+    let absent_why = {
+        let mut found = None;
+        while let Ok(e) = alice.rx.recv_timeout(Duration::from_millis(100)) {
+            for out in alice.net.handle(e, now) {
+                if let NetEvent::PingUndeliverable { why, .. } = out {
+                    found = Some(why);
+                }
+            }
+        }
+        found.expect("an absent peer's Ping must be reported")
+    };
+
+    alice.net.ping(&bob.id, now).unwrap();
+    let (a_events, _) = settle(&alice, &bob, now);
+    assert!(
+        !a_events
+            .iter()
+            .any(|e| matches!(e, NetEvent::PingUndeliverable { peer, .. } if peer == &bob.id)),
+        "the pipe to a blocking peer opens normally, so nothing should be \
+         concluded before the deadline: {a_events:?}"
+    );
+
+    // And at the deadline it must say the *same thing* an absent peer said.
+    //
+    // Note which way round this cuts. The instinct is that a blocked peer
+    // should produce nothing — but silence is itself a signal, and a unique
+    // one: absent peers report, so anyone who reports nothing is blocking you.
+    // Indistinguishability is the requirement (R0-F10), not silence, and that
+    // means a blocked peer must produce the identical message.
+    let blocked_why = alice
+        .net
+        .expire_pings(now + PING_DEADLINE)
+        .into_iter()
+        .find_map(|e| match e {
+            NetEvent::PingUndeliverable { peer, why } if peer == bob.id => Some(why),
+            _ => None,
+        })
+        .expect(
+            "a blocked peer's Ping was never reported — silence where an absent \
+             peer reports is exactly how the sender learns it was refused",
+        );
+
+    assert_eq!(
+        blocked_why, absent_why,
+        "blocked and absent must be indistinguishable to the sender"
+    );
+
+    // The deadline above is computed *from* PING_DEADLINE, so on its own it
+    // would pass however long that grew — a day included, which is the silence
+    // this test exists to forbid wearing a different hat. Pin the policy
+    // against a literal, separately from the mechanism.
+    assert!(
+        PING_DEADLINE <= Duration::from_secs(30),
+        "a Ping that takes longer than this to report has told the person nothing"
     );
 }
 
