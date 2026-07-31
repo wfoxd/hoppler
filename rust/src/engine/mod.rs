@@ -271,7 +271,30 @@ pub fn ping(device_id: String) -> Result<(), String> {
     // produces — the fake used to emit it synchronously and the UI must not
     // rely on that any more.
     net.reach(&device_id).map_err(|e| e.to_string())?;
-    net.ping(&device_id, std::time::Instant::now())
+    net.ping(&device_id, std::time::Instant::now())?;
+    watch_for_an_undelivered_ping(net);
+    Ok(())
+}
+
+/// Wake up once, after the Ping deadline, to report anything still waiting.
+///
+/// A thread per tap rather than a permanent ticker: a queued Ping is the only
+/// thing here with a deadline, taps are rare and human-paced, and a loop that
+/// runs forever costs battery every second of a session that may never queue
+/// anything at all.
+///
+/// It sleeps slightly past the deadline so the check lands after expiry rather
+/// than racing it, and finding nothing to report is the normal case — the
+/// session usually opens first and takes the Ping with it.
+fn watch_for_an_undelivered_ping(net: Arc<net::Net>) {
+    let _ = std::thread::Builder::new()
+        .name("hoppler-ping-deadline".into())
+        .spawn(move || {
+            std::thread::sleep(net::PING_DEADLINE + std::time::Duration::from_millis(100));
+            for out in net.expire_pings(std::time::Instant::now()) {
+                on_net_event(&net, out);
+            }
+        });
 }
 
 /// Send a chat message: writes the outgoing row, then (fake) receives a canned
