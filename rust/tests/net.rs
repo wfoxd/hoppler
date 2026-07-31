@@ -394,3 +394,62 @@ fn the_first_ping_to_a_peer_arrives_without_a_second_tap() {
         "the first ping never arrived: {b_events:?}"
     );
 }
+
+/// Tapping Ping twice must not destroy the session it is building.
+///
+/// `PipeOpened` is not once-per-pipe: T08 rule 2 makes the rung emit it again
+/// for a `connect` to an already-connected peer, so a caller waiting on the
+/// event never hangs. Every extra tap therefore delivers another one.
+///
+/// Before the fix that meant two handshakes down one pipe. The second
+/// initiator overwrote the first in `pending`, so the reply to msg1 #1 was
+/// decrypted against msg1 #2's ephemeral key — `Noise("decrypt error")` — while
+/// the responder, which had opened a session from msg1 #1, read msg1 #2 as
+/// ciphertext and dropped it. Both ends destroyed what they had just built, and
+/// tapping harder made it worse.
+///
+/// Found on two phones. Every layer reported success: the pipe was healthy, the
+/// persona verified, both msg1s sent `Ok`.
+#[test]
+fn a_second_pipe_opened_does_not_wreck_the_handshake_in_flight() {
+    let air = air();
+    let now = Instant::now();
+    let alice = node(&air, "alice", "Alice", now);
+    let bob = node(&air, "bob", "Bob", now);
+    bob.net.discovery().set_enabled(true, now).unwrap();
+    alice.net.discovery().start_scanning().unwrap();
+    settle(&alice, &bob, now);
+
+    // Two taps. The rung announces the pipe each time, exactly as the contract
+    // says it must.
+    alice.net.reach(&bob.id).unwrap();
+    alice.net.handle(
+        TransportEvent::PipeOpened {
+            peer: bob.id.clone(),
+        },
+        now,
+    );
+    let (a_events, b_events) = settle(&alice, &bob, now);
+
+    assert_eq!(
+        opened_with(&a_events).as_deref(),
+        Some("Bob"),
+        "the duplicate announcement cost Alice the session: {a_events:?}"
+    );
+    assert_eq!(
+        opened_with(&b_events).as_deref(),
+        Some("Alice"),
+        "the duplicate announcement cost Bob the session: {b_events:?}"
+    );
+
+    // And the thing the person was trying to do actually happens.
+    alice.net.ping(&bob.id, now).unwrap();
+    let (_, b_events) = settle(&alice, &bob, now);
+    assert!(
+        b_events.contains(&NetEvent::Pinged {
+            peer: alice.id.clone(),
+            persona_name: "Alice".into(),
+        }),
+        "the Ping did not arrive after a duplicate announcement: {b_events:?}"
+    );
+}

@@ -230,6 +230,29 @@ impl Net {
     /// A pipe opened. If we know who they are we can start a handshake; if not
     /// we must ask first, because Noise IK needs their static up front.
     fn on_pipe_opened(&self, peer: &str) -> Vec<NetEvent> {
+        // `PipeOpened` is not once-per-pipe. T08 rule 2 requires the rung to
+        // emit it for a `connect` to a peer that is *already* connected, so a
+        // caller waiting on the event never hangs — which means every extra tap
+        // of Ping delivers another one, and this must be idempotent.
+        //
+        // It was not, and the cost was total. A second `start_handshake`
+        // overwrites the first initiator in `pending`, so the reply to msg1 #1
+        // gets decrypted against msg1 #2's ephemeral key — `Noise("decrypt
+        // error")` — while the far side, which established a session from msg1
+        // #1, reads msg1 #2 as ciphertext and drops that session. Both ends
+        // destroy what they had just built, and the harder the person taps the
+        // more reliably it fails.
+        if self.sessions.is_open(peer) {
+            return Vec::new();
+        }
+        if self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(peer)
+        {
+            return Vec::new();
+        }
         // The other side will speak first; anything we sent now would collide
         // with it (see the module docs on who initiates).
         if !self.we_initiate(peer) {
@@ -253,7 +276,24 @@ impl Net {
         }
     }
 
+    /// Open a handshake — **at most one at a time per peer**.
+    ///
+    /// The guard lives here rather than only at the call sites because there
+    /// are two routes in: a pipe that opens when the persona is already known,
+    /// and a persona arriving for a pipe that opened earlier. A duplicate
+    /// `PipeOpened` reaches the second route with `pending` still empty (we are
+    /// waiting on the persona, not on a reply), so guarding the caller alone
+    /// misses exactly the case hardware hit.
     fn start_handshake(&self, peer: &str, persona: &VerifiedPersona) -> Vec<NetEvent> {
+        if self.sessions.is_open(peer)
+            || self
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(peer)
+        {
+            return Vec::new();
+        }
         let identity = self.identity.lock().unwrap_or_else(|e| e.into_inner());
         match Initiator::start(&identity, persona) {
             Ok((initiator, msg1)) => {
