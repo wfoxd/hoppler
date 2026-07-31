@@ -1017,14 +1017,24 @@ impl Transport for LanTransport {
             }
         };
         if let Err(e) = send_hello(&stream, &self.inner.id(), self.inner.port) {
+            #[cfg(debug_assertions)]
             log::warn!("dial {peer} connected to {addr} but the hello failed: {e}");
+            #[cfg(not(debug_assertions))]
+            log::warn!("dial {peer} connected but the hello failed: {e}");
             self.inner.emit(TransportEvent::PipeFailed {
                 peer: peer.to_string(),
                 why: e.to_string(),
             });
             return Err(e);
         }
+        // Debug builds only. mDNS already puts this pairing on the wire, so it
+        // is no secret in the moment — but a log outlives the twelve-minute
+        // rotation that makes the id disposable, and an address does not
+        // rotate at all. Diagnosing is worth that trade; shipping is not.
+        #[cfg(debug_assertions)]
         log::info!("dialled {peer} at {addr}");
+        #[cfg(not(debug_assertions))]
+        log::info!("dialled {peer}");
         self.inner.adopt(peer.to_string(), stream, Some(addr), true);
         Ok(())
     }
