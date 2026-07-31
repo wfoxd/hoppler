@@ -332,7 +332,12 @@ impl Net {
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(peer.to_string(), persona.clone());
                 let _ = self.discovery.accept_persona(peer, &record);
-                log::info!("learned persona of {peer}: {:?}", persona.name);
+                // Deliberately not the name. A persona name is stable where the
+                // device id is not, so a log carrying both is a rotation-proof
+                // link between them — the exact correlation R0-F2 exists to
+                // deny — and it survives in a bug report long after the id it
+                // was paired with has gone.
+                log::info!("learned persona of {peer}");
                 let mut out = self.start_handshake(peer, &persona);
                 out.push(NetEvent::PeersChanged);
                 return out;
@@ -391,7 +396,11 @@ impl Net {
         {
             // Dropped. Not an error frame, not a close — nothing, so a blocked
             // device cannot tell this from us being out of range (R0-F10).
-            log::info!("handshake offer from {peer} dropped: blocked");
+            // Not logged, and that is the point. A block is enforced by
+            // silence, and nothing on the wire reveals it (R0-F10) — so a log
+            // line saying so would be the only artifact in existence that does.
+            // Whoever reads the log is not always the person who wrote the
+            // block.
             return Vec::new();
         }
 
