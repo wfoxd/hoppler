@@ -411,6 +411,7 @@ impl Net {
     }
 
     fn on_session(&self, peer: &str, bytes: &[u8], now: Instant) -> Vec<NetEvent> {
+        log::info!("session bytes from {peer}: {} bytes", bytes.len());
         // 1. An established session: ordinary traffic.
         if self.sessions.is_open(peer) {
             return self.on_session_bytes(peer, bytes, now);
@@ -469,11 +470,15 @@ impl Net {
                 let _ = self.send_on(peer, CHANNEL_SESSION, &reply);
                 self.adopt(peer, established, now)
             }
-            Err(_) => Vec::new(),
+            Err(e) => {
+                log::warn!("handshake offer from {peer} accepted then failed: {e:?}");
+                Vec::new()
+            }
         }
     }
 
     fn adopt(&self, peer: &str, established: Established, now: Instant) -> Vec<NetEvent> {
+        log::info!("session open with {peer}");
         let name = established.persona.name.clone();
         self.known
             .lock()
