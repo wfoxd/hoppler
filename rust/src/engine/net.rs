@@ -315,6 +315,7 @@ impl Net {
         // The other side will speak first; anything we sent now would collide
         // with it (see the module docs on who initiates).
         if !self.we_initiate(peer) {
+            log::info!("pipe open to {peer}: they initiate, waiting");
             return Vec::new();
         }
         let persona = self
@@ -324,12 +325,17 @@ impl Net {
             .get(peer)
             .cloned();
         match persona {
-            Some(persona) => self.start_handshake(peer, &persona),
+            Some(persona) => {
+                log::info!("pipe open to {peer}: persona known, starting handshake");
+                self.start_handshake(peer, &persona)
+            }
             None => {
                 // First contact: ask for their persona. We cannot present a
                 // pseudonym yet — it is derived from *their* Layer-2 key, which
                 // is exactly what we are asking for.
-                let _ = self.send_on(peer, CHANNEL_DISCOVERY, &Request::first_contact().encode());
+                let sent =
+                    self.send_on(peer, CHANNEL_DISCOVERY, &Request::first_contact().encode());
+                log::info!("pipe open to {peer}: asking for persona (sent={sent:?})");
                 Vec::new()
             }
         }
@@ -361,7 +367,11 @@ impl Net {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(peer.to_string(), initiator);
-                let _ = self.send_on(peer, CHANNEL_SESSION, &msg1);
+                let sent = self.send_on(peer, CHANNEL_SESSION, &msg1);
+                log::info!(
+                    "handshake to {peer}: sent msg1 ({} bytes, {sent:?})",
+                    msg1.len()
+                );
             }
             Err(_) => {
                 self.pending
@@ -421,6 +431,12 @@ impl Net {
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(peer.to_string(), persona.clone());
                 let _ = self.discovery.accept_persona(peer, &record);
+                // Deliberately not the name. A persona name is stable where the
+                // device id is not, so a log carrying both is a rotation-proof
+                // link between them — the exact correlation R0-F2 exists to
+                // deny — and it survives in a bug report long after the id it
+                // was paired with has gone.
+                log::info!("learned persona of {peer}");
                 let mut out = self.start_handshake(peer, &persona);
                 out.push(NetEvent::PeersChanged);
                 return out;
@@ -435,6 +451,7 @@ impl Net {
     }
 
     fn on_session(&self, peer: &str, bytes: &[u8], now: Instant) -> Vec<NetEvent> {
+        log::info!("session bytes from {peer}: {} bytes", bytes.len());
         // 1. An established session: ordinary traffic.
         if self.sessions.is_open(peer) {
             return self.on_session_bytes(peer, bytes, now);
@@ -448,7 +465,10 @@ impl Net {
         if let Some(initiator) = waiting {
             return match initiator.finish(bytes) {
                 Ok(established) => self.adopt(peer, established, now),
-                Err(_) => Vec::new(),
+                Err(e) => {
+                    log::warn!("handshake reply from {peer} rejected: {e:?}");
+                    Vec::new()
+                }
             };
         }
         // 3. Otherwise: someone opening a handshake with us.
@@ -462,7 +482,10 @@ impl Net {
         let identity = self.identity.lock().unwrap_or_else(|e| e.into_inner());
         let pending = match Responder::read_first(&identity, bytes) {
             Ok(p) => p,
-            Err(_) => return Vec::new(),
+            Err(e) => {
+                log::warn!("handshake offer from {peer} rejected: {e:?}");
+                return Vec::new();
+            }
         };
 
         if self
@@ -473,6 +496,11 @@ impl Net {
         {
             // Dropped. Not an error frame, not a close — nothing, so a blocked
             // device cannot tell this from us being out of range (R0-F10).
+            // Not logged, and that is the point. A block is enforced by
+            // silence, and nothing on the wire reveals it (R0-F10) — so a log
+            // line saying so would be the only artifact in existence that does.
+            // Whoever reads the log is not always the person who wrote the
+            // block.
             return Vec::new();
         }
 
@@ -482,11 +510,15 @@ impl Net {
                 let _ = self.send_on(peer, CHANNEL_SESSION, &reply);
                 self.adopt(peer, established, now)
             }
-            Err(_) => Vec::new(),
+            Err(e) => {
+                log::warn!("handshake offer from {peer} accepted then failed: {e:?}");
+                Vec::new()
+            }
         }
     }
 
     fn adopt(&self, peer: &str, established: Established, now: Instant) -> Vec<NetEvent> {
+        log::info!("session open with {peer}");
         let name = established.persona.name.clone();
         self.known
             .lock()
