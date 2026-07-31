@@ -266,8 +266,16 @@ impl Inner {
         let mut buf = vec![0u8; READ_CHUNK];
         loop {
             match stream.read(&mut buf) {
-                Ok(0) => break,  // peer hung up
-                Err(_) => break, // severed link
+                Ok(0) => {
+                    log::info!("pipe to {peer} closed: peer hung up");
+                    break;
+                }
+                Err(e) => {
+                    // The interesting one: with keepalive armed this is how a
+                    // peer that vanished without a goodbye finally surfaces.
+                    log::info!("pipe to {peer} closed: {e}");
+                    break;
+                }
                 Ok(n) => {
                     // Publish under the pipes guard, and only while we are still
                     // the current pipe: otherwise a concurrent disconnect can
@@ -724,6 +732,7 @@ fn accept_loop(inner: Arc<Inner>, listener: TcpListener) {
             if check_label(&peer).is_err() {
                 return;
             }
+            log::info!("accepted a pipe from {peer}");
             let _ = stream.set_read_timeout(None);
             // Their source port is ephemeral; pair their IP with the listening
             // port they told us about, or the address is undialable later.
@@ -981,7 +990,12 @@ impl Transport for LanTransport {
             return Ok(());
         }
         let candidates = self.peer_addrs(peer);
+        log::info!(
+            "dialling {peer}: {} candidate address(es)",
+            candidates.len()
+        );
         if candidates.is_empty() {
+            log::warn!("dial {peer} refused: no address known for it");
             self.inner.emit(TransportEvent::PipeFailed {
                 peer: peer.to_string(),
                 why: "peer not discovered".into(),
@@ -994,6 +1008,7 @@ impl Transport for LanTransport {
         let (stream, addr) = match dial_race(&candidates) {
             Ok(pair) => pair,
             Err(e) => {
+                log::warn!("dial {peer} failed against every candidate: {e}");
                 self.inner.emit(TransportEvent::PipeFailed {
                     peer: peer.to_string(),
                     why: e.to_string(),
@@ -1002,12 +1017,14 @@ impl Transport for LanTransport {
             }
         };
         if let Err(e) = send_hello(&stream, &self.inner.id(), self.inner.port) {
+            log::warn!("dial {peer} connected to {addr} but the hello failed: {e}");
             self.inner.emit(TransportEvent::PipeFailed {
                 peer: peer.to_string(),
                 why: e.to_string(),
             });
             return Err(e);
         }
+        log::info!("dialled {peer} at {addr}");
         self.inner.adopt(peer.to_string(), stream, Some(addr), true);
         Ok(())
     }
