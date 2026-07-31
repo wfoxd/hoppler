@@ -31,7 +31,7 @@
 //! and a frame arrives, so a device that connects and says nothing leaves no
 //! trace beyond the transport's own bookkeeping.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -44,6 +44,13 @@ use crate::session::frame::{Frame, FrameKind};
 use crate::session::handshake::{Established, Initiator, Responder};
 use crate::session::table::SessionTable;
 use crate::transport::{PeerId, Transport, TransportError, TransportEvent};
+
+/// How long a queued Ping waits for a session before it is called undeliverable.
+///
+/// Long enough for the honest path — dial (3 s in the LAN rung), persona fetch,
+/// and an IK handshake — and short enough that a person still connects the
+/// answer to the tap that caused it.
+pub const PING_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Something the engine should act on: store a row, emit to Dart, update the UI.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,6 +65,8 @@ pub enum NetEvent {
     Pinged { peer: PeerId, persona_name: String },
     /// A chat line arrived.
     ChatReceived { peer: PeerId, text: String },
+    /// A queued Ping was dropped because the pipe never opened.
+    PingUndeliverable { peer: PeerId, why: String },
 }
 
 /// Everything the engine needs a network for.
@@ -73,8 +82,16 @@ pub struct Net {
     known: Mutex<HashMap<PeerId, VerifiedPersona>>,
     /// Pseudonyms the user has blocked (R0-F10).
     blocked: Mutex<Vec<[u8; 32]>>,
-    /// Pings asked for before a session existed, to be sent once it does.
-    pending_pings: Mutex<HashSet<PeerId>>,
+    /// Pings asked for before a session existed, to be sent once it does —
+    /// each with the moment it stops being worth waiting for.
+    ///
+    /// A deadline rather than a bare set, because "the pipe failed" is a much
+    /// narrower event than "it did not arrive". A pipe that opens and then
+    /// stalls mid-handshake produces no transport event at all, so without a
+    /// clock a queued Ping waits forever and the person who tapped it is told
+    /// nothing. Observed on hardware: two phones listing each other, Ping
+    /// silent, and only the *chat* path saying "no session".
+    pending_pings: Mutex<HashMap<PeerId, Instant>>,
     /// Per-peer stream reassembly. The rung splits and merges freely (T08 rule
     /// 3), so nothing arriving here is a whole message until this says so.
     readers: Mutex<HashMap<PeerId, PipeReader>>,
@@ -100,7 +117,7 @@ impl Net {
             known: Mutex::new(HashMap::new()),
             blocked: Mutex::new(Vec::new()),
             readers: Mutex::new(HashMap::new()),
-            pending_pings: Mutex::new(HashSet::new()),
+            pending_pings: Mutex::new(HashMap::new()),
         }
     }
 
@@ -159,8 +176,39 @@ impl Net {
         self.pending_pings
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(peer.to_string());
+            .insert(peer.to_string(), now + PING_DEADLINE);
         self.reach(peer).map_err(|e| e.to_string())
+    }
+
+    /// Give up on queued Pings whose deadline has passed, and say so.
+    ///
+    /// Someone has to call this — nothing in the engine ticks, and `handle`
+    /// only runs when the transport has something to say, which in exactly the
+    /// failing case it never does.
+    pub fn expire_pings(&self, now: Instant) -> Vec<NetEvent> {
+        let expired: Vec<PeerId> = {
+            let mut pings = self.pending_pings.lock().unwrap_or_else(|e| e.into_inner());
+            let due: Vec<PeerId> = pings
+                .iter()
+                .filter(|(_, &deadline)| now >= deadline)
+                .map(|(peer, _)| peer.clone())
+                .collect();
+            for peer in &due {
+                pings.remove(peer);
+            }
+            due
+        };
+        expired
+            .into_iter()
+            .map(|peer| NetEvent::PingUndeliverable {
+                peer,
+                // Deliberately the same wording as the pipe-failure case. The
+                // two are different internally but identical to the person
+                // holding the phone, and distinguishing them here would leak
+                // whether a peer refused us — the R0-F10 line.
+                why: "could not reach that device".into(),
+            })
+            .collect()
     }
 
     pub fn send_chat(&self, peer: &str, text: &str, now: Instant) -> Result<(), String> {
@@ -208,19 +256,30 @@ impl Net {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(&peer);
+                // A Ping waiting on a pipe that will never open. Reported here
+                // as soon as we know, rather than waiting out the deadline —
+                // this is the case where the answer is already certain.
+                let dropped_ping = self
+                    .pending_pings
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&peer)
+                    .is_some();
                 self.readers
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(&peer);
-                self.pending_pings
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&peer);
-                if self.sessions.close(&peer) {
-                    vec![NetEvent::SessionClosed { peer }]
-                } else {
-                    Vec::new()
+                let mut out = Vec::new();
+                if dropped_ping {
+                    out.push(NetEvent::PingUndeliverable {
+                        peer: peer.clone(),
+                        why: "could not reach that device".into(),
+                    });
                 }
+                if self.sessions.close(&peer) {
+                    out.push(NetEvent::SessionClosed { peer });
+                }
+                out
             }
             TransportEvent::Received { peer, bytes } => self.on_stream(&peer, &bytes, now),
             TransportEvent::Availability { .. } => vec![NetEvent::PeersChanged],
@@ -400,6 +459,7 @@ impl Net {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(peer)
+            .is_some()
         {
             let _ = self.send_frame(peer, FrameKind::Ping, Vec::new(), now);
         }

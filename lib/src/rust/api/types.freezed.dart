@@ -55,12 +55,13 @@ extension CoreEventPatterns on CoreEvent {
 /// }
 /// ```
 
-@optionalTypeArgs TResult maybeMap<TResult extends Object?>({TResult Function( CoreEvent_DiscoveryUpdated value)?  discoveryUpdated,TResult Function( CoreEvent_Pinged value)?  pinged,TResult Function( CoreEvent_MessageReceived value)?  messageReceived,TResult Function( CoreEvent_TransferProgress value)?  transferProgress,TResult Function( CoreEvent_TransferCompleted value)?  transferCompleted,required TResult orElse(),}){
+@optionalTypeArgs TResult maybeMap<TResult extends Object?>({TResult Function( CoreEvent_DiscoveryUpdated value)?  discoveryUpdated,TResult Function( CoreEvent_Pinged value)?  pinged,TResult Function( CoreEvent_PingFailed value)?  pingFailed,TResult Function( CoreEvent_MessageReceived value)?  messageReceived,TResult Function( CoreEvent_TransferProgress value)?  transferProgress,TResult Function( CoreEvent_TransferCompleted value)?  transferCompleted,required TResult orElse(),}){
 final _that = this;
 switch (_that) {
 case CoreEvent_DiscoveryUpdated() when discoveryUpdated != null:
 return discoveryUpdated(_that);case CoreEvent_Pinged() when pinged != null:
-return pinged(_that);case CoreEvent_MessageReceived() when messageReceived != null:
+return pinged(_that);case CoreEvent_PingFailed() when pingFailed != null:
+return pingFailed(_that);case CoreEvent_MessageReceived() when messageReceived != null:
 return messageReceived(_that);case CoreEvent_TransferProgress() when transferProgress != null:
 return transferProgress(_that);case CoreEvent_TransferCompleted() when transferCompleted != null:
 return transferCompleted(_that);case _:
@@ -81,12 +82,13 @@ return transferCompleted(_that);case _:
 /// }
 /// ```
 
-@optionalTypeArgs TResult map<TResult extends Object?>({required TResult Function( CoreEvent_DiscoveryUpdated value)  discoveryUpdated,required TResult Function( CoreEvent_Pinged value)  pinged,required TResult Function( CoreEvent_MessageReceived value)  messageReceived,required TResult Function( CoreEvent_TransferProgress value)  transferProgress,required TResult Function( CoreEvent_TransferCompleted value)  transferCompleted,}){
+@optionalTypeArgs TResult map<TResult extends Object?>({required TResult Function( CoreEvent_DiscoveryUpdated value)  discoveryUpdated,required TResult Function( CoreEvent_Pinged value)  pinged,required TResult Function( CoreEvent_PingFailed value)  pingFailed,required TResult Function( CoreEvent_MessageReceived value)  messageReceived,required TResult Function( CoreEvent_TransferProgress value)  transferProgress,required TResult Function( CoreEvent_TransferCompleted value)  transferCompleted,}){
 final _that = this;
 switch (_that) {
 case CoreEvent_DiscoveryUpdated():
 return discoveryUpdated(_that);case CoreEvent_Pinged():
-return pinged(_that);case CoreEvent_MessageReceived():
+return pinged(_that);case CoreEvent_PingFailed():
+return pingFailed(_that);case CoreEvent_MessageReceived():
 return messageReceived(_that);case CoreEvent_TransferProgress():
 return transferProgress(_that);case CoreEvent_TransferCompleted():
 return transferCompleted(_that);}
@@ -103,12 +105,13 @@ return transferCompleted(_that);}
 /// }
 /// ```
 
-@optionalTypeArgs TResult? mapOrNull<TResult extends Object?>({TResult? Function( CoreEvent_DiscoveryUpdated value)?  discoveryUpdated,TResult? Function( CoreEvent_Pinged value)?  pinged,TResult? Function( CoreEvent_MessageReceived value)?  messageReceived,TResult? Function( CoreEvent_TransferProgress value)?  transferProgress,TResult? Function( CoreEvent_TransferCompleted value)?  transferCompleted,}){
+@optionalTypeArgs TResult? mapOrNull<TResult extends Object?>({TResult? Function( CoreEvent_DiscoveryUpdated value)?  discoveryUpdated,TResult? Function( CoreEvent_Pinged value)?  pinged,TResult? Function( CoreEvent_PingFailed value)?  pingFailed,TResult? Function( CoreEvent_MessageReceived value)?  messageReceived,TResult? Function( CoreEvent_TransferProgress value)?  transferProgress,TResult? Function( CoreEvent_TransferCompleted value)?  transferCompleted,}){
 final _that = this;
 switch (_that) {
 case CoreEvent_DiscoveryUpdated() when discoveryUpdated != null:
 return discoveryUpdated(_that);case CoreEvent_Pinged() when pinged != null:
-return pinged(_that);case CoreEvent_MessageReceived() when messageReceived != null:
+return pinged(_that);case CoreEvent_PingFailed() when pingFailed != null:
+return pingFailed(_that);case CoreEvent_MessageReceived() when messageReceived != null:
 return messageReceived(_that);case CoreEvent_TransferProgress() when transferProgress != null:
 return transferProgress(_that);case CoreEvent_TransferCompleted() when transferCompleted != null:
 return transferCompleted(_that);case _:
@@ -128,11 +131,12 @@ return transferCompleted(_that);case _:
 /// }
 /// ```
 
-@optionalTypeArgs TResult maybeWhen<TResult extends Object?>({TResult Function( List<NearbyDevice> devices)?  discoveryUpdated,TResult Function( String deviceId,  String name)?  pinged,TResult Function( PlatformInt64 threadId,  String msgId,  String text)?  messageReceived,TResult Function( String transferId,  BigInt received,  BigInt total)?  transferProgress,TResult Function( String transferId,  bool success)?  transferCompleted,required TResult orElse(),}) {final _that = this;
+@optionalTypeArgs TResult maybeWhen<TResult extends Object?>({TResult Function( List<NearbyDevice> devices)?  discoveryUpdated,TResult Function( String deviceId,  String name)?  pinged,TResult Function( String deviceId,  String reason)?  pingFailed,TResult Function( PlatformInt64 threadId,  String msgId,  String text)?  messageReceived,TResult Function( String transferId,  BigInt received,  BigInt total)?  transferProgress,TResult Function( String transferId,  bool success)?  transferCompleted,required TResult orElse(),}) {final _that = this;
 switch (_that) {
 case CoreEvent_DiscoveryUpdated() when discoveryUpdated != null:
 return discoveryUpdated(_that.devices);case CoreEvent_Pinged() when pinged != null:
-return pinged(_that.deviceId,_that.name);case CoreEvent_MessageReceived() when messageReceived != null:
+return pinged(_that.deviceId,_that.name);case CoreEvent_PingFailed() when pingFailed != null:
+return pingFailed(_that.deviceId,_that.reason);case CoreEvent_MessageReceived() when messageReceived != null:
 return messageReceived(_that.threadId,_that.msgId,_that.text);case CoreEvent_TransferProgress() when transferProgress != null:
 return transferProgress(_that.transferId,_that.received,_that.total);case CoreEvent_TransferCompleted() when transferCompleted != null:
 return transferCompleted(_that.transferId,_that.success);case _:
@@ -153,11 +157,12 @@ return transferCompleted(_that.transferId,_that.success);case _:
 /// }
 /// ```
 
-@optionalTypeArgs TResult when<TResult extends Object?>({required TResult Function( List<NearbyDevice> devices)  discoveryUpdated,required TResult Function( String deviceId,  String name)  pinged,required TResult Function( PlatformInt64 threadId,  String msgId,  String text)  messageReceived,required TResult Function( String transferId,  BigInt received,  BigInt total)  transferProgress,required TResult Function( String transferId,  bool success)  transferCompleted,}) {final _that = this;
+@optionalTypeArgs TResult when<TResult extends Object?>({required TResult Function( List<NearbyDevice> devices)  discoveryUpdated,required TResult Function( String deviceId,  String name)  pinged,required TResult Function( String deviceId,  String reason)  pingFailed,required TResult Function( PlatformInt64 threadId,  String msgId,  String text)  messageReceived,required TResult Function( String transferId,  BigInt received,  BigInt total)  transferProgress,required TResult Function( String transferId,  bool success)  transferCompleted,}) {final _that = this;
 switch (_that) {
 case CoreEvent_DiscoveryUpdated():
 return discoveryUpdated(_that.devices);case CoreEvent_Pinged():
-return pinged(_that.deviceId,_that.name);case CoreEvent_MessageReceived():
+return pinged(_that.deviceId,_that.name);case CoreEvent_PingFailed():
+return pingFailed(_that.deviceId,_that.reason);case CoreEvent_MessageReceived():
 return messageReceived(_that.threadId,_that.msgId,_that.text);case CoreEvent_TransferProgress():
 return transferProgress(_that.transferId,_that.received,_that.total);case CoreEvent_TransferCompleted():
 return transferCompleted(_that.transferId,_that.success);}
@@ -174,11 +179,12 @@ return transferCompleted(_that.transferId,_that.success);}
 /// }
 /// ```
 
-@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>({TResult? Function( List<NearbyDevice> devices)?  discoveryUpdated,TResult? Function( String deviceId,  String name)?  pinged,TResult? Function( PlatformInt64 threadId,  String msgId,  String text)?  messageReceived,TResult? Function( String transferId,  BigInt received,  BigInt total)?  transferProgress,TResult? Function( String transferId,  bool success)?  transferCompleted,}) {final _that = this;
+@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>({TResult? Function( List<NearbyDevice> devices)?  discoveryUpdated,TResult? Function( String deviceId,  String name)?  pinged,TResult? Function( String deviceId,  String reason)?  pingFailed,TResult? Function( PlatformInt64 threadId,  String msgId,  String text)?  messageReceived,TResult? Function( String transferId,  BigInt received,  BigInt total)?  transferProgress,TResult? Function( String transferId,  bool success)?  transferCompleted,}) {final _that = this;
 switch (_that) {
 case CoreEvent_DiscoveryUpdated() when discoveryUpdated != null:
 return discoveryUpdated(_that.devices);case CoreEvent_Pinged() when pinged != null:
-return pinged(_that.deviceId,_that.name);case CoreEvent_MessageReceived() when messageReceived != null:
+return pinged(_that.deviceId,_that.name);case CoreEvent_PingFailed() when pingFailed != null:
+return pingFailed(_that.deviceId,_that.reason);case CoreEvent_MessageReceived() when messageReceived != null:
 return messageReceived(_that.threadId,_that.msgId,_that.text);case CoreEvent_TransferProgress() when transferProgress != null:
 return transferProgress(_that.transferId,_that.received,_that.total);case CoreEvent_TransferCompleted() when transferCompleted != null:
 return transferCompleted(_that.transferId,_that.success);case _:
@@ -322,6 +328,74 @@ class _$CoreEvent_PingedCopyWithImpl<$Res>
   return _then(CoreEvent_Pinged(
 deviceId: null == deviceId ? _self.deviceId : deviceId // ignore: cast_nullable_to_non_nullable
 as String,name: null == name ? _self.name : name // ignore: cast_nullable_to_non_nullable
+as String,
+  ));
+}
+
+
+}
+
+/// @nodoc
+
+
+class CoreEvent_PingFailed extends CoreEvent {
+  const CoreEvent_PingFailed({required this.deviceId, required this.reason}): super._();
+  
+
+ final  String deviceId;
+ final  String reason;
+
+/// Create a copy of CoreEvent
+/// with the given fields replaced by the non-null parameter values.
+@JsonKey(includeFromJson: false, includeToJson: false)
+@pragma('vm:prefer-inline')
+$CoreEvent_PingFailedCopyWith<CoreEvent_PingFailed> get copyWith => _$CoreEvent_PingFailedCopyWithImpl<CoreEvent_PingFailed>(this, _$identity);
+
+
+
+@override
+bool operator ==(Object other) {
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is CoreEvent_PingFailed&&(identical(other.deviceId, deviceId) || other.deviceId == deviceId)&&(identical(other.reason, reason) || other.reason == reason));
+}
+
+
+@override
+int get hashCode => Object.hash(runtimeType,deviceId,reason);
+
+@override
+String toString() {
+  return 'CoreEvent.pingFailed(deviceId: $deviceId, reason: $reason)';
+}
+
+
+}
+
+/// @nodoc
+abstract mixin class $CoreEvent_PingFailedCopyWith<$Res> implements $CoreEventCopyWith<$Res> {
+  factory $CoreEvent_PingFailedCopyWith(CoreEvent_PingFailed value, $Res Function(CoreEvent_PingFailed) _then) = _$CoreEvent_PingFailedCopyWithImpl;
+@useResult
+$Res call({
+ String deviceId, String reason
+});
+
+
+
+
+}
+/// @nodoc
+class _$CoreEvent_PingFailedCopyWithImpl<$Res>
+    implements $CoreEvent_PingFailedCopyWith<$Res> {
+  _$CoreEvent_PingFailedCopyWithImpl(this._self, this._then);
+
+  final CoreEvent_PingFailed _self;
+  final $Res Function(CoreEvent_PingFailed) _then;
+
+/// Create a copy of CoreEvent
+/// with the given fields replaced by the non-null parameter values.
+@pragma('vm:prefer-inline') $Res call({Object? deviceId = null,Object? reason = null,}) {
+  return _then(CoreEvent_PingFailed(
+deviceId: null == deviceId ? _self.deviceId : deviceId // ignore: cast_nullable_to_non_nullable
+as String,reason: null == reason ? _self.reason : reason // ignore: cast_nullable_to_non_nullable
 as String,
   ));
 }
