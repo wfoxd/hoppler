@@ -1181,11 +1181,23 @@ mod tests {
             socket.keepalive().unwrap_or(false),
             "an adopted pipe must have keepalive armed, or a vanished peer is never detected"
         );
-        assert!(
+        // Two separate claims, and asserting only one of them leaves a hole.
+        //
+        // That the configured value reaches the socket — the plumbing. Exact,
+        // because `TCP_KEEPIDLE` is whole seconds and round-trips unchanged.
+        assert_eq!(
             socket
                 .tcp_keepalive_time()
-                .expect("keepalive time readable")
-                <= Duration::from_secs(60),
+                .expect("keepalive time readable"),
+            KEEPALIVE_IDLE,
+            "the configured idle time must reach the fd, not just be written down"
+        );
+        // And that the configured value is short enough to be worth anything —
+        // the policy. Deliberately *not* expressed in terms of KEEPALIVE_IDLE:
+        // an assertion that reads the constant it is checking would pass however
+        // that constant changed, including back to the useless kernel default.
+        assert!(
+            KEEPALIVE_IDLE <= Duration::from_secs(60),
             "the kernel's default idle time is hours; a phone that leaves must surface in seconds"
         );
     }
