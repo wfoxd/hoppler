@@ -449,7 +449,12 @@ impl BleIngress {
                 }
             }
             PlatformEvent::Availability { available, reason } => {
-                inner.available.store(available, Ordering::SeqCst);
+                let was = inner.available.swap(available, Ordering::SeqCst);
+                // A radio that has come back has come back empty, and only this
+                // rung knows what it was doing before. See `rearm`.
+                if available && !was {
+                    rearm(&inner);
+                }
                 inner.emit(TransportEvent::Availability { available, reason });
             }
         }
@@ -482,6 +487,77 @@ impl BleIngress {
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                     Some(n.saturating_sub(bytes))
                 });
+        }
+    }
+}
+
+/// Put the radio back the way this rung already believes it is.
+///
+/// A radio that becomes available again comes back **blank**. An advertising
+/// set and a scan callback are registrations in the Bluetooth stack, and
+/// toggling Bluetooth destroys both; so does starting up without the permission
+/// to create them and being granted it later. Nothing downstream notices,
+/// because every piece of state here still says we are advertising and
+/// scanning — `start_scanning` is a no-op while `scanning` is already true.
+///
+/// Without this, Bluetooth off-and-on is permanent: the rung reports itself
+/// available, advertises nothing, hears nothing, and only a restart fixes it.
+/// That is acceptance checks 5 and 7 both failing, silently.
+///
+/// It re-applies remembered state rather than inventing any, which is why it
+/// cannot resurrect something the core meant to stop: Discovery off clears
+/// `advertising` and `scanning` first, so a radio coming back under it stays
+/// dark (R0-F2).
+///
+/// Failures are logged, not propagated. There is no caller to return them to,
+/// and the radio has just said it is available — a refusal means it changed its
+/// mind, and another `Availability` is already on its way.
+///
+/// # Why `dead` is re-checked here
+///
+/// `on_platform_event` already refuses everything once the rung is dead, but
+/// that check is not enough for this one, because this is the first thing in
+/// that function whose side effect reaches the *platform* rather than the sink.
+/// `emit` re-checks `dead` itself and `revoke` is ordered against a delivery in
+/// flight; a platform call has neither.
+///
+/// The losing interleaving is short and entirely plausible: this passes the
+/// outer check, `shutdown` sets `dead` and tells the platform to shut down,
+/// then this takes the advertising lock, still sees `Some(payload)`, and starts
+/// advertising — after which `shutdown` blocks on that same lock and clears it.
+/// The rung is gone, the radio is transmitting, and nothing left will ever stop
+/// it. Rule 6 and R0-F2 in one.
+///
+/// Checking under each lock closes it, because `shutdown` sets `dead` *before*
+/// it reaches for either one.
+fn rearm(inner: &Inner) {
+    // Lock order: local_id before advertising, as everywhere else in this file.
+    // Both held across the re-advertise so a rotation racing this cannot
+    // publish the old name.
+    let local = inner.local_id.lock().unwrap_or_else(|e| e.into_inner());
+    let advertising = inner.advertising.lock().unwrap_or_else(|e| e.into_inner());
+    if inner.dead.load(Ordering::SeqCst) {
+        return;
+    }
+    // The adapter keeps the local id in a plain field, so it survives the radio
+    // — but a host that restarted, or one that rejected the id while
+    // unpermitted, has not got it. Re-sending is idempotent and cheap; guessing
+    // which host we have is neither.
+    if let Err(why) = inner.platform.set_local_id(&local) {
+        log::warn!("could not re-name the radio after it came back: {why}");
+    }
+    if let Some(payload) = advertising.as_ref() {
+        if let Err(why) = inner.platform.start_advertising(payload) {
+            log::warn!("could not re-advertise after the radio came back: {why}");
+        }
+    }
+    drop(advertising);
+    drop(local);
+
+    let scanning = inner.scanning.lock().unwrap_or_else(|e| e.into_inner());
+    if *scanning && !inner.dead.load(Ordering::SeqCst) {
+        if let Err(why) = inner.platform.start_scanning() {
+            log::warn!("could not resume scanning after the radio came back: {why}");
         }
     }
 }
@@ -776,40 +852,83 @@ impl Drop for BleTransport {
 mod tests {
     use super::*;
 
+    /// A radio that records what it was asked to do.
+    #[derive(Default)]
+    struct Recorder {
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl Recorder {
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+        fn clear(&self) {
+            self.calls.lock().unwrap().clear();
+        }
+        fn note(&self, call: impl Into<String>) {
+            self.calls.lock().unwrap().push(call.into());
+        }
+    }
+
+    impl BlePlatform for Recorder {
+        fn set_local_id(&self, id: &str) -> Result<(), TransportError> {
+            self.note(format!("set_local_id({id})"));
+            Ok(())
+        }
+        fn start_advertising(&self, payload: &[u8]) -> Result<(), TransportError> {
+            self.note(format!("start_advertising({payload:?})"));
+            Ok(())
+        }
+        fn stop_advertising(&self) -> Result<(), TransportError> {
+            self.note("stop_advertising");
+            Ok(())
+        }
+        fn start_scanning(&self) -> Result<(), TransportError> {
+            self.note("start_scanning");
+            Ok(())
+        }
+        fn stop_scanning(&self) -> Result<(), TransportError> {
+            self.note("stop_scanning");
+            Ok(())
+        }
+        fn connect(&self, _: &str) -> Result<(), TransportError> {
+            Ok(())
+        }
+        fn send(&self, _: &str, _: &[u8]) -> Result<(), TransportError> {
+            Ok(())
+        }
+        fn disconnect(&self, _: &str) -> Result<(), TransportError> {
+            Ok(())
+        }
+        fn shutdown(&self) {}
+    }
+
+    /// A transport over a recording radio, with construction's own calls
+    /// cleared — every test here is about what happens afterwards.
+    fn transport() -> (BleTransport, Arc<Recorder>) {
+        let radio = Arc::new(Recorder::default());
+        let t = BleTransport::new("a", radio.clone(), Box::new(|_| {})).unwrap();
+        radio.clear();
+        (t, radio)
+    }
+
+    fn radio_is(available: bool) -> PlatformEvent {
+        PlatformEvent::Availability {
+            available,
+            reason: if available {
+                None
+            } else {
+                Some("Bluetooth is off".into())
+            },
+        }
+    }
+
     /// `is_available` is what the UI uses to say "Bluetooth is off" rather than
     /// showing an empty list that reads as "nobody is nearby" (F2), so it must
     /// track the radio and not merely the shutdown flag.
     #[test]
     fn availability_tracks_the_radio() {
-        struct Nop;
-        impl BlePlatform for Nop {
-            fn set_local_id(&self, _: &str) -> Result<(), TransportError> {
-                Ok(())
-            }
-            fn start_advertising(&self, _: &[u8]) -> Result<(), TransportError> {
-                Ok(())
-            }
-            fn stop_advertising(&self) -> Result<(), TransportError> {
-                Ok(())
-            }
-            fn start_scanning(&self) -> Result<(), TransportError> {
-                Ok(())
-            }
-            fn stop_scanning(&self) -> Result<(), TransportError> {
-                Ok(())
-            }
-            fn connect(&self, _: &str) -> Result<(), TransportError> {
-                Ok(())
-            }
-            fn send(&self, _: &str, _: &[u8]) -> Result<(), TransportError> {
-                Ok(())
-            }
-            fn disconnect(&self, _: &str) -> Result<(), TransportError> {
-                Ok(())
-            }
-            fn shutdown(&self) {}
-        }
-        let t = BleTransport::new("a", Arc::new(Nop), Box::new(|_| {})).unwrap();
+        let (t, _) = transport();
         let radio = t.ingress();
         assert!(t.is_available());
         radio.on_platform_event(PlatformEvent::Availability {
@@ -825,5 +944,122 @@ mod tests {
         t.shutdown();
         // A shut-down rung is not available whatever the radio last said.
         assert!(!t.is_available());
+    }
+
+    /// A radio that comes back comes back **blank**: the advertising set and
+    /// the scan callback are registrations in the Bluetooth stack, and toggling
+    /// Bluetooth destroys both. Nothing downstream notices, because every flag
+    /// here still says we are advertising and scanning — which makes an
+    /// off-and-on toggle permanent until the app is restarted, and acceptance
+    /// checks 5 and 7 unpassable.
+    #[test]
+    fn a_radio_that_comes_back_is_put_back_to_work() {
+        let (t, radio) = transport();
+        t.start_advertising(vec![7, 7]).unwrap();
+        t.start_scanning().unwrap();
+        let ingress = t.ingress();
+
+        ingress.on_platform_event(radio_is(false));
+        radio.clear();
+        ingress.on_platform_event(radio_is(true));
+
+        let calls = radio.calls();
+        assert!(
+            calls.contains(&"start_advertising([7, 7])".to_string()),
+            "the same advertisement must go back up, got {calls:?}"
+        );
+        assert!(
+            calls.contains(&"start_scanning".to_string()),
+            "scanning must resume, got {calls:?}"
+        );
+    }
+
+    /// The re-arm re-applies what the rung *remembers*, never what it once did.
+    /// Discovery off clears both flags first, so a radio returning while hidden
+    /// must stay dark — a re-arm that resurrected the last advertisement would
+    /// put a hidden node back on the air, which is precisely the R0-F2 failure
+    /// the Discovery switch exists to prevent.
+    #[test]
+    fn a_radio_that_comes_back_under_discovery_off_stays_dark() {
+        let (t, radio) = transport();
+        t.start_advertising(vec![7, 7]).unwrap();
+        t.start_scanning().unwrap();
+        t.stop_advertising().unwrap();
+        t.stop_scanning().unwrap();
+        let ingress = t.ingress();
+
+        ingress.on_platform_event(radio_is(false));
+        radio.clear();
+        ingress.on_platform_event(radio_is(true));
+
+        let calls = radio.calls();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("start_advertising")),
+            "a hidden node must not come back on the air, got {calls:?}"
+        );
+        assert!(
+            !calls.contains(&"start_scanning".to_string()),
+            "scanning was stopped and must stay stopped, got {calls:?}"
+        );
+    }
+
+    /// A re-arm that loses the race to `shutdown` must still do nothing.
+    ///
+    /// `rearm` is called directly here, which is the point: going through
+    /// `on_platform_event` would be turned away by *its* `dead` check and the
+    /// test would pass with the guard removed. The interleaving being modelled
+    /// gets past that check and is then overtaken — this rung passes it, sets
+    /// `dead`, shuts the platform down, and only then reaches for the
+    /// advertising lock to clear it.
+    ///
+    /// Without the guard the radio is left transmitting with nothing alive to
+    /// stop it, which is rule 6 and R0-F2 at once.
+    #[test]
+    fn a_re_arm_overtaken_by_shutdown_touches_nothing() {
+        let (t, radio) = transport();
+        t.start_advertising(vec![9]).unwrap();
+        t.start_scanning().unwrap();
+
+        // Exactly what `shutdown` does first, and all it has done at the moment
+        // the losing interleaving reaches `rearm`: the flags this re-applies
+        // are still set, because shutdown has not got to them yet.
+        t.inner.dead.store(true, Ordering::SeqCst);
+        assert!(
+            t.inner.advertising.lock().unwrap().is_some(),
+            "the interleaving under test needs state left to re-apply"
+        );
+        radio.clear();
+
+        rearm(&t.inner);
+
+        assert!(
+            radio.calls().is_empty(),
+            "a dead rung must not reach the radio, got {:?}",
+            radio.calls()
+        );
+    }
+
+    /// Only a *change* re-arms.
+    ///
+    /// The adapter reports availability whenever the UI subscribes, and again
+    /// after a failed scan. Re-arming on each one would matter: our own
+    /// `start_advertising` stops the current set before starting the next, so
+    /// every redundant report would blink the advertisement off and on — which
+    /// a sniffer sees and a peer mid-dial may not survive.
+    #[test]
+    fn an_availability_report_that_changes_nothing_does_not_re_arm() {
+        let (t, radio) = transport();
+        t.start_advertising(vec![1]).unwrap();
+        t.start_scanning().unwrap();
+        let ingress = t.ingress();
+        radio.clear();
+
+        ingress.on_platform_event(radio_is(true));
+
+        assert!(
+            radio.calls().is_empty(),
+            "nothing changed, so nothing should have been re-issued, got {:?}",
+            radio.calls()
+        );
     }
 }
