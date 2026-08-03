@@ -36,7 +36,7 @@
 pub mod ble;
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::transport::ble::{BleIngress, PlatformEvent};
 use crate::transport::PeerId;
@@ -106,6 +106,16 @@ struct Bridge {
     /// the first thing the radio hears is still `BleSetLocalId` rather than
     /// whatever happened to be sent after Dart woke up.
     queued: VecDeque<PlatformCommand>,
+}
+
+/// The process-wide bridge.
+///
+/// A singleton because the host is: there is one Dart isolate, one radio, one
+/// set of permissions. `PlatformBridge` itself is not a singleton so that tests
+/// can hold as many as they like.
+pub fn bridge() -> &'static Arc<PlatformBridge> {
+    static BRIDGE: OnceLock<Arc<PlatformBridge>> = OnceLock::new();
+    BRIDGE.get_or_init(|| Arc::new(PlatformBridge::new()))
 }
 
 impl PlatformBridge {
