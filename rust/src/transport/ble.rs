@@ -512,12 +512,33 @@ impl BleIngress {
 /// Failures are logged, not propagated. There is no caller to return them to,
 /// and the radio has just said it is available — a refusal means it changed its
 /// mind, and another `Availability` is already on its way.
+///
+/// # Why `dead` is re-checked here
+///
+/// `on_platform_event` already refuses everything once the rung is dead, but
+/// that check is not enough for this one, because this is the first thing in
+/// that function whose side effect reaches the *platform* rather than the sink.
+/// `emit` re-checks `dead` itself and `revoke` is ordered against a delivery in
+/// flight; a platform call has neither.
+///
+/// The losing interleaving is short and entirely plausible: this passes the
+/// outer check, `shutdown` sets `dead` and tells the platform to shut down,
+/// then this takes the advertising lock, still sees `Some(payload)`, and starts
+/// advertising — after which `shutdown` blocks on that same lock and clears it.
+/// The rung is gone, the radio is transmitting, and nothing left will ever stop
+/// it. Rule 6 and R0-F2 in one.
+///
+/// Checking under each lock closes it, because `shutdown` sets `dead` *before*
+/// it reaches for either one.
 fn rearm(inner: &Inner) {
     // Lock order: local_id before advertising, as everywhere else in this file.
     // Both held across the re-advertise so a rotation racing this cannot
     // publish the old name.
     let local = inner.local_id.lock().unwrap_or_else(|e| e.into_inner());
     let advertising = inner.advertising.lock().unwrap_or_else(|e| e.into_inner());
+    if inner.dead.load(Ordering::SeqCst) {
+        return;
+    }
     // The adapter keeps the local id in a plain field, so it survives the radio
     // — but a host that restarted, or one that rejected the id while
     // unpermitted, has not got it. Re-sending is idempotent and cheap; guessing
@@ -533,7 +554,8 @@ fn rearm(inner: &Inner) {
     drop(advertising);
     drop(local);
 
-    if *inner.scanning.lock().unwrap_or_else(|e| e.into_inner()) {
+    let scanning = inner.scanning.lock().unwrap_or_else(|e| e.into_inner());
+    if *scanning && !inner.dead.load(Ordering::SeqCst) {
         if let Err(why) = inner.platform.start_scanning() {
             log::warn!("could not resume scanning after the radio came back: {why}");
         }
@@ -978,6 +1000,42 @@ mod tests {
         assert!(
             !calls.contains(&"start_scanning".to_string()),
             "scanning was stopped and must stay stopped, got {calls:?}"
+        );
+    }
+
+    /// A re-arm that loses the race to `shutdown` must still do nothing.
+    ///
+    /// `rearm` is called directly here, which is the point: going through
+    /// `on_platform_event` would be turned away by *its* `dead` check and the
+    /// test would pass with the guard removed. The interleaving being modelled
+    /// gets past that check and is then overtaken — this rung passes it, sets
+    /// `dead`, shuts the platform down, and only then reaches for the
+    /// advertising lock to clear it.
+    ///
+    /// Without the guard the radio is left transmitting with nothing alive to
+    /// stop it, which is rule 6 and R0-F2 at once.
+    #[test]
+    fn a_re_arm_overtaken_by_shutdown_touches_nothing() {
+        let (t, radio) = transport();
+        t.start_advertising(vec![9]).unwrap();
+        t.start_scanning().unwrap();
+
+        // Exactly what `shutdown` does first, and all it has done at the moment
+        // the losing interleaving reaches `rearm`: the flags this re-applies
+        // are still set, because shutdown has not got to them yet.
+        t.inner.dead.store(true, Ordering::SeqCst);
+        assert!(
+            t.inner.advertising.lock().unwrap().is_some(),
+            "the interleaving under test needs state left to re-apply"
+        );
+        radio.clear();
+
+        rearm(&t.inner);
+
+        assert!(
+            radio.calls().is_empty(),
+            "a dead rung must not reach the radio, got {:?}",
+            radio.calls()
         );
     }
 
