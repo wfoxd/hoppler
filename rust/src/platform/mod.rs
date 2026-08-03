@@ -188,7 +188,18 @@ impl PlatformBridge {
         match fact {
             PlatformFact::Ble(event) => ingress.on_platform_event(event),
             PlatformFact::BleWriteComplete { peer, bytes } => {
-                ingress.on_write_complete(&peer, bytes as usize)
+                // Saturating, not `as`. We ship a 32-bit target
+                // (armv7-linux-androideabi), so a `u64` past `u32::MAX`
+                // truncates — and a value that truncates to *zero* releases no
+                // send-window credit at all, wedging the pipe on `WouldBlock`
+                // for the life of the process.
+                //
+                // Saturating the other way is safe: `on_write_complete` already
+                // saturates at zero, so over-releasing costs a window that
+                // refills, where under-releasing costs the pipe. This rung has
+                // already been wedged once by an arithmetic edge exactly like
+                // it — see `refund` on why that one saturates too.
+                ingress.on_write_complete(&peer, usize::try_from(bytes).unwrap_or(usize::MAX))
             }
         }
     }
@@ -275,6 +286,24 @@ mod tests {
         let (sink2, seen2) = recorder();
         bridge.attach(sink2);
         assert_eq!(*seen2.lock().unwrap(), vec![id("while-away")]);
+    }
+
+    /// A byte count too large for the target's `usize` must saturate, never
+    /// wrap.
+    ///
+    /// We ship a 32-bit target, so `as usize` on a `u64` past `u32::MAX`
+    /// truncates — and a value truncating to zero releases no send-window
+    /// credit, wedging the pipe on `WouldBlock` permanently. The count comes
+    /// from the host, so it is not ours to trust.
+    #[test]
+    fn an_absurd_write_count_saturates_rather_than_truncating() {
+        assert_eq!(usize::try_from(u64::MAX).unwrap_or(usize::MAX), usize::MAX);
+        // The value that makes `as` dangerous: 2^32 truncates to 0 on 32-bit.
+        let wrapping = 1u64 << 32;
+        assert!(
+            usize::try_from(wrapping).unwrap_or(usize::MAX) > 0,
+            "a count that truncates to zero would release no credit at all"
+        );
     }
 
     /// The radio is asynchronous and reports on work issued before a shutdown,
