@@ -218,11 +218,19 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
      * §6 rule 6 says a shut-down adapter is inert, and an outcome event after
      * shutdown would be neither silent nor inert.
      */
-    private fun submit(work: () -> Unit): Boolean = try {
-        io.execute(work)
-        true
-    } catch (e: RejectedExecutionException) {
-        false
+    private fun submit(work: () -> Unit): Boolean {
+        // Checked before the queue, not just caught after it. `shutdown` sets
+        // this flag and only reaches `io.shutdownNow()` several statements
+        // later, so between the two the pool still accepts — and work queued in
+        // that window runs against half-torn-down state. Rejection alone would
+        // never report it.
+        if (shuttingDown.get()) return false
+        return try {
+            io.execute(work)
+            true
+        } catch (e: RejectedExecutionException) {
+            false
+        }
     }
 
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
@@ -596,8 +604,20 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
             val socket = adapter.listenUsingInsecureL2capChannel()
             serverSocket = socket
             localPsm = socket.psm
+            // Rolled back rather than left half-open. `startAdvertising` skips
+            // opening a listener whenever `serverSocket` is non-null, so a
+            // socket kept without an accept loop would go on to publish a psm
+            // that answers nothing — a dial that fails every time from the far
+            // side, with nothing here to say why. That is the failure the loop
+            // below warns about, reached from the other direction.
+            if (!submit { acceptLoop(socket) }) {
+                serverSocket = null
+                localPsm = 0
+                runCatching { socket.close() }
+                Log.w(TAG, "could not open an L2CAP listener: the radio is shutting down")
+                return false
+            }
             Log.i(TAG, "listening on psm $localPsm")
-            io.execute { acceptLoop(socket) }
             true
         } catch (e: IOException) {
             Log.w(TAG, "could not open an L2CAP listener: ${e.message}")
@@ -786,7 +806,8 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
     private var localId: String? = null
 
     private fun openPipe(peer: String, socket: BluetoothSocket, link: BluetoothGatt? = null) {
-        val existing = pipes.put(peer, Pipe(socket, link))
+        val pipe = Pipe(socket, link)
+        val existing = pipes.put(peer, pipe)
         if (existing != null) {
             // Simultaneous dial. Report the open regardless — the core opens
             // one pipe (§6) — but do not leak the socket we displaced.
@@ -798,8 +819,24 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
             Log.i(TAG, "simultaneous dial with $peer: keeping the newer pipe")
             existing.release()
         }
+        // `shutdown` closes one snapshot of `pipes`. A pipe landing after that
+        // snapshot is past everything that would ever close it, and it now owns
+        // an LE link as well as a socket — so it is checked here rather than
+        // left to the teardown that has already been and gone.
+        if (shuttingDown.get()) {
+            if (pipes.remove(peer, pipe)) pipe.release()
+            return
+        }
         emit(mapOf("type" to "pipeOpened", "peer" to peer))
-        submit { readLoop(peer, socket) }
+        // Emitted before the reader is queued, so `received` can never reach
+        // the core ahead of the `pipeOpened` it belongs to. If the reader then
+        // cannot start, the pipe is withdrawn and the open is closed off rather
+        // than left dangling: a pipe in the map with nobody reading it is a
+        // peer we believe we can hear and cannot.
+        if (!submit { readLoop(peer, socket) }) {
+            if (pipes.remove(peer, pipe)) pipe.release()
+            emit(mapOf("type" to "pipeClosed", "peer" to peer))
+        }
     }
 
     private fun readLoop(peer: String, socket: BluetoothSocket) {
