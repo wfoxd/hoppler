@@ -538,9 +538,22 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
             return@synchronized
         }
         Log.i(TAG, "resuming the scan")
-        scanRunning = runCatching {
+        val refused = runCatching {
             scanner.startScan(scanFilters, scanSettings, callback)
-        }.isSuccess
+        }.exceptionOrNull()
+        scanRunning = refused == null
+        if (refused != null) {
+            // The state stays honest either way, but silence here would leave
+            // discovery dead with the core still believing it is on — and the
+            // whole point of this file's logging is that a radio failure should
+            // never be something you can only infer. A SecurityException is the
+            // likely one: `onMethodCall` catches those and reports them, and
+            // nothing catches them out here on a dial thread.
+            Log.w(
+                TAG,
+                "could not resume the scan: ${refused.javaClass.simpleName}: ${refused.message}"
+            )
+        }
     }
 
     /**
