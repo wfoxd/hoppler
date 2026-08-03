@@ -28,9 +28,14 @@
 //!   `PipeFailed`, because that is what the core acts on. We deliberately do
 //!   *not* track which peers we dialled in order to tell a failed dial from an
 //!   unsolicited close: that is state the adapter's own reconnection would keep
-//!   invalidating, and an unsolicited `PipeFailed` costs the core nothing —
-//!   whereas a `PipeClosed` for a pipe it never opened would have it tearing
-//!   down state it never built.
+//!   invalidating, and a `PipeFailed` for a peer we hold no pipe to costs the
+//!   core nothing — whereas a `PipeClosed` for a pipe it never opened would
+//!   have it tearing down state it never built.
+//!
+//!   One qualifier, learned the hard way: a `PipeFailed` while a pipe *is*
+//!   live is no longer free. The engine queues a Ping until a session exists,
+//!   so a spurious failure cancels it and reports it undeliverable moments
+//!   before it would have been delivered. Suppressed below.
 //!
 //! An adapter that gets any of these wrong is still correct from the core's
 //! side, which is what makes per-OEM BLE quirks survivable.
@@ -387,7 +392,29 @@ impl BleIngress {
                 }
             }
             PlatformEvent::PipeFailed { peer, why } => {
-                inner.emit(TransportEvent::PipeFailed { peer, why });
+                // Not while a pipe to them is live. Both ends dial at once
+                // often enough that one connection losing the race is normal,
+                // and the adapter reports that loser's closure as a failure of
+                // the *peer* — which it is not, because the survivor is
+                // carrying traffic.
+                //
+                // `PipeOpened` above already dedupes for exactly this reason.
+                // This did not, on the stated grounds that "an unsolicited
+                // PipeFailed costs the core nothing" — true when written, and
+                // false since the engine began queueing a Ping until a session
+                // exists: a spurious failure now cancels that Ping and tells
+                // the person it could not be delivered, moments before it is.
+                // Observed on two phones, first Ping every time.
+                let live = inner
+                    .pipes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains_key(&peer);
+                if live {
+                    log::info!("ignoring a pipe failure for {peer}: a pipe is live ({why})");
+                } else {
+                    inner.emit(TransportEvent::PipeFailed { peer, why });
+                }
             }
             PlatformEvent::PipeClosed { peer } => {
                 let existed = inner
