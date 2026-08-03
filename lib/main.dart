@@ -1,7 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
-import 'package:hoppler/features/ping/ping_button.dart';
+import 'package:hoppler/features/nearby/nearby_tile.dart';
 import 'package:hoppler/features/ping/ping_service.dart';
 import 'package:hoppler/src/rust/api/core.dart';
 import 'package:hoppler/src/rust/api/discovery.dart';
@@ -133,31 +133,12 @@ class _HomePageState extends State<HomePage> {
   }
 
   Widget _deviceTile(NearbyDevice d) {
-    return ListTile(
-      leading: CircleAvatar(backgroundColor: Color(0xFF000000 | d.colour)),
-      title: Text(d.name),
-      subtitle: Text(d.paired ? 'paired' : 'nearby'),
-      trailing: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          PingButton(
-            key: ValueKey(d.deviceId),
-            service: _pingService,
-            deviceId: d.deviceId,
-          ),
-          IconButton(
-            icon: const Icon(Icons.chat_bubble_outline),
-            tooltip: 'Chat',
-            onPressed: () => _run(() => sendChat(deviceId: d.deviceId, text: 'Hey ${d.name}!')),
-          ),
-          IconButton(
-            icon: const Icon(Icons.upload_file_outlined),
-            tooltip: 'Drop',
-            onPressed: () => _run(
-              () => offerDrop(deviceId: d.deviceId, name: 'photo.jpg', size: BigInt.from(5000000)),
-            ),
-          ),
-        ],
+    return NearbyTile(
+      device: d,
+      pingService: _pingService,
+      onChat: (text) => _run(() => sendChat(deviceId: d.deviceId, text: text)),
+      onDrop: () => _run(
+        () => offerDrop(deviceId: d.deviceId, name: 'photo.jpg', size: BigInt.from(5000000)),
       ),
     );
   }
