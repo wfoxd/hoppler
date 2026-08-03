@@ -8,5 +8,6 @@ pub mod discovery;
 pub mod events;
 pub mod identity;
 pub mod messaging;
+pub mod platform;
 pub mod transfers;
 pub mod types;

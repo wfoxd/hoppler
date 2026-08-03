@@ -4,6 +4,7 @@ pub mod discovery;
 pub mod engine;
 mod frb_generated;
 pub mod identity;
+pub mod platform;
 pub mod proto;
 pub mod session;
 pub mod store;

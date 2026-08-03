@@ -11,6 +11,7 @@ import 'api/discovery.dart';
 import 'api/events.dart';
 import 'api/identity.dart';
 import 'api/messaging.dart';
+import 'api/platform.dart';
 import 'api/transfers.dart';
 import 'api/types.dart';
 import 'dart:async';
@@ -33,10 +34,18 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   RustStreamSink<CoreEvent> dco_decode_StreamSink_core_event_Sse(dynamic raw);
 
   @protected
+  RustStreamSink<HostCommand> dco_decode_StreamSink_host_command_Sse(
+    dynamic raw,
+  );
+
+  @protected
   String dco_decode_String(dynamic raw);
 
   @protected
   bool dco_decode_bool(dynamic raw);
+
+  @protected
+  HostFact dco_decode_box_autoadd_host_fact(dynamic raw);
 
   @protected
   PlatformInt64 dco_decode_box_autoadd_i_64(dynamic raw);
@@ -46,6 +55,15 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   CoreEvent dco_decode_core_event(dynamic raw);
+
+  @protected
+  HostCommand dco_decode_host_command(dynamic raw);
+
+  @protected
+  HostFact dco_decode_host_fact(dynamic raw);
+
+  @protected
+  int dco_decode_i_32(dynamic raw);
 
   @protected
   PlatformInt64 dco_decode_i_64(dynamic raw);
@@ -66,10 +84,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   NearbyDevice dco_decode_nearby_device(dynamic raw);
 
   @protected
+  String? dco_decode_opt_String(dynamic raw);
+
+  @protected
   PlatformInt64? dco_decode_opt_box_autoadd_i_64(dynamic raw);
 
   @protected
   PersonaDto dco_decode_persona_dto(dynamic raw);
+
+  @protected
+  RadioChoice dco_decode_radio_choice(dynamic raw);
 
   @protected
   ThreadSummary dco_decode_thread_summary(dynamic raw);
@@ -95,10 +119,18 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  RustStreamSink<HostCommand> sse_decode_StreamSink_host_command_Sse(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   String sse_decode_String(SseDeserializer deserializer);
 
   @protected
   bool sse_decode_bool(SseDeserializer deserializer);
+
+  @protected
+  HostFact sse_decode_box_autoadd_host_fact(SseDeserializer deserializer);
 
   @protected
   PlatformInt64 sse_decode_box_autoadd_i_64(SseDeserializer deserializer);
@@ -108,6 +140,15 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   CoreEvent sse_decode_core_event(SseDeserializer deserializer);
+
+  @protected
+  HostCommand sse_decode_host_command(SseDeserializer deserializer);
+
+  @protected
+  HostFact sse_decode_host_fact(SseDeserializer deserializer);
+
+  @protected
+  int sse_decode_i_32(SseDeserializer deserializer);
 
   @protected
   PlatformInt64 sse_decode_i_64(SseDeserializer deserializer);
@@ -134,10 +175,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   NearbyDevice sse_decode_nearby_device(SseDeserializer deserializer);
 
   @protected
+  String? sse_decode_opt_String(SseDeserializer deserializer);
+
+  @protected
   PlatformInt64? sse_decode_opt_box_autoadd_i_64(SseDeserializer deserializer);
 
   @protected
   PersonaDto sse_decode_persona_dto(SseDeserializer deserializer);
+
+  @protected
+  RadioChoice sse_decode_radio_choice(SseDeserializer deserializer);
 
   @protected
   ThreadSummary sse_decode_thread_summary(SseDeserializer deserializer);
@@ -155,9 +202,6 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_decode_unit(SseDeserializer deserializer);
 
   @protected
-  int sse_decode_i_32(SseDeserializer deserializer);
-
-  @protected
   void sse_encode_AnyhowException(
     AnyhowException self,
     SseSerializer serializer,
@@ -170,10 +214,22 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_StreamSink_host_command_Sse(
+    RustStreamSink<HostCommand> self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_String(String self, SseSerializer serializer);
 
   @protected
   void sse_encode_bool(bool self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_box_autoadd_host_fact(
+    HostFact self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_box_autoadd_i_64(
@@ -189,6 +245,15 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_core_event(CoreEvent self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_host_command(HostCommand self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_host_fact(HostFact self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_i_32(int self, SseSerializer serializer);
 
   @protected
   void sse_encode_i_64(PlatformInt64 self, SseSerializer serializer);
@@ -221,6 +286,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_nearby_device(NearbyDevice self, SseSerializer serializer);
 
   @protected
+  void sse_encode_opt_String(String? self, SseSerializer serializer);
+
+  @protected
   void sse_encode_opt_box_autoadd_i_64(
     PlatformInt64? self,
     SseSerializer serializer,
@@ -228,6 +296,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_persona_dto(PersonaDto self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_radio_choice(RadioChoice self, SseSerializer serializer);
 
   @protected
   void sse_encode_thread_summary(ThreadSummary self, SseSerializer serializer);
@@ -243,9 +314,6 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_unit(void self, SseSerializer serializer);
-
-  @protected
-  void sse_encode_i_32(int self, SseSerializer serializer);
 }
 
 // Section: wire_class

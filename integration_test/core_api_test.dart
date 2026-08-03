@@ -22,7 +22,7 @@ void main() {
   setUpAll(() async {
     await RustLib.init();
     final dir = Directory.systemTemp.createTempSync('hoppler-it');
-    await coreInit(supportDir: dir.path);
+    await coreInit(supportDir: dir.path, radio: RadioChoice.lan);
     events = coreEventStream().asBroadcastStream();
   });
 

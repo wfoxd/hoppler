@@ -8,6 +8,7 @@ import 'api/discovery.dart';
 import 'api/events.dart';
 import 'api/identity.dart';
 import 'api/messaging.dart';
+import 'api/platform.dart';
 import 'api/transfers.dart';
 import 'api/types.dart';
 import 'dart:async';
@@ -72,7 +73,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.12.0';
 
   @override
-  int get rustContentHash => -168770705;
+  int get rustContentHash => -606368833;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -88,7 +89,10 @@ abstract class RustLibApi extends BaseApi {
 
   Stream<CoreEvent> crateApiEventsCoreEventStream();
 
-  Future<PersonaDto> crateApiCoreCoreInit({required String supportDir});
+  Future<PersonaDto> crateApiCoreCoreInit({
+    required String supportDir,
+    required RadioChoice radio,
+  });
 
   String crateApiCoreCoreVersion();
 
@@ -107,6 +111,10 @@ abstract class RustLibApi extends BaseApi {
   });
 
   Future<void> crateApiMessagingPing({required String deviceId});
+
+  Stream<HostCommand> crateApiPlatformPlatformCommandStream();
+
+  Future<void> crateApiPlatformPlatformFact({required HostFact fact});
 
   Future<ChatMessageDto> crateApiMessagingSendChat({
     required String deviceId,
@@ -192,12 +200,16 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       const TaskConstMeta(debugName: "core_event_stream", argNames: ["sink"]);
 
   @override
-  Future<PersonaDto> crateApiCoreCoreInit({required String supportDir}) {
+  Future<PersonaDto> crateApiCoreCoreInit({
+    required String supportDir,
+    required RadioChoice radio,
+  }) {
     return handler.executeNormal(
       NormalTask(
         callFfi: (port_) {
           final serializer = SseSerializer(generalizedFrbRustBinding);
           sse_encode_String(supportDir, serializer);
+          sse_encode_radio_choice(radio, serializer);
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
@@ -210,14 +222,16 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           decodeErrorData: sse_decode_String,
         ),
         constMeta: kCrateApiCoreCoreInitConstMeta,
-        argValues: [supportDir],
+        argValues: [supportDir, radio],
         apiImpl: this,
       ),
     );
   }
 
-  TaskConstMeta get kCrateApiCoreCoreInitConstMeta =>
-      const TaskConstMeta(debugName: "core_init", argNames: ["supportDir"]);
+  TaskConstMeta get kCrateApiCoreCoreInitConstMeta => const TaskConstMeta(
+    debugName: "core_init",
+    argNames: ["supportDir", "radio"],
+  );
 
   @override
   String crateApiCoreCoreVersion() {
@@ -414,6 +428,69 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       const TaskConstMeta(debugName: "ping", argNames: ["deviceId"]);
 
   @override
+  Stream<HostCommand> crateApiPlatformPlatformCommandStream() {
+    final sink = RustStreamSink<HostCommand>();
+    unawaited(
+      handler.executeNormal(
+        NormalTask(
+          callFfi: (port_) {
+            final serializer = SseSerializer(generalizedFrbRustBinding);
+            sse_encode_StreamSink_host_command_Sse(sink, serializer);
+            pdeCallFfi(
+              generalizedFrbRustBinding,
+              serializer,
+              funcId: 11,
+              port: port_,
+            );
+          },
+          codec: SseCodec(
+            decodeSuccessData: sse_decode_unit,
+            decodeErrorData: null,
+          ),
+          constMeta: kCrateApiPlatformPlatformCommandStreamConstMeta,
+          argValues: [sink],
+          apiImpl: this,
+        ),
+      ),
+    );
+    return sink.stream;
+  }
+
+  TaskConstMeta get kCrateApiPlatformPlatformCommandStreamConstMeta =>
+      const TaskConstMeta(
+        debugName: "platform_command_stream",
+        argNames: ["sink"],
+      );
+
+  @override
+  Future<void> crateApiPlatformPlatformFact({required HostFact fact}) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_box_autoadd_host_fact(fact, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 12,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiPlatformPlatformFactConstMeta,
+        argValues: [fact],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiPlatformPlatformFactConstMeta =>
+      const TaskConstMeta(debugName: "platform_fact", argNames: ["fact"]);
+
+  @override
   Future<ChatMessageDto> crateApiMessagingSendChat({
     required String deviceId,
     required String text,
@@ -427,7 +504,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 11,
+            funcId: 13,
             port: port_,
           );
         },
@@ -457,7 +534,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 12,
+            funcId: 14,
             port: port_,
           );
         },
@@ -487,7 +564,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 13,
+            funcId: 15,
             port: port_,
           );
         },
@@ -520,7 +597,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 14,
+            funcId: 16,
             port: port_,
           );
         },
@@ -552,7 +629,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 15,
+            funcId: 17,
             port: port_,
           );
         },
@@ -586,6 +663,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  RustStreamSink<HostCommand> dco_decode_StreamSink_host_command_Sse(
+    dynamic raw,
+  ) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    throw UnimplementedError();
+  }
+
+  @protected
   String dco_decode_String(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw as String;
@@ -595,6 +680,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   bool dco_decode_bool(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw as bool;
+  }
+
+  @protected
+  HostFact dco_decode_box_autoadd_host_fact(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return dco_decode_host_fact(raw);
   }
 
   @protected
@@ -659,6 +750,84 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  HostCommand dco_decode_host_command(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    switch (raw[0]) {
+      case 0:
+        return HostCommand_BleSetLocalId(localId: dco_decode_String(raw[1]));
+      case 1:
+        return HostCommand_BleStartAdvertising(
+          payload: dco_decode_list_prim_u_8_strict(raw[1]),
+        );
+      case 2:
+        return HostCommand_BleStopAdvertising();
+      case 3:
+        return HostCommand_BleStartScanning();
+      case 4:
+        return HostCommand_BleStopScanning();
+      case 5:
+        return HostCommand_BleConnect(peer: dco_decode_String(raw[1]));
+      case 6:
+        return HostCommand_BleSend(
+          peer: dco_decode_String(raw[1]),
+          bytes: dco_decode_list_prim_u_8_strict(raw[2]),
+        );
+      case 7:
+        return HostCommand_BleDisconnect(peer: dco_decode_String(raw[1]));
+      case 8:
+        return HostCommand_BleShutdown();
+      default:
+        throw Exception("unreachable");
+    }
+  }
+
+  @protected
+  HostFact dco_decode_host_fact(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    switch (raw[0]) {
+      case 0:
+        return HostFact_BlePeerFound(
+          peer: dco_decode_String(raw[1]),
+          payload: dco_decode_list_prim_u_8_strict(raw[2]),
+        );
+      case 1:
+        return HostFact_BlePeerLost(peer: dco_decode_String(raw[1]));
+      case 2:
+        return HostFact_BlePipeOpened(peer: dco_decode_String(raw[1]));
+      case 3:
+        return HostFact_BlePipeFailed(
+          peer: dco_decode_String(raw[1]),
+          why: dco_decode_String(raw[2]),
+        );
+      case 4:
+        return HostFact_BlePipeClosed(peer: dco_decode_String(raw[1]));
+      case 5:
+        return HostFact_BleReceived(
+          peer: dco_decode_String(raw[1]),
+          bytes: dco_decode_list_prim_u_8_strict(raw[2]),
+        );
+      case 6:
+        return HostFact_BleAvailability(
+          available: dco_decode_bool(raw[1]),
+          reason: dco_decode_opt_String(raw[2]),
+        );
+      case 7:
+        return HostFact_BleWriteComplete(
+          peer: dco_decode_String(raw[1]),
+          bytes: dco_decode_u_64(raw[2]),
+        );
+      default:
+        throw Exception("unreachable");
+    }
+  }
+
+  @protected
+  int dco_decode_i_32(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw as int;
+  }
+
+  @protected
   PlatformInt64 dco_decode_i_64(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return dcoDecodeI64(raw);
@@ -703,6 +872,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  String? dco_decode_opt_String(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw == null ? null : dco_decode_String(raw);
+  }
+
+  @protected
   PlatformInt64? dco_decode_opt_box_autoadd_i_64(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw == null ? null : dco_decode_box_autoadd_i_64(raw);
@@ -719,6 +894,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       colour: dco_decode_u_32(arr[1]),
       version: dco_decode_u_32(arr[2]),
     );
+  }
+
+  @protected
+  RadioChoice dco_decode_radio_choice(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return RadioChoice.values[raw as int];
   }
 
   @protected
@@ -774,6 +955,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  RustStreamSink<HostCommand> sse_decode_StreamSink_host_command_Sse(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    throw UnimplementedError('Unreachable ()');
+  }
+
+  @protected
   String sse_decode_String(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var inner = sse_decode_list_prim_u_8_strict(deserializer);
@@ -784,6 +973,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   bool sse_decode_bool(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return deserializer.buffer.getUint8() != 0;
+  }
+
+  @protected
+  HostFact sse_decode_box_autoadd_host_fact(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return (sse_decode_host_fact(deserializer));
   }
 
   @protected
@@ -857,6 +1052,90 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  HostCommand sse_decode_host_command(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    var tag_ = sse_decode_i_32(deserializer);
+    switch (tag_) {
+      case 0:
+        var var_localId = sse_decode_String(deserializer);
+        return HostCommand_BleSetLocalId(localId: var_localId);
+      case 1:
+        var var_payload = sse_decode_list_prim_u_8_strict(deserializer);
+        return HostCommand_BleStartAdvertising(payload: var_payload);
+      case 2:
+        return HostCommand_BleStopAdvertising();
+      case 3:
+        return HostCommand_BleStartScanning();
+      case 4:
+        return HostCommand_BleStopScanning();
+      case 5:
+        var var_peer = sse_decode_String(deserializer);
+        return HostCommand_BleConnect(peer: var_peer);
+      case 6:
+        var var_peer = sse_decode_String(deserializer);
+        var var_bytes = sse_decode_list_prim_u_8_strict(deserializer);
+        return HostCommand_BleSend(peer: var_peer, bytes: var_bytes);
+      case 7:
+        var var_peer = sse_decode_String(deserializer);
+        return HostCommand_BleDisconnect(peer: var_peer);
+      case 8:
+        return HostCommand_BleShutdown();
+      default:
+        throw UnimplementedError('');
+    }
+  }
+
+  @protected
+  HostFact sse_decode_host_fact(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    var tag_ = sse_decode_i_32(deserializer);
+    switch (tag_) {
+      case 0:
+        var var_peer = sse_decode_String(deserializer);
+        var var_payload = sse_decode_list_prim_u_8_strict(deserializer);
+        return HostFact_BlePeerFound(peer: var_peer, payload: var_payload);
+      case 1:
+        var var_peer = sse_decode_String(deserializer);
+        return HostFact_BlePeerLost(peer: var_peer);
+      case 2:
+        var var_peer = sse_decode_String(deserializer);
+        return HostFact_BlePipeOpened(peer: var_peer);
+      case 3:
+        var var_peer = sse_decode_String(deserializer);
+        var var_why = sse_decode_String(deserializer);
+        return HostFact_BlePipeFailed(peer: var_peer, why: var_why);
+      case 4:
+        var var_peer = sse_decode_String(deserializer);
+        return HostFact_BlePipeClosed(peer: var_peer);
+      case 5:
+        var var_peer = sse_decode_String(deserializer);
+        var var_bytes = sse_decode_list_prim_u_8_strict(deserializer);
+        return HostFact_BleReceived(peer: var_peer, bytes: var_bytes);
+      case 6:
+        var var_available = sse_decode_bool(deserializer);
+        var var_reason = sse_decode_opt_String(deserializer);
+        return HostFact_BleAvailability(
+          available: var_available,
+          reason: var_reason,
+        );
+      case 7:
+        var var_peer = sse_decode_String(deserializer);
+        var var_bytes = sse_decode_u_64(deserializer);
+        return HostFact_BleWriteComplete(peer: var_peer, bytes: var_bytes);
+      default:
+        throw UnimplementedError('');
+    }
+  }
+
+  @protected
+  int sse_decode_i_32(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return deserializer.buffer.getInt32();
+  }
+
+  @protected
   PlatformInt64 sse_decode_i_64(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return deserializer.buffer.getPlatformInt64();
@@ -927,6 +1206,17 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  String? sse_decode_opt_String(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    if (sse_decode_bool(deserializer)) {
+      return (sse_decode_String(deserializer));
+    } else {
+      return null;
+    }
+  }
+
+  @protected
   PlatformInt64? sse_decode_opt_box_autoadd_i_64(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
 
@@ -944,6 +1234,13 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_colour = sse_decode_u_32(deserializer);
     var var_version = sse_decode_u_32(deserializer);
     return PersonaDto(name: var_name, colour: var_colour, version: var_version);
+  }
+
+  @protected
+  RadioChoice sse_decode_radio_choice(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var inner = sse_decode_i_32(deserializer);
+    return RadioChoice.values[inner];
   }
 
   @protected
@@ -983,12 +1280,6 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
-  int sse_decode_i_32(SseDeserializer deserializer) {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    return deserializer.buffer.getInt32();
-  }
-
-  @protected
   void sse_encode_AnyhowException(
     AnyhowException self,
     SseSerializer serializer,
@@ -1015,6 +1306,23 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_StreamSink_host_command_Sse(
+    RustStreamSink<HostCommand> self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_String(
+      self.setupAndSerialize(
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_host_command,
+          decodeErrorData: sse_decode_AnyhowException,
+        ),
+      ),
+      serializer,
+    );
+  }
+
+  @protected
   void sse_encode_String(String self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_list_prim_u_8_strict(utf8.encoder.convert(self), serializer);
@@ -1024,6 +1332,15 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   void sse_encode_bool(bool self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     serializer.buffer.putUint8(self ? 1 : 0);
+  }
+
+  @protected
+  void sse_encode_box_autoadd_host_fact(
+    HostFact self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_host_fact(self, serializer);
   }
 
   @protected
@@ -1092,6 +1409,82 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_host_command(HostCommand self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    switch (self) {
+      case HostCommand_BleSetLocalId(localId: final localId):
+        sse_encode_i_32(0, serializer);
+        sse_encode_String(localId, serializer);
+      case HostCommand_BleStartAdvertising(payload: final payload):
+        sse_encode_i_32(1, serializer);
+        sse_encode_list_prim_u_8_strict(payload, serializer);
+      case HostCommand_BleStopAdvertising():
+        sse_encode_i_32(2, serializer);
+      case HostCommand_BleStartScanning():
+        sse_encode_i_32(3, serializer);
+      case HostCommand_BleStopScanning():
+        sse_encode_i_32(4, serializer);
+      case HostCommand_BleConnect(peer: final peer):
+        sse_encode_i_32(5, serializer);
+        sse_encode_String(peer, serializer);
+      case HostCommand_BleSend(peer: final peer, bytes: final bytes):
+        sse_encode_i_32(6, serializer);
+        sse_encode_String(peer, serializer);
+        sse_encode_list_prim_u_8_strict(bytes, serializer);
+      case HostCommand_BleDisconnect(peer: final peer):
+        sse_encode_i_32(7, serializer);
+        sse_encode_String(peer, serializer);
+      case HostCommand_BleShutdown():
+        sse_encode_i_32(8, serializer);
+    }
+  }
+
+  @protected
+  void sse_encode_host_fact(HostFact self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    switch (self) {
+      case HostFact_BlePeerFound(peer: final peer, payload: final payload):
+        sse_encode_i_32(0, serializer);
+        sse_encode_String(peer, serializer);
+        sse_encode_list_prim_u_8_strict(payload, serializer);
+      case HostFact_BlePeerLost(peer: final peer):
+        sse_encode_i_32(1, serializer);
+        sse_encode_String(peer, serializer);
+      case HostFact_BlePipeOpened(peer: final peer):
+        sse_encode_i_32(2, serializer);
+        sse_encode_String(peer, serializer);
+      case HostFact_BlePipeFailed(peer: final peer, why: final why):
+        sse_encode_i_32(3, serializer);
+        sse_encode_String(peer, serializer);
+        sse_encode_String(why, serializer);
+      case HostFact_BlePipeClosed(peer: final peer):
+        sse_encode_i_32(4, serializer);
+        sse_encode_String(peer, serializer);
+      case HostFact_BleReceived(peer: final peer, bytes: final bytes):
+        sse_encode_i_32(5, serializer);
+        sse_encode_String(peer, serializer);
+        sse_encode_list_prim_u_8_strict(bytes, serializer);
+      case HostFact_BleAvailability(
+        available: final available,
+        reason: final reason,
+      ):
+        sse_encode_i_32(6, serializer);
+        sse_encode_bool(available, serializer);
+        sse_encode_opt_String(reason, serializer);
+      case HostFact_BleWriteComplete(peer: final peer, bytes: final bytes):
+        sse_encode_i_32(7, serializer);
+        sse_encode_String(peer, serializer);
+        sse_encode_u_64(bytes, serializer);
+    }
+  }
+
+  @protected
+  void sse_encode_i_32(int self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    serializer.buffer.putInt32(self);
+  }
+
+  @protected
   void sse_encode_i_64(PlatformInt64 self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     serializer.buffer.putPlatformInt64(self);
@@ -1153,6 +1546,16 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_opt_String(String? self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    sse_encode_bool(self != null, serializer);
+    if (self != null) {
+      sse_encode_String(self, serializer);
+    }
+  }
+
+  @protected
   void sse_encode_opt_box_autoadd_i_64(
     PlatformInt64? self,
     SseSerializer serializer,
@@ -1171,6 +1574,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_String(self.name, serializer);
     sse_encode_u_32(self.colour, serializer);
     sse_encode_u_32(self.version, serializer);
+  }
+
+  @protected
+  void sse_encode_radio_choice(RadioChoice self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.index, serializer);
   }
 
   @protected
@@ -1202,11 +1611,5 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   @protected
   void sse_encode_unit(void self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
-  }
-
-  @protected
-  void sse_encode_i_32(int self, SseSerializer serializer) {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    serializer.buffer.putInt32(self);
   }
 }

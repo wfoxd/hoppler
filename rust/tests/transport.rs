@@ -1412,3 +1412,56 @@ fn an_over_acknowledging_adapter_cannot_wedge_the_pipe() {
     t.send("p1", b"still alive")
         .expect("the oversized attempt left the window charged");
 }
+
+/// A failure report for a peer whose pipe is live must not reach the core.
+///
+/// Both ends dial at once often enough that one connection losing the race is
+/// ordinary, and the adapter reports that loser's closure as a failure of the
+/// *peer* — which it is not, because the survivor is carrying traffic.
+///
+/// This was passed straight through on the stated grounds that "an unsolicited
+/// PipeFailed costs the core nothing". True when written; false once the engine
+/// began queueing a Ping until a session exists, because a spurious failure now
+/// cancels that Ping and tells the person it could not be delivered — moments
+/// before it would have been. Seen on two phones, first Ping every time, while
+/// the very same second carried a completed handshake.
+#[test]
+fn a_failure_for_a_peer_with_a_live_pipe_is_not_reported() {
+    use rust_lib_hoppler::transport::ble::PlatformEvent;
+    let (probe, _t, rx) = probed("p1");
+
+    probe.radio().on_platform_event(PlatformEvent::PipeFailed {
+        peer: "p1".to_string(),
+        why: "Broken pipe".into(),
+    });
+
+    // Nothing to wait *for*, so give the ingress a moment and then require
+    // silence — the assertion is an absence, and absences need a window.
+    std::thread::sleep(Duration::from_millis(200));
+    let seen: Vec<TransportEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    assert!(
+        !seen
+            .iter()
+            .any(|e| matches!(e, TransportEvent::PipeFailed { peer, .. } if peer == "p1")),
+        "a live pipe was reported as failed: {seen:?}"
+    );
+}
+
+/// The suppression must be narrow: a peer we hold no pipe to still has to be
+/// reported, or a dial that genuinely fails goes silent and the Ping waiting on
+/// it hangs until its deadline.
+#[test]
+fn a_failure_for_a_peer_with_no_pipe_is_still_reported() {
+    use rust_lib_hoppler::transport::ble::PlatformEvent;
+    let (probe, _t, rx) = probed("p1");
+
+    probe.radio().on_platform_event(PlatformEvent::PipeFailed {
+        peer: "stranger".to_string(),
+        why: "no route".into(),
+    });
+
+    wait_for(
+        &rx,
+        |e| matches!(e, TransportEvent::PipeFailed { peer, .. } if peer == "stranger"),
+    );
+}
