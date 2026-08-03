@@ -104,6 +104,20 @@ struct Inner {
     identity: Arc<Mutex<Identity>>,
     on: AtomicBool,
     sightings: Mutex<HashMap<PeerId, Sighting>>,
+    /// Personas learned for a peer, held independently of whether that peer has
+    /// a sighting *yet*.
+    ///
+    /// The two arrive in either order. A peer that dials us is known through the
+    /// pipe — hello, persona fetch, handshake — before its advertisement
+    /// necessarily reaches us, and storing the persona only onto an existing
+    /// sighting silently dropped it in exactly that case. The sighting then
+    /// appeared with no name and nothing ever refilled it, which is a nameless
+    /// tile above a live session.
+    ///
+    /// Keyed by the same rotating id as the sightings, so it stitches nothing
+    /// together that they do not: a peer that rotates has no entry here under
+    /// its new id, and has to be learned again.
+    personas: Mutex<HashMap<PeerId, identity::VerifiedPersona>>,
     blocked: Mutex<Vec<[u8; PSEUDONYM_LEN]>>,
     buckets: Mutex<Buckets>,
     last_rotation: Mutex<Instant>,
@@ -131,6 +145,7 @@ impl Discovery {
                 identity,
                 on: AtomicBool::new(false),
                 sightings: Mutex::new(HashMap::new()),
+                personas: Mutex::new(HashMap::new()),
                 blocked: Mutex::new(Vec::new()),
                 buckets: Mutex::new(Buckets {
                     hits: HashMap::new(),
@@ -289,6 +304,16 @@ impl Discovery {
                 // know. Overwriting would discard a persona we have already
                 // fetched and signature-checked, and the UI would watch names
                 // blink out for no reason the user could see.
+                // A persona may already be known for this peer — it dialled us
+                // and identified itself before its advertisement arrived. Read
+                // it out before taking the sightings lock, never both at once.
+                let known = self
+                    .inner
+                    .personas
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&peer)
+                    .cloned();
                 self.inner
                     .sightings
                     .lock()
@@ -296,10 +321,15 @@ impl Discovery {
                     .entry(peer.clone())
                     .or_insert(Sighting {
                         peer,
-                        persona: None,
+                        persona: known,
                     });
             }
             TransportEvent::PeerLost { peer } => {
+                self.inner
+                    .personas
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&peer);
                 self.inner
                     .sightings
                     .lock()
@@ -400,15 +430,53 @@ impl Discovery {
     /// is not skippable by any path that populates the list.
     pub fn accept_persona(&self, peer: &str, wire: &[u8]) -> Result<(), identity::IdentityError> {
         let verified = identity::verify_persona_record(wire)?;
+        self.note_persona(peer, verified);
+        Ok(())
+    }
+
+    /// Record a persona that was verified somewhere else — in practice the
+    /// session handshake.
+    ///
+    /// Only one side of a pair ever *asks* for a persona: the initiator, which
+    /// the tie-break fixes as the smaller id. The responder learns the same
+    /// persona from the handshake instead, and had no way to say so, so its
+    /// sighting stayed nameless for the life of the session — the side holding
+    /// the larger id, whichever device that happens to be until the next
+    /// rotation deals the ids again.
+    ///
+    /// What arrives here is *better* attested than what `accept_persona`
+    /// verifies. A record off the discovery channel proves only that it was
+    /// signed; one that came through the handshake is additionally bound to the
+    /// static key the peer proved possession of, which is the check that closed
+    /// the T10 impersonation hole. So overwriting is an upgrade.
+    ///
+    /// A peer with no sighting is left alone: nothing has advertised it, so
+    /// there is no tile to name.
+    ///
+    /// `pub(crate)` deliberately. Unlike [`Self::accept_persona`], which
+    /// verifies bytes, this takes the verdict as a type — and
+    /// `VerifiedPersona` has all-public fields and no private constructor, so
+    /// the name is a claim rather than something the type enforces. Keeping
+    /// this off the public API means the only way in from outside is the one
+    /// that actually checks a signature.
+    pub(crate) fn note_persona(&self, peer: &str, persona: identity::VerifiedPersona) {
+        // Recorded first and unconditionally, so a persona that arrives before
+        // the advertisement is not lost. Locks are taken one at a time and in
+        // this order everywhere; this module has already paid for a lock
+        // inversion once.
+        self.inner
+            .personas
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(peer.to_string(), persona.clone());
         let mut sightings = self
             .inner
             .sightings
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if let Some(sighting) = sightings.get_mut(peer) {
-            sighting.persona = Some(verified);
+            sighting.persona = Some(persona);
         }
-        Ok(())
     }
 }
 

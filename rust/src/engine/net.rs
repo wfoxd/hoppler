@@ -524,6 +524,13 @@ impl Net {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(peer.to_string(), established.persona.clone());
+        // The nearby list reads names off the *sighting*, and only the
+        // initiator ever fetches a persona over the discovery channel. Without
+        // this the responder — whichever side drew the larger id this time —
+        // shows a live, session-bearing peer as a nameless tile for as long as
+        // the session lasts.
+        self.discovery
+            .note_persona(peer, established.persona.clone());
         self.sessions.open(peer, established, now);
         // Anything asked for before the session existed goes now.
         if self

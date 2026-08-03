@@ -568,3 +568,147 @@ fn a_second_pipe_opened_does_not_wreck_the_handshake_in_flight() {
         "the Ping did not arrive after a duplicate announcement: {b_events:?}"
     );
 }
+
+/// Both sides must end up able to name the other, not just the one that asked.
+///
+/// Names on the nearby list come from `Discovery`'s sightings, and only the
+/// *initiator* fetches a persona over the discovery channel. The tie-break
+/// fixes the initiator as the smaller id, so before the fix the larger id
+/// showed a live peer — session open, Pings arriving — as a nameless tile, for
+/// the life of the session and every session after it.
+///
+/// Deterministic, which is why the two-phone runs looked inconsistent: whichever
+/// handset drew the larger id that run was the one with the blank tile.
+///
+/// Both directions are asserted because only one of them was ever broken, and a
+/// test that checked the responder alone would not notice the fix breaking the
+/// initiator.
+#[test]
+fn both_sides_learn_the_others_name() {
+    let air = air();
+    let now = Instant::now();
+    let alice = node(&air, "alice", "Alice", now);
+    let bob = node(&air, "bob", "Bob", now);
+
+    // Both advertising and both scanning, so each has a sighting of the other
+    // to carry a name. "alice" < "bob", so Alice initiates and Bob responds.
+    alice.net.discovery().set_enabled(true, now).unwrap();
+    bob.net.discovery().set_enabled(true, now).unwrap();
+    alice.net.discovery().start_scanning().unwrap();
+    bob.net.discovery().start_scanning().unwrap();
+    settle(&alice, &bob, now);
+
+    alice.net.reach(&bob.id).unwrap();
+    let (a_events, b_events) = settle(&alice, &bob, now);
+    assert!(
+        opened_with(&a_events).is_some() && opened_with(&b_events).is_some(),
+        "no session, so this test would prove nothing: {a_events:?} / {b_events:?}"
+    );
+
+    let named = |node: &Node, peer: &str| -> Option<String> {
+        node.net
+            .discovery()
+            .sightings()
+            .into_iter()
+            .find(|s| s.peer == peer)
+            .and_then(|s| s.persona)
+            .map(|p| p.name)
+    };
+
+    assert_eq!(
+        named(&alice, &bob.id).as_deref(),
+        Some("Bob"),
+        "the initiator lost the name it fetched"
+    );
+    assert_eq!(
+        named(&bob, &alice.id).as_deref(),
+        Some("Alice"),
+        "the responder never learned the name, so its tile stays blank forever"
+    );
+}
+
+/// A persona that arrives before the advertisement must not be thrown away.
+///
+/// The two orders both happen. A peer that dials *us* is known through the pipe
+/// — hello, persona fetch, handshake — before its mDNS advertisement
+/// necessarily reaches us. Storing the persona only onto an existing sighting
+/// dropped it silently in that case, and the sighting created afterwards
+/// started nameless with nothing to refill it.
+///
+/// Seen on hardware immediately after the first naming fix: the phone that
+/// *accepted* the pipe showed a blank tile above a live session with Pings
+/// arriving on it, while the phone that dialled showed the name correctly. The
+/// first fix was right and incomplete — it inherited this hole from
+/// `accept_persona`.
+#[test]
+fn a_persona_learned_before_the_sighting_survives() {
+    let air = air();
+    let now = Instant::now();
+    let alice = node(&air, "alice", "Alice", now);
+    let bob = node(&air, "bob", "Bob", now);
+
+    alice.net.discovery().start_scanning().unwrap();
+    bob.net.discovery().set_enabled(true, now).unwrap();
+    bob.net.reach(&alice.id).unwrap();
+
+    // Pump both sides, but withhold Alice's sighting of Bob. Left to itself the
+    // loopback rung delivers PeerFound first and the sighting exists before the
+    // session does — which is the ordering that already worked, and a test that
+    // allowed it passed with the fix removed.
+    let mut a_events = Vec::new();
+    for _ in 0..40 {
+        let mut moved = false;
+        while let Ok(e) = alice.rx.recv_timeout(Duration::from_millis(30)) {
+            moved = true;
+            if matches!(&e, TransportEvent::PeerFound { peer, .. } if peer == &bob.id) {
+                continue;
+            }
+            a_events.extend(alice.net.handle(e, now));
+        }
+        while let Ok(e) = bob.rx.recv_timeout(Duration::from_millis(30)) {
+            moved = true;
+            bob.net.handle(e, now);
+        }
+        if !moved {
+            break;
+        }
+    }
+
+    assert!(
+        opened_with(&a_events).is_some(),
+        "no session, so this proves nothing: {a_events:?}"
+    );
+    assert!(
+        !alice
+            .net
+            .discovery()
+            .sightings()
+            .iter()
+            .any(|s| s.peer == bob.id),
+        "Bob must still be unsighted here, or the ordering under test never happened"
+    );
+
+    // Only now does the advertisement land.
+    alice.net.handle(
+        TransportEvent::PeerFound {
+            peer: bob.id.clone(),
+            payload: Vec::new(),
+        },
+        now,
+    );
+
+    let named = alice
+        .net
+        .discovery()
+        .sightings()
+        .into_iter()
+        .find(|s| s.peer == bob.id)
+        .and_then(|s| s.persona)
+        .map(|p| p.name);
+    assert_eq!(
+        named.as_deref(),
+        Some("Bob"),
+        "the persona was learned over the pipe and then dropped when the \
+         sighting appeared, leaving a nameless tile above a live session"
+    );
+}
