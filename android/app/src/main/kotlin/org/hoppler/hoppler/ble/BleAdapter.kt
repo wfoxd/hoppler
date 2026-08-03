@@ -547,10 +547,20 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
                     // when this is non-null, so the rung would come back
                     // advertising a PSM nothing is accepting on — a peer that
                     // is visible and undialable.
+                    //
+                    // Every call here is wrapped: this is a broadcast
+                    // receiver, so unlike `onMethodCall` there is no `catch`
+                    // above it, and a stack mid-teardown is exactly where a
+                    // `SecurityException` or a dead-object throw is plausible.
+                    // Taking the app down while the user toggles Bluetooth
+                    // would be a worse bug than the one being fixed.
                     runCatching { serverSocket?.close() }
                     serverSocket = null
                     localPsm = 0
-                    stopAdvertisingInternal()
+                    runCatching { stopAdvertisingInternal() }
+                    // Not stopped, only forgotten: the scanner is gone with the
+                    // stack, and a non-null callback would make `startScanning`
+                    // return success without re-registering when it comes back.
                     scanCallback = null
                     emitAvailability("Bluetooth is off")
                 }
