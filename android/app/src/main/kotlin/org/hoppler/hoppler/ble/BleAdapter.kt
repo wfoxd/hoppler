@@ -1,11 +1,16 @@
 package org.hoppler.hoppler.ble
 
 import android.annotation.SuppressLint
+import android.annotation.TargetApi
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothGatt
+import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothProfile
 import android.bluetooth.BluetoothServerSocket
 import android.bluetooth.BluetoothSocket
+import android.bluetooth.BluetoothSocketException
 import android.bluetooth.le.AdvertiseData
 import android.bluetooth.le.AdvertisingSet
 import android.bluetooth.le.AdvertisingSetCallback
@@ -32,8 +37,13 @@ import io.flutter.plugin.common.MethodChannel
 import java.io.IOException
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * The Android BLE adapter (T08b).
@@ -86,6 +96,16 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
         /** A sighting older than this is reported as `peerLost`. */
         const val PEER_TTL_MS = 15_000L
         private const val AGE_SWEEP_MS = 3_000L
+
+        /**
+         * How long to wait for the LE link a dial rides on.
+         *
+         * A peer advertising at `INTERVAL_MEDIUM` is connectable a few times a
+         * second, so a link that has not come up in ten seconds is not slow,
+         * it is not coming. Long enough to be a real answer, short enough that
+         * a dial to a peer that has walked away still ends.
+         */
+        private const val LINK_TIMEOUT_MS = 10_000L
     }
 
     private val main = Handler(Looper.getMainLooper())
@@ -130,9 +150,21 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
         var lastSeen: Long
     )
 
-    private class Pipe(val socket: BluetoothSocket) {
+    /**
+     * An open pipe, and the LE link underneath it if we raised one.
+     *
+     * [link] is null for a pipe we accepted — the dialer raised that ACL and
+     * owns it. Ours is closed with the pipe, never separately, so there is one
+     * place a client interface can leak from instead of several.
+     */
+    private class Pipe(val socket: BluetoothSocket, val link: BluetoothGatt? = null) {
         /** §5.2: one `send` is one contiguous, ordered write. */
         val writeLock = Any()
+
+        fun release() {
+            runCatching { socket.close() }
+            link?.let { runCatching { it.close() } }
+        }
     }
 
     // ── channel plumbing ────────────────────────────────────────────────────
@@ -170,6 +202,27 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
 
     private fun ok(result: MethodChannel.Result, value: Any? = null) {
         main.post { result.success(value) }
+    }
+
+    /**
+     * Hand work to the radio threads. False if the adapter is shutting down.
+     *
+     * `connect` and `send` answer their `MethodChannel.Result` *before* queuing,
+     * because acceptance and outcome are separate (§5.4). After
+     * `io.shutdownNow()` the queue rejects, and an escaping
+     * `RejectedExecutionException` would reach `onMethodCall`'s catch, which
+     * replies to that same result a second time — which Flutter treats as
+     * fatal. So the shutdown path would take the app down with it.
+     *
+     * Dropping the work is not just the safe choice, it is the specified one:
+     * §6 rule 6 says a shut-down adapter is inert, and an outcome event after
+     * shutdown would be neither silent nor inert.
+     */
+    private fun submit(work: () -> Unit): Boolean = try {
+        io.execute(work)
+        true
+    } catch (e: RejectedExecutionException) {
+        false
     }
 
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
@@ -276,6 +329,16 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
                     fail(result, "io", "advertising failed (status $status)")
                 }
             }
+
+            override fun onAdvertisingEnabled(set: AdvertisingSet?, enable: Boolean, status: Int) {
+                // A connectable advertisement stops the moment a peer connects
+                // — the controller does it, not us. If it never resumes we go
+                // dark to everyone else, which from their side is
+                // indistinguishable from having walked away. Logged rather
+                // than assumed either way: it decides whether a mesh of three
+                // works, and nothing else in the system reports it.
+                if (!enable) Log.i(TAG, "the advertisement went quiet (status $status)")
+            }
         }
         advertiseCallback = callback
         advertiser.startAdvertisingSet(params, data, null, null, null, callback)
@@ -342,19 +405,8 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
                 emitAvailability("scan failed (code $errorCode)")
             }
         }
-        // Hardware filtering: an unfiltered scan wakes the CPU for every BLE
-        // device in the room, which is the battery profile N4 rules out.
-        val filters = listOf(ScanFilter.Builder().setServiceUuid(SERVICE_PARCEL).build())
-        // Without setLegacy(false) the scanner reports *only* legacy
-        // advertisements — it would never see the extended ones we transmit,
-        // and the symptom is two working radios that cannot find each other.
-        val settings = ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-            .setLegacy(false)
-            .setPhy(ScanSettings.PHY_LE_ALL_SUPPORTED)
-            .build()
         scanCallback = callback
-        scanner.startScan(filters, settings, callback)
+        scanner.startScan(scanFilters, scanSettings, callback)
         ok(result)
     }
 
@@ -365,38 +417,124 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
         ok(result)
     }
 
+    // Hardware filtering: an unfiltered scan wakes the CPU for every BLE device
+    // in the room, which is the battery profile N4 rules out.
+    private val scanFilters = listOf(ScanFilter.Builder().setServiceUuid(SERVICE_PARCEL).build())
+
+    // Without setLegacy(false) the scanner reports *only* legacy
+    // advertisements — it would never see the extended ones we transmit, and
+    // the symptom is two working radios that cannot find each other.
+    //
+    // Hoisted out of startScanning because a paused scan has to come back with
+    // exactly these: a resume that quietly dropped setLegacy(false) would leave
+    // discovery running and blind, which is worse than not resuming at all.
+    private val scanSettings = ScanSettings.Builder()
+        .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+        .setLegacy(false)
+        .setPhy(ScanSettings.PHY_LE_ALL_SUPPORTED)
+        .build()
+
+    /** Dials in flight. The scan is paused while this is above zero. */
+    private val dialsInFlight = AtomicInteger(0)
+
     /**
-     * Ask for a handle Android knows to reach over LE. **Unverified.**
+     * Stop scanning for the duration of a dial.
      *
-     * `ScanResult.getDevice()` reports `DEVICE_TYPE_UNKNOWN` for every peer we
-     * dial — the type comes from the stack's remote device cache, and an
-     * advertisement alone does not populate it. Android picks the transport for
-     * an L2CAP channel from that type, so the theory is that the dial goes out
-     * with nothing saying LE. `getRemoteLeDevice` states it instead. Random is
-     * the right address type and not a guess: R0-F2 requires a rotating
-     * address, so every Hoppler peer advertises under a resolvable private one.
+     * `SCAN_MODE_LOW_LATENCY` across `PHY_LE_ALL_SUPPORTED` is a continuous
+     * scan, and initiating a connection wants the radio free.
      *
-     * What is *known*: the dial still fails with this in place. What is not
-     * known is whether this changes anything at all, because `getType()` reads
-     * that same cache however the handle was built — so it cannot distinguish a
-     * handle that did not change from one that did. [dialLog] reports whether
-     * the call returned a handle, which is the missing half.
+     * **Not a fix for anything.** This was added against the dial failure of
+     * §5.0.15 and changed the result not at all — that failure was the phone
+     * being out of LE connection slots. Kept because it is right on its own
+     * terms, and recorded as ineffective so the next reader does not mistake it
+     * for the reason dialling works.
      *
-     * Kept rather than removed because it falls back and costs nothing, but it
-     * is a hypothesis under test, not a fix. Do not let this comment read as
-     * one later.
+     * Counted rather than a flag, because two dials can overlap: the first to
+     * finish must not hand the radio back while the second is still using it.
      */
     @SuppressLint("MissingPermission")
-    private fun leHandleFor(device: BluetoothDevice): BluetoothDevice {
-        if (device.type != BluetoothDevice.DEVICE_TYPE_UNKNOWN) return device
-        return runCatching {
-            adapter?.getRemoteLeDevice(device.address, BluetoothDevice.ADDRESS_TYPE_RANDOM)
-        }.getOrNull() ?: device
+    private fun pauseScanning() {
+        if (dialsInFlight.getAndIncrement() != 0) return
+        scanCallback?.let {
+            Log.i(TAG, "pausing the scan to dial")
+            runCatching { scanner?.stopScan(it) }
+        }
     }
 
-    /** Whether [leHandleFor] actually produced a different handle. */
-    private fun dialLog(original: BluetoothDevice, used: BluetoothDevice): String =
-        if (original === used) "no le handle" else "le handle"
+    /** Give the radio back, if this was the last dial using it. */
+    @SuppressLint("MissingPermission")
+    private fun resumeScanning() {
+        if (dialsInFlight.decrementAndGet() != 0) return
+        // Null if the core turned discovery off while we dialled — then there
+        // is nothing to resume, and restarting would be discovery it did not
+        // ask for.
+        scanCallback?.let {
+            Log.i(TAG, "resuming the scan")
+            runCatching { scanner?.startScan(scanFilters, scanSettings, it) }
+        }
+    }
+
+    /**
+     * Bring up an LE link to [device] before dialling it.
+     *
+     * An L2CAP channel needs an ACL underneath it. Raising it here rather than
+     * letting the CoC request do it states the transport explicitly and gives
+     * the failure a name: a refused link reports a GATT `status`, where the
+     * CoC path reports only `BluetoothSocketException` code 0 for every cause
+     * there is. Services are deliberately not discovered — the link is the
+     * entire point, and GATT traffic we do not need is airtime we do not want
+     * (R0-N4).
+     *
+     * **This did not fix the dial failure of §5.0.15**, and the theory it was
+     * built on — that the CoC request went out with an unresolved address type
+     * because every peer reads `DEVICE_TYPE_UNKNOWN` — was wrong. The link came
+     * up correctly on every attempt and Android's GATT layer tore it back down,
+     * out of transport control blocks. Kept for the diagnostics above, not
+     * because it made anything work.
+     *
+     * Held for the life of the pipe rather than dropped once the channel is up:
+     * the ACL survives either way, but tying it to [Pipe] means one owner and
+     * one close. A `BluetoothGatt` that is never closed leaks a client
+     * interface, and the stack has about 32 — leak them and *every* connection
+     * on the device fails, long after the code that leaked them ran.
+     */
+    @SuppressLint("MissingPermission")
+    private fun raiseLeLink(peer: String, device: BluetoothDevice): BluetoothGatt? {
+        val settled = CountDownLatch(1)
+        val link = AtomicReference<BluetoothGatt?>(null)
+        val callback = object : BluetoothGattCallback() {
+            override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, state: Int) {
+                if (state == BluetoothProfile.STATE_CONNECTED) {
+                    link.set(gatt)
+                    settled.countDown()
+                } else if (state == BluetoothProfile.STATE_DISCONNECTED) {
+                    // status is the one number that says *why*, and it is the
+                    // only place this failure is named at all.
+                    Log.w(TAG, "le link to $peer went down (status $status)")
+                    settled.countDown()
+                }
+            }
+        }
+        val gatt = device.connectGatt(context, false, callback, BluetoothDevice.TRANSPORT_LE)
+        if (gatt == null) {
+            Log.w(TAG, "the stack refused an le link to $peer")
+            return null
+        }
+        val answered = settled.await(LINK_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        if (answered && link.get() != null) return gatt
+        // Refused and unanswered are different failures, and reporting a
+        // refusal as a timeout sends the next reader looking for a peer that
+        // was never slow — it said no, and said why, in the line above.
+        Log.w(
+            TAG,
+            if (answered) "no le link to $peer: the stack turned it down"
+            else "no le link to $peer: nothing answered in ${LINK_TIMEOUT_MS}ms"
+        )
+        // close, not disconnect: a gatt that never connected still holds the
+        // client interface, and disconnect alone does not give it back.
+        runCatching { gatt.close() }
+        return null
+    }
 
     /**
      * The one number that names why a dial was refused.
@@ -412,9 +550,23 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
      */
     private fun errorCode(e: Exception): String {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return ""
-        return (e as? android.bluetooth.BluetoothSocketException)
-            ?.let { " (code ${it.errorCode})" }
-            ?: ""
+        return SocketError.of(e)
+    }
+
+    /**
+     * Holds the only reference to a class that does not exist below API 33.
+     *
+     * `BluetoothSocketException` is API 33+ and `minSdk` is 29. ART resolves
+     * lazily, so the version check in [errorCode] almost certainly suffices on
+     * its own — but "almost certainly" is carrying real weight in that
+     * sentence, and there is no API 29–32 device here to settle it on. A
+     * separate class costs nothing and means no method that can run on an older
+     * device carries the reference at all.
+     */
+    @TargetApi(Build.VERSION_CODES.TIRAMISU)
+    private object SocketError {
+        fun of(e: Exception): String =
+            (e as? BluetoothSocketException)?.let { " (code ${it.errorCode})" } ?: ""
     }
 
     /** Ages out sightings; the radio has no "gone" event. */
@@ -476,7 +628,9 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
             // The dialer's id is not on the socket — it arrives as the first
             // line, mirroring what it advertises. Reading it off-loop keeps one
             // slow peer from wedging every accept (the LAN rung's slowloris).
-            io.execute { adoptInbound(client) }
+            // Not left dangling if shutdown beat us to it: an accepted socket
+            // nobody will ever read is a peer holding a pipe we have forgotten.
+            if (!submit { adoptInbound(client) }) runCatching { client.close() }
         }
     }
 
@@ -526,6 +680,11 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
 
     @SuppressLint("MissingPermission")
     private fun connect(peer: String, result: MethodChannel.Result) {
+        // Refused rather than accepted-then-dropped: §6 rule 2 owes a
+        // pipeOpened or pipeFailed for every accepted dial, and a shut-down
+        // adapter emits neither (rule 6). Saying no is the only answer that
+        // keeps both rules.
+        if (shuttingDown.get()) return fail(result, "unavailable", "the radio is shut down")
         val sighting = seen[peer] ?: run {
             Log.w(TAG, "cannot dial $peer: not among ${seen.size} sighting(s)")
             return fail(result, "no_such_peer", "$peer has not been seen")
@@ -552,14 +711,34 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
         // neither survives the id rotation as a correlator (R0-F2).
         val bond = sighting.device.bondState
         val type = sighting.device.type
-        val device = leHandleFor(sighting.device)
-        io.execute {
+        val device = sighting.device
+        // Every LE link on the phone, not just ours. Android's GATT layer keeps
+        // a fixed pool of control blocks (GATT_MAX_PHY_CHANNEL, commonly 7) and
+        // shares it with every app: Fast Pair, Find Hub, a watch. When it is
+        // full the stack lets our connection complete and then tears the ACL
+        // straight back down — "out of resources", visible only in the system
+        // log, surfacing to us as an unexplained status 133. Six runs went into
+        // finding that. It is one number, and it is the number that says so.
+        val links = runCatching { manager.getConnectedDevices(BluetoothProfile.GATT).size }
+            .getOrDefault(-1)
+        // Shutdown can still land between the guard above and here; then the
+        // dial is dropped and `dialling` has to be cleared by hand, because the
+        // `finally` that normally does it lives inside work that never ran.
+        val queued = submit {
             Log.i(
                 TAG,
                 "dialling $peer on psm $psm (last seen ${age}ms ago, bond $bond, " +
-                    "type $type, ${dialLog(sighting.device, device)})"
+                    "type $type, $links le link(s) already up)"
             )
+            // Held here until the pipe adopts it, so a dial that fails anywhere
+            // below still gives the client interface back (see [raiseLeLink]).
+            var link: BluetoothGatt? = null
+            pauseScanning()
             try {
+                val started = System.currentTimeMillis()
+                link = raiseLeLink(peer, device)
+                    ?: throw IOException("no le link to $peer to carry the channel")
+                Log.i(TAG, "le link to $peer up in ${System.currentTimeMillis() - started}ms")
                 val socket = device.createInsecureL2capChannel(psm)
                 socket.connect()
                 socket.outputStream.apply {
@@ -567,7 +746,8 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
                     flush()
                 }
                 Log.i(TAG, "dialled $peer on psm $psm")
-                openPipe(peer, socket)
+                openPipe(peer, socket, link)
+                link = null // the pipe owns it now
             } catch (e: Exception) {
                 // The class carries as much as the message. An IOException out
                 // of `connect` is the remote refusing the psm; a
@@ -581,12 +761,20 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
                 )
                 emit(mapOf("type" to "pipeFailed", "peer" to peer, "why" to (e.message ?: "dial failed")))
             } finally {
+                // Before anything that could throw: the radio goes back even if
+                // the rest of this teardown does not run, because a scan left
+                // paused is a device that never sees anyone again.
+                resumeScanning()
+                // Still set means the pipe never adopted it, so this is the
+                // only chance to give the client interface back.
+                link?.let { runCatching { it.close() } }
                 // Released on both paths. Left set after a failure, this peer
                 // would be undialable for the life of the process — trading a
                 // failure that retries for one that never does.
                 dialling.remove(peer)
             }
         }
+        if (!queued) dialling.remove(peer)
     }
 
     /**
@@ -597,8 +785,8 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
     @Volatile
     private var localId: String? = null
 
-    private fun openPipe(peer: String, socket: BluetoothSocket) {
-        val existing = pipes.put(peer, Pipe(socket))
+    private fun openPipe(peer: String, socket: BluetoothSocket, link: BluetoothGatt? = null) {
+        val existing = pipes.put(peer, Pipe(socket, link))
         if (existing != null) {
             // Simultaneous dial. Report the open regardless — the core opens
             // one pipe (§6) — but do not leak the socket we displaced.
@@ -608,10 +796,10 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
             // who opens the handshake), and how often it lands is the
             // difference between a rare race and the normal opening.
             Log.i(TAG, "simultaneous dial with $peer: keeping the newer pipe")
-            runCatching { existing.socket.close() }
+            existing.release()
         }
         emit(mapOf("type" to "pipeOpened", "peer" to peer))
-        io.execute { readLoop(peer, socket) }
+        submit { readLoop(peer, socket) }
     }
 
     private fun readLoop(peer: String, socket: BluetoothSocket) {
@@ -629,9 +817,13 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
             // event to the core.
         }
         // Only report the close if this socket is still the live one — a
-        // re-dial may have replaced it while this reader was blocked.
-        if (pipes[peer]?.socket === socket) {
-            pipes.remove(peer)
+        // re-dial may have replaced it while this reader was blocked. Removed
+        // by identity, so a pipe that replaced ours between the read and the
+        // remove is not the one torn down: that would strand its LE link with
+        // nothing left holding a reference to close it.
+        val mine = pipes[peer]
+        if (mine?.socket === socket && pipes.remove(peer, mine)) {
+            mine.release()
             emit(mapOf("type" to "pipeClosed", "peer" to peer))
         }
     }
@@ -639,7 +831,8 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
     private fun send(peer: String, bytes: ByteArray, result: MethodChannel.Result) {
         val pipe = pipes[peer] ?: return fail(result, "no_such_peer", "no pipe to $peer")
         ok(result)
-        io.execute {
+        // Same double-reply shape as `connect`: answered above, queued here.
+        submit {
             try {
                 // §5.2: one send is one contiguous ordered write.
                 synchronized(pipe.writeLock) {
@@ -657,7 +850,7 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
 
     private fun closePipe(peer: String, report: Boolean) {
         val pipe = pipes.remove(peer) ?: return
-        runCatching { pipe.socket.close() }
+        pipe.release()
         if (report) emit(mapOf("type" to "pipeClosed", "peer" to peer))
     }
 
