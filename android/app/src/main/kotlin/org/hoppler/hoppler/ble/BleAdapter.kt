@@ -21,9 +21,11 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelUuid
+import android.util.Log
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
@@ -51,6 +53,23 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
     EventChannel.StreamHandler {
 
     companion object {
+        /**
+         * The adapter logs what the core cannot see.
+         *
+         * The Rust side is well instrumented and the radio layer was silent,
+         * which meant a failed dial could be observed but never explained —
+         * three hardware diagnoses in a row were guesses because of it. What is
+         * logged here is chosen to answer the questions the core cannot: which
+         * PSM we listen on, which we dial, whether an accept ever fires, and
+         * what a failure actually threw.
+         *
+         * **No addresses.** A line pairing a peer's rotating id with its
+         * Bluetooth address would outlive the rotation and undo R0-F2 — the
+         * same leak a security review already found in the core's logging.
+         * Correlate with `bt_stack` by timestamp if an address is ever needed.
+         */
+        private const val TAG = "hoppler-ble"
+
         const val METHOD_CHANNEL = "org.hoppler/ble"
         const val EVENT_CHANNEL = "org.hoppler/ble/events"
         const val CHANNEL_VERSION = 1
@@ -89,6 +108,21 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
 
     /** Open pipes: id → socket and its serialised writer. */
     private val pipes = ConcurrentHashMap<String, Pipe>()
+
+    /**
+     * Peers with a dial in flight.
+     *
+     * `pipes` cannot serve: a dial that has not connected yet has no entry
+     * there, so two `connect` calls landing in the same millisecond both pass
+     * that check and both open an L2CAP channel to the same remote. Two
+     * channels to one remote at once do not both succeed — on two phones,
+     * neither did, and every Ping failed.
+     *
+     * The core has been fixed not to ask twice, but this stays: it is one line,
+     * and the next thing to reach a peer twice — a retry, a double tap, a
+     * second rung — would rediscover the same failure from scratch.
+     */
+    private val dialling = ConcurrentHashMap.newKeySet<String>()
 
     private class Sighting(
         val device: BluetoothDevice,
@@ -231,8 +265,13 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
         val callback = object : AdvertisingSetCallback() {
             override fun onAdvertisingSetStarted(set: AdvertisingSet?, txPower: Int, status: Int) {
                 if (status == ADVERTISE_SUCCESS) {
+                    // The psm we publish, against the psm we opened above: if
+                    // these ever disagree, every dial to us fails and neither
+                    // side can tell that from being out of range.
+                    Log.i(TAG, "advertising ${body.size} bytes carrying psm $localPsm")
                     ok(result)
                 } else {
+                    Log.w(TAG, "the radio refused to advertise (status $status)")
                     advertiseCallback = null
                     fail(result, "io", "advertising failed (status $status)")
                 }
@@ -255,7 +294,13 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
 
     @SuppressLint("MissingPermission")
     private fun stopAdvertisingInternal() {
-        advertiseCallback?.let { advertiser?.stopAdvertisingSet(it) }
+        advertiseCallback?.let {
+            // The R0-F2 line. A UI that merely hides is a fail, so the moment
+            // the radio is actually told to stop is worth being able to point
+            // at — and worth being able to see the absence of.
+            Log.i(TAG, "stopping the advertisement")
+            advertiser?.stopAdvertisingSet(it)
+        }
         advertiseCallback = null
     }
 
@@ -274,6 +319,15 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
                 val now = System.currentTimeMillis()
                 val previous = seen.put(advert.id, Sighting(sr.device, advert, now))
                 if (BleFraming.isNews(previous?.advert, advert)) {
+                    // Only on news, so this stays bounded — an advertisement
+                    // arrives many times a second. The psm here is what the
+                    // peer *claims*; the psm it logged opening is what it has.
+                    // A mismatch is the whole question.
+                    Log.i(
+                        TAG,
+                        "sighted ${advert.id} on psm ${advert.psm}, " +
+                            "${advert.payload.size} byte payload"
+                    )
                     emit(
                         mapOf(
                             "type" to "peerFound",
@@ -311,6 +365,58 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
         ok(result)
     }
 
+    /**
+     * Ask for a handle Android knows to reach over LE. **Unverified.**
+     *
+     * `ScanResult.getDevice()` reports `DEVICE_TYPE_UNKNOWN` for every peer we
+     * dial — the type comes from the stack's remote device cache, and an
+     * advertisement alone does not populate it. Android picks the transport for
+     * an L2CAP channel from that type, so the theory is that the dial goes out
+     * with nothing saying LE. `getRemoteLeDevice` states it instead. Random is
+     * the right address type and not a guess: R0-F2 requires a rotating
+     * address, so every Hoppler peer advertises under a resolvable private one.
+     *
+     * What is *known*: the dial still fails with this in place. What is not
+     * known is whether this changes anything at all, because `getType()` reads
+     * that same cache however the handle was built — so it cannot distinguish a
+     * handle that did not change from one that did. [dialLog] reports whether
+     * the call returned a handle, which is the missing half.
+     *
+     * Kept rather than removed because it falls back and costs nothing, but it
+     * is a hypothesis under test, not a fix. Do not let this comment read as
+     * one later.
+     */
+    @SuppressLint("MissingPermission")
+    private fun leHandleFor(device: BluetoothDevice): BluetoothDevice {
+        if (device.type != BluetoothDevice.DEVICE_TYPE_UNKNOWN) return device
+        return runCatching {
+            adapter?.getRemoteLeDevice(device.address, BluetoothDevice.ADDRESS_TYPE_RANDOM)
+        }.getOrNull() ?: device
+    }
+
+    /** Whether [leHandleFor] actually produced a different handle. */
+    private fun dialLog(original: BluetoothDevice, used: BluetoothDevice): String =
+        if (original === used) "no le handle" else "le handle"
+
+    /**
+     * The one number that names why a dial was refused.
+     *
+     * `BluetoothSocketException`'s *message* is the same sentence — "A
+     * Bluetooth Socket failure occurred" — for a PSM nobody is listening on, a
+     * link that never came up, and a peer demanding authentication we do not
+     * do. Its code tells those apart, and nothing else in the system does.
+     *
+     * API 33+ only, and `minSdk` is 29, so the class is touched solely inside
+     * the version check — an unguarded reference would be a class that does not
+     * exist on a device we support.
+     */
+    private fun errorCode(e: Exception): String {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return ""
+        return (e as? android.bluetooth.BluetoothSocketException)
+            ?.let { " (code ${it.errorCode})" }
+            ?: ""
+    }
+
     /** Ages out sightings; the radio has no "gone" event. */
     private val ageSweep = object : Runnable {
         override fun run() {
@@ -330,27 +436,43 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
 
     @SuppressLint("MissingPermission")
     private fun openServerSocket(): Boolean {
-        val adapter = adapter ?: return false
+        val adapter = adapter ?: run {
+            Log.w(TAG, "no listener: Bluetooth is unavailable")
+            return false
+        }
         return try {
             val socket = adapter.listenUsingInsecureL2capChannel()
             serverSocket = socket
             localPsm = socket.psm
+            Log.i(TAG, "listening on psm $localPsm")
             io.execute { acceptLoop(socket) }
             true
         } catch (e: IOException) {
+            Log.w(TAG, "could not open an L2CAP listener: ${e.message}")
             false
         } catch (e: SecurityException) {
+            Log.w(TAG, "could not open an L2CAP listener: not permitted")
             false
         }
     }
 
     private fun acceptLoop(socket: BluetoothServerSocket) {
+        // Captured now: reading `psm` off a closed socket is not reliable, and
+        // the number is most wanted precisely when the loop is ending.
+        val psm = localPsm
         while (!shuttingDown.get()) {
             val client = try {
                 socket.accept()
             } catch (e: IOException) {
+                // Worth distinguishing from the orderly exit below. A loop that
+                // ends here while we are still advertising leaves us publishing
+                // a psm nothing will ever answer on — which from the far side
+                // is a dial that fails every time, with nothing on this side
+                // to say why.
+                Log.i(TAG, "stopped accepting on psm $psm: ${e.message}")
                 return // socket closed by shutdown
             }
+            Log.i(TAG, "accepted a dial on psm $psm")
             // The dialer's id is not on the socket — it arrives as the first
             // line, mirroring what it advertises. Reading it off-loop keeps one
             // slow peer from wedging every accept (the LAN rung's slowloris).
@@ -362,13 +484,19 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
         val id = try {
             readHello(socket)
         } catch (e: IOException) {
+            // An accept that gets this far and then dies is a *different*
+            // failure from a dial that never connected, and from the far side
+            // the two are indistinguishable — both are "the pipe failed".
+            Log.w(TAG, "an accepted dial never said who it was: ${e.message}")
             runCatching { socket.close() }
             return
         }
         if (id == null) {
+            Log.w(TAG, "an accepted dial introduced itself with an id we refuse")
             runCatching { socket.close() }
             return
         }
+        Log.i(TAG, "accepted $id")
         openPipe(id, socket)
     }
 
@@ -398,23 +526,65 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
 
     @SuppressLint("MissingPermission")
     private fun connect(peer: String, result: MethodChannel.Result) {
-        val sighting = seen[peer]
-            ?: return fail(result, "no_such_peer", "$peer has not been seen")
+        val sighting = seen[peer] ?: run {
+            Log.w(TAG, "cannot dial $peer: not among ${seen.size} sighting(s)")
+            return fail(result, "no_such_peer", "$peer has not been seen")
+        }
         if (pipes.containsKey(peer)) return ok(result) // core re-announces (§6)
+        if (!dialling.add(peer)) {
+            // Accepted, and deliberately silent: the dial already running will
+            // emit pipeOpened or pipeFailed, and the core acts on one of those
+            // per peer either way (§6).
+            Log.i(TAG, "already dialling $peer, letting the first attempt stand")
+            return ok(result)
+        }
 
         // Acceptance only: the outcome arrives as pipeOpened / pipeFailed.
         ok(result)
+        val psm = sighting.advert.psm
+        // How old the sighting is separates a live peer from a remembered one:
+        // a psm read from a stale advertisement points at a listener that may
+        // no longer exist, and the dial fails identically either way.
+        val age = System.currentTimeMillis() - sighting.lastSeen
+        // Bond state and transport type, because an insecure L2CAP channel is
+        // supposed to need neither — if a refusal turns out to be about
+        // authentication, these are what say so. Neither is an address, so
+        // neither survives the id rotation as a correlator (R0-F2).
+        val bond = sighting.device.bondState
+        val type = sighting.device.type
+        val device = leHandleFor(sighting.device)
         io.execute {
+            Log.i(
+                TAG,
+                "dialling $peer on psm $psm (last seen ${age}ms ago, bond $bond, " +
+                    "type $type, ${dialLog(sighting.device, device)})"
+            )
             try {
-                val socket = sighting.device.createInsecureL2capChannel(sighting.advert.psm)
+                val socket = device.createInsecureL2capChannel(psm)
                 socket.connect()
                 socket.outputStream.apply {
                     write(BleFraming.hello(localId ?: ""))
                     flush()
                 }
+                Log.i(TAG, "dialled $peer on psm $psm")
                 openPipe(peer, socket)
             } catch (e: Exception) {
+                // The class carries as much as the message. An IOException out
+                // of `connect` is the remote refusing the psm; a
+                // SecurityException is our own permissions; anything else is
+                // the device object, not the link. All three reach the core as
+                // the same `pipeFailed`.
+                Log.w(
+                    TAG,
+                    "dial to $peer on psm $psm failed: ${e.javaClass.simpleName}" +
+                        "${errorCode(e)}: ${e.message}"
+                )
                 emit(mapOf("type" to "pipeFailed", "peer" to peer, "why" to (e.message ?: "dial failed")))
+            } finally {
+                // Released on both paths. Left set after a failure, this peer
+                // would be undialable for the life of the process — trading a
+                // failure that retries for one that never does.
+                dialling.remove(peer)
             }
         }
     }
@@ -432,6 +602,12 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
         if (existing != null) {
             // Simultaneous dial. Report the open regardless — the core opens
             // one pipe (§6) — but do not leak the socket we displaced.
+            //
+            // Logged because it is the case we cannot otherwise count: both
+            // ends dialling is ordinary here (nothing decides who dials, unlike
+            // who opens the handshake), and how often it lands is the
+            // difference between a rare race and the normal opening.
+            Log.i(TAG, "simultaneous dial with $peer: keeping the newer pipe")
             runCatching { existing.socket.close() }
         }
         emit(mapOf("type" to "pipeOpened", "peer" to peer))
@@ -525,6 +701,7 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
      * simply untrue, and left "nobody is nearby" as the only symptom.
      */
     private fun emitAvailability(reason: String? = unusable()) {
+        Log.i(TAG, "radio " + (reason?.let { "unavailable: $it" } ?: "available"))
         emit(mapOf("type" to "availability", "available" to (reason == null), "reason" to reason))
     }
 
