@@ -732,14 +732,18 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
         val bond = sighting.device.bondState
         val type = sighting.device.type
         val device = sighting.device
-        // Every LE link on the phone, not just ours. Android's GATT layer keeps
-        // a fixed pool of control blocks (GATT_MAX_PHY_CHANNEL, commonly 7) and
-        // shares it with every app: Fast Pair, Find Hub, a watch. When it is
-        // full the stack lets our connection complete and then tears the ACL
-        // straight back down — "out of resources", visible only in the system
-        // log, surfacing to us as an unexplained status 133. Six runs went into
-        // finding that. It is one number, and it is the number that says so.
-        val links = runCatching { manager.getConnectedDevices(BluetoothProfile.GATT).size }
+        // Devices with a GATT connection — which is narrower than "every LE
+        // link", but is the pool that actually runs out. Android allocates a
+        // GATT control block for *every* LE ACL, not only for app GATT clients;
+        // that is precisely why a plain L2CAP dial died of it. So the profile
+        // count tracks the contended resource even though it is not a count of
+        // ACLs. GATT_MAX_PHY_CHANNEL is commonly 7 and is shared with every app
+        // on the phone: Fast Pair, Find Hub, a watch. Full, and the stack lets
+        // our connection complete and then tears the ACL straight back down —
+        // "out of resources", visible only in the system log, surfacing here as
+        // a bare status 133. Eight runs went into finding that; this is the
+        // number that says it at a glance.
+        val gattLinks = runCatching { manager.getConnectedDevices(BluetoothProfile.GATT).size }
             .getOrDefault(-1)
         // Shutdown can still land between the guard above and here; then the
         // dial is dropped and `dialling` has to be cleared by hand, because the
@@ -748,7 +752,7 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
             Log.i(
                 TAG,
                 "dialling $peer on psm $psm (last seen ${age}ms ago, bond $bond, " +
-                    "type $type, $links le link(s) already up)"
+                    "type $type, $gattLinks gatt connection(s) already up)"
             )
             // Held here until the pipe adopts it, so a dial that fails anywhere
             // below still gives the client interface back (see [raiseLeLink]).
@@ -834,8 +838,13 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
         // than left dangling: a pipe in the map with nobody reading it is a
         // peer we believe we can hear and cannot.
         if (!submit { readLoop(peer, socket) }) {
+            // Reachable only once shutdown has begun: `submit` refuses for no
+            // other reason, and a cached pool rejects for no other reason. So
+            // no `pipeClosed` — §6 rule 6 says the adapter goes silent, and
+            // that would be a callback into a core that has asked us to stop.
+            // The `pipeOpened` above stands: it went out before shutdown was
+            // observed, and a second event now would not unsay it.
             if (pipes.remove(peer, pipe)) pipe.release()
-            emit(mapOf("type" to "pipeClosed", "peer" to peer))
         }
     }
 
