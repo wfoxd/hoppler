@@ -413,147 +413,34 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
                 emitAvailability("scan failed (code $errorCode)")
             }
         }
-        synchronized(scanLock) {
-            scanCallback = callback
-            // Deferred, not skipped, when a dial holds the radio: `resumeScanning`
-            // starts it when the last one finishes. Starting it here instead
-            // would leave the scan running *and* `scanRunning` false, and the
-            // resume would then call `startScan` on a scanner that is already
-            // scanning — which answers `onScanFailed(ALREADY_STARTED)` and
-            // reports the radio unavailable when nothing is wrong with it.
-            if (dialsInFlight == 0) {
-                // Withdrawn on failure rather than left registered. A
-                // `scanCallback` with no scan behind it makes every later
-                // `startScanning` return success at the guard above without
-                // registering anything — discovery off, and the core told twice
-                // that it is on.
-                if (runCatching { scanner.startScan(scanFilters, scanSettings, callback) }
-                        .isFailure
-                ) {
-                    scanCallback = null
-                    return fail(result, "io", "the radio refused to start scanning")
-                }
-                scanRunning = true
-            }
+        // Hardware filtering: an unfiltered scan wakes the CPU for every BLE
+        // device in the room, which is the battery profile N4 rules out.
+        val filters = listOf(ScanFilter.Builder().setServiceUuid(SERVICE_PARCEL).build())
+        // Without setLegacy(false) the scanner reports *only* legacy
+        // advertisements — it would never see the extended ones we transmit,
+        // and the symptom is two working radios that cannot find each other.
+        val settings = ScanSettings.Builder()
+            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .setLegacy(false)
+            .setPhy(ScanSettings.PHY_LE_ALL_SUPPORTED)
+            .build()
+        scanCallback = callback
+        // Withdrawn on failure rather than left registered. A `scanCallback`
+        // with no scan behind it makes every later `startScanning` return
+        // success at the guard above without registering anything — discovery
+        // off, and the core told twice that it is on.
+        if (runCatching { scanner.startScan(filters, settings, callback) }.isFailure) {
+            scanCallback = null
+            return fail(result, "io", "the radio refused to start scanning")
         }
         ok(result)
     }
 
     @SuppressLint("MissingPermission")
     private fun stopScanning(result: MethodChannel.Result) {
-        synchronized(scanLock) {
-            if (scanRunning) scanCallback?.let { runCatching { scanner?.stopScan(it) } }
-            scanCallback = null
-            scanRunning = false
-        }
+        scanCallback?.let { runCatching { scanner?.stopScan(it) } }
+        scanCallback = null
         ok(result)
-    }
-
-    // Hardware filtering: an unfiltered scan wakes the CPU for every BLE device
-    // in the room, which is the battery profile N4 rules out.
-    private val scanFilters = listOf(ScanFilter.Builder().setServiceUuid(SERVICE_PARCEL).build())
-
-    // Without setLegacy(false) the scanner reports *only* legacy
-    // advertisements — it would never see the extended ones we transmit, and
-    // the symptom is two working radios that cannot find each other.
-    //
-    // Hoisted out of startScanning because a paused scan has to come back with
-    // exactly these: a resume that quietly dropped setLegacy(false) would leave
-    // discovery running and blind, which is worse than not resuming at all.
-    private val scanSettings = ScanSettings.Builder()
-        .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-        .setLegacy(false)
-        .setPhy(ScanSettings.PHY_LE_ALL_SUPPORTED)
-        .build()
-
-    /**
-     * Guards the three facts that have to agree about the scanner: whether the
-     * core wants discovery ([scanCallback]), whether the scanner is actually
-     * running ([scanRunning]), and how many dials are holding the radio
-     * ([dialsInFlight]).
-     *
-     * They were separate before, and could disagree: discovery off, then a
-     * dial, then discovery on mid-dial left the scan running with the pause
-     * still counted, and the resume called `startScan` on an already-running
-     * scanner. Android answers that with `onScanFailed(ALREADY_STARTED)`, which
-     * this adapter reports as the radio being unavailable — a lie about the
-     * radio, which is the one thing §5.1 says it must never tell.
-     *
-     * Held only across scanner calls, never across I/O or `emit`, so it cannot
-     * be part of a cycle.
-     */
-    private val scanLock = Any()
-
-    /** Whether `startScan` is outstanding. Guarded by [scanLock]. */
-    private var scanRunning = false
-
-    /** Dials holding the radio; the scan stays down while above zero. Guarded by [scanLock]. */
-    private var dialsInFlight = 0
-
-    /**
-     * Stop scanning for the duration of a dial.
-     *
-     * `SCAN_MODE_LOW_LATENCY` across `PHY_LE_ALL_SUPPORTED` is a continuous
-     * scan, and initiating a connection wants the radio free.
-     *
-     * **Not a fix for anything.** This was added against the dial failure of
-     * §5.0.15 and changed the result not at all — that failure was the phone
-     * being out of LE connection slots. Kept because it is right on its own
-     * terms, and recorded as ineffective so the next reader does not mistake it
-     * for the reason dialling works.
-     *
-     * Counted rather than a flag, because two dials can overlap: the first to
-     * finish must not hand the radio back while the second is still using it.
-     */
-    @SuppressLint("MissingPermission")
-    private fun pauseScanning() = synchronized(scanLock) {
-        if (dialsInFlight++ > 0) return@synchronized
-        val callback = scanCallback ?: return@synchronized
-        if (!scanRunning) return@synchronized
-        Log.i(TAG, "pausing the scan to dial")
-        runCatching { scanner?.stopScan(callback) }
-        scanRunning = false
-    }
-
-    /** Give the radio back, if this was the last dial using it. */
-    @SuppressLint("MissingPermission")
-    private fun resumeScanning() = synchronized(scanLock) {
-        if (--dialsInFlight > 0) return@synchronized
-        // Null if the core turned discovery off while we dialled — then there
-        // is nothing to resume, and restarting would be discovery it did not
-        // ask for.
-        val callback = scanCallback ?: return@synchronized
-        // Already running if discovery was turned on mid-dial. Starting twice
-        // is what `onScanFailed(ALREADY_STARTED)` reports, and this adapter
-        // turns that into "the radio is unavailable".
-        if (scanRunning) return@synchronized
-        val scanner = this.scanner
-        if (scanner == null) {
-            // Left false so the next resume, or `startScanning` once the radio
-            // is back, can try again. Claiming a scan the radio never started
-            // would make every later attempt early-return on `scanRunning`, and
-            // discovery would stay off for the life of the process with nothing
-            // reporting why.
-            Log.w(TAG, "cannot resume the scan: Bluetooth is unavailable")
-            return@synchronized
-        }
-        Log.i(TAG, "resuming the scan")
-        val refused = runCatching {
-            scanner.startScan(scanFilters, scanSettings, callback)
-        }.exceptionOrNull()
-        scanRunning = refused == null
-        if (refused != null) {
-            // The state stays honest either way, but silence here would leave
-            // discovery dead with the core still believing it is on — and the
-            // whole point of this file's logging is that a radio failure should
-            // never be something you can only infer. A SecurityException is the
-            // likely one: `onMethodCall` catches those and reports them, and
-            // nothing catches them out here on a dial thread.
-            Log.w(
-                TAG,
-                "could not resume the scan: ${refused.javaClass.simpleName}: ${refused.message}"
-            )
-        }
     }
 
     /**
@@ -831,7 +718,6 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
             // Held here until the pipe adopts it, so a dial that fails anywhere
             // below still gives the client interface back (see [raiseLeLink]).
             var link: BluetoothGatt? = null
-            pauseScanning()
             try {
                 val started = System.currentTimeMillis()
                 link = raiseLeLink(peer, device)
@@ -859,10 +745,6 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
                 )
                 emit(mapOf("type" to "pipeFailed", "peer" to peer, "why" to (e.message ?: "dial failed")))
             } finally {
-                // Before anything that could throw: the radio goes back even if
-                // the rest of this teardown does not run, because a scan left
-                // paused is a device that never sees anyone again.
-                resumeScanning()
                 // Still set means the pipe never adopted it, so this is the
                 // only chance to give the client interface back.
                 link?.let { runCatching { it.close() } }
@@ -1051,13 +933,7 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
                     // Not stopped, only forgotten: the scanner is gone with the
                     // stack, and a non-null callback would make `startScanning`
                     // return success without re-registering when it comes back.
-                    // `scanRunning` goes with it — the radio took the scan down,
-                    // so leaving it true would make the next resume think a scan
-                    // is outstanding that no longer exists.
-                    synchronized(scanLock) {
-                        scanCallback = null
-                        scanRunning = false
-                    }
+                    scanCallback = null
                     emitAvailability("Bluetooth is off")
                 }
             }
@@ -1067,11 +943,8 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
     fun shutdown() {
         if (!shuttingDown.compareAndSet(false, true)) return
         stopAdvertisingInternal()
-        synchronized(scanLock) {
-            if (scanRunning) scanCallback?.let { runCatching { scanner?.stopScan(it) } }
-            scanCallback = null
-            scanRunning = false
-        }
+        scanCallback?.let { runCatching { scanner?.stopScan(it) } }
+        scanCallback = null
         runCatching { serverSocket?.close() }
         serverSocket = null
         pipes.keys.toList().forEach { closePipe(it, report = false) }
