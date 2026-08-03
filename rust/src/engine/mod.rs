@@ -311,7 +311,17 @@ pub fn ping(device_id: String) -> Result<(), String> {
     // `Pinged` is now an *inbound* event rather than something this call
     // produces — the fake used to emit it synchronously and the UI must not
     // rely on that any more.
-    net.reach(&device_id).map_err(|e| e.to_string())?;
+    //
+    // `Net::ping` reaches for itself, so the `reach` that used to stand here
+    // was a second dial for one tap. On TCP that is invisible — a duplicate
+    // connect to a peer already being connected is absorbed — but two L2CAP
+    // channels opened to one remote in the same millisecond fail, and on two
+    // phones every Ping did. Two `dialling` lines per tap, microseconds apart,
+    // is what the adapter's logging finally showed.
+    //
+    // It was also in the wrong order. `Net::ping` queues the Ping *before*
+    // reaching, so that a pipe which opens immediately still finds it; reaching
+    // first opens that window for no benefit.
     net.ping(&device_id, std::time::Instant::now())?;
     watch_for_an_undelivered_ping(net);
     Ok(())

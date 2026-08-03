@@ -26,7 +26,7 @@ use rust_lib_hoppler::discovery::Discovery;
 use rust_lib_hoppler::engine::init_with_transport;
 use rust_lib_hoppler::identity::Identity;
 use rust_lib_hoppler::transport::loopback::LoopbackNet;
-use rust_lib_hoppler::transport::{Transport, TransportEvent};
+use rust_lib_hoppler::transport::{Transport, TransportError, TransportEvent};
 
 static LOCK: Mutex<()> = Mutex::new(());
 
@@ -162,6 +162,129 @@ fn ping_requires_discovery_and_a_reachable_peer() {
     // A device that was never seen is not reachable, whatever its id — no wait
     // needed, since nothing is expected to arrive.
     assert!(ping("never-seen".into()).is_err());
+}
+
+/// A transport that records every dial, and otherwise gets out of the way.
+struct CountingDials {
+    inner: Arc<dyn Transport>,
+    dials: Arc<Mutex<Vec<String>>>,
+}
+
+impl Transport for CountingDials {
+    fn connect(&self, peer: &str) -> Result<(), TransportError> {
+        self.dials
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(peer.to_string());
+        self.inner.connect(peer)
+    }
+
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+    fn limits(&self) -> rust_lib_hoppler::transport::TransportLimits {
+        self.inner.limits()
+    }
+    fn is_available(&self) -> bool {
+        self.inner.is_available()
+    }
+    fn set_local_id(&self, id: &str) -> Result<(), TransportError> {
+        self.inner.set_local_id(id)
+    }
+    fn start_advertising(&self, payload: Vec<u8>) -> Result<(), TransportError> {
+        self.inner.start_advertising(payload)
+    }
+    fn stop_advertising(&self) -> Result<(), TransportError> {
+        self.inner.stop_advertising()
+    }
+    fn start_scanning(&self) -> Result<(), TransportError> {
+        self.inner.start_scanning()
+    }
+    fn stop_scanning(&self) -> Result<(), TransportError> {
+        self.inner.stop_scanning()
+    }
+    fn send(&self, peer: &str, bytes: &[u8]) -> Result<(), TransportError> {
+        self.inner.send(peer, bytes)
+    }
+    fn disconnect(&self, peer: &str) -> Result<(), TransportError> {
+        self.inner.disconnect(peer)
+    }
+    fn peers(&self) -> Vec<rust_lib_hoppler::transport::PeerId> {
+        self.inner.peers()
+    }
+    fn pipes(&self) -> Vec<rust_lib_hoppler::transport::PeerId> {
+        self.inner.pipes()
+    }
+    fn shutdown(&self) {
+        self.inner.shutdown()
+    }
+}
+
+/// One tap is one dial.
+///
+/// `engine::ping` used to call `reach` and then `Net::ping`, which reaches for
+/// itself — two dials for one tap. Every rung but one absorbs that: a duplicate
+/// TCP connect to a peer already being connected is harmless, which is why ~190
+/// tests and a full LAN acceptance never noticed.
+///
+/// BLE does not absorb it. Two L2CAP channels opened to one remote in the same
+/// millisecond do not both succeed, and on two phones neither did — five taps,
+/// ten dials, no session. The adapter's logging showed two `dialling` lines per
+/// tap with timestamps a microsecond apart, which is the only reason this was
+/// found at all.
+///
+/// Counted rather than asserted as "at least one", because at-least-one is what
+/// the broken version satisfied.
+#[test]
+fn one_tap_is_one_dial() {
+    let _g = LOCK.lock().unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let air = LoopbackNet::new();
+    let (tx, rx) = channel();
+    let tx = Mutex::new(tx);
+    let sink: Box<dyn Fn(TransportEvent) + Send + Sync> = Box::new(move |e| {
+        let _ = tx.lock().unwrap_or_else(|p| p.into_inner()).send(e);
+    });
+    let dials = Arc::new(Mutex::new(Vec::new()));
+    let transport: Arc<dyn Transport> = Arc::new(CountingDials {
+        inner: Arc::new(air.join("core", sink)),
+        dials: Arc::clone(&dials),
+    });
+    init_with_transport(
+        dir.path().to_str().unwrap().to_string(),
+        transport,
+        "core",
+        rx,
+    )
+    .unwrap();
+
+    let (_peer, _rx) = advertising_peer(&air, "peer-one");
+    set_discovery(true).unwrap();
+    until("an advertising peer to appear", || {
+        nearby_devices()
+            .map(|d| d.iter().any(|d| d.device_id == "peer-one"))
+            .unwrap_or(false)
+    });
+
+    // Dials from discovery itself are not what is being counted; only what the
+    // tap adds.
+    dials.lock().unwrap().clear();
+    ping("peer-one".into()).unwrap();
+
+    let dialled: Vec<String> = dials
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|p| *p == "peer-one")
+        .cloned()
+        .collect();
+    assert_eq!(
+        dialled.len(),
+        1,
+        "one tap must be one dial, got {}: {dialled:?}",
+        dialled.len()
+    );
 }
 
 #[test]
