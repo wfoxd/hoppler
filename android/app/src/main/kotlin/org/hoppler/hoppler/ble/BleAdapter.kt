@@ -422,7 +422,17 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
             // scanning — which answers `onScanFailed(ALREADY_STARTED)` and
             // reports the radio unavailable when nothing is wrong with it.
             if (dialsInFlight == 0) {
-                scanner.startScan(scanFilters, scanSettings, callback)
+                // Withdrawn on failure rather than left registered. A
+                // `scanCallback` with no scan behind it makes every later
+                // `startScanning` return success at the guard above without
+                // registering anything — discovery off, and the core told twice
+                // that it is on.
+                if (runCatching { scanner.startScan(scanFilters, scanSettings, callback) }
+                        .isFailure
+                ) {
+                    scanCallback = null
+                    return fail(result, "io", "the radio refused to start scanning")
+                }
                 scanRunning = true
             }
         }
@@ -517,9 +527,20 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
         // is what `onScanFailed(ALREADY_STARTED)` reports, and this adapter
         // turns that into "the radio is unavailable".
         if (scanRunning) return@synchronized
+        val scanner = this.scanner
+        if (scanner == null) {
+            // Left false so the next resume, or `startScanning` once the radio
+            // is back, can try again. Claiming a scan the radio never started
+            // would make every later attempt early-return on `scanRunning`, and
+            // discovery would stay off for the life of the process with nothing
+            // reporting why.
+            Log.w(TAG, "cannot resume the scan: Bluetooth is unavailable")
+            return@synchronized
+        }
         Log.i(TAG, "resuming the scan")
-        runCatching { scanner?.startScan(scanFilters, scanSettings, callback) }
-        scanRunning = true
+        scanRunning = runCatching {
+            scanner.startScan(scanFilters, scanSettings, callback)
+        }.isSuccess
     }
 
     /**
