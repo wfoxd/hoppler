@@ -177,6 +177,7 @@ impl Net {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(peer.to_string(), now + PING_DEADLINE);
+        log::info!("ping to {peer} queued: no session yet, reaching");
         self.reach(peer).map_err(|e| e.to_string())
     }
 
@@ -198,6 +199,13 @@ impl Net {
             }
             due
         };
+        for peer in &expired {
+            // Distinguishes the two ways a Ping can be reported undeliverable.
+            // This one means the pipe was fine and the session simply did not
+            // arrive in time — on a slow rung that may be the deadline being
+            // wrong rather than the peer being unreachable.
+            log::warn!("ping to {peer} expired: no session within the deadline");
+        }
         expired
             .into_iter()
             .map(|peer| NetEvent::PingUndeliverable {
@@ -251,39 +259,53 @@ impl Net {
                 vec![NetEvent::PeersChanged]
             }
             TransportEvent::PipeOpened { peer } => self.on_pipe_opened(&peer),
-            TransportEvent::PipeClosed { peer } | TransportEvent::PipeFailed { peer, .. } => {
-                self.pending
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&peer);
-                // A Ping waiting on a pipe that will never open. Reported here
-                // as soon as we know, rather than waiting out the deadline —
-                // this is the case where the answer is already certain.
-                let dropped_ping = self
-                    .pending_pings
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&peer)
-                    .is_some();
-                self.readers
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&peer);
-                let mut out = Vec::new();
-                if dropped_ping {
-                    out.push(NetEvent::PingUndeliverable {
-                        peer: peer.clone(),
-                        why: "could not reach that device".into(),
-                    });
-                }
-                if self.sessions.close(&peer) {
-                    out.push(NetEvent::SessionClosed { peer });
-                }
-                out
+            // Split so the reason can be logged. Every rung's failures converge
+            // here, which is why the logging belongs here: instrumenting the
+            // LAN dial alone left BLE's failures invisible — the same blindness
+            // that cost four hardware sessions, moved down one layer.
+            TransportEvent::PipeClosed { peer } => {
+                log::info!("pipe to {peer} closed");
+                self.on_pipe_gone(peer)
+            }
+            TransportEvent::PipeFailed { peer, why } => {
+                log::warn!("pipe to {peer} failed: {why}");
+                self.on_pipe_gone(peer)
             }
             TransportEvent::Received { peer, bytes } => self.on_stream(&peer, &bytes, now),
             TransportEvent::Availability { .. } => vec![NetEvent::PeersChanged],
         }
+    }
+
+    /// A pipe ended, however it ended.
+    fn on_pipe_gone(&self, peer: String) -> Vec<NetEvent> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&peer);
+        // A Ping waiting on a pipe that will never open. Reported here as soon
+        // as we know, rather than waiting out the deadline — this is the case
+        // where the answer is already certain.
+        let dropped_ping = self
+            .pending_pings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&peer)
+            .is_some();
+        self.readers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&peer);
+        let mut out = Vec::new();
+        if dropped_ping {
+            out.push(NetEvent::PingUndeliverable {
+                peer: peer.clone(),
+                why: "could not reach that device".into(),
+            });
+        }
+        if self.sessions.close(&peer) {
+            out.push(NetEvent::SessionClosed { peer });
+        }
+        out
     }
 
     /// A pipe opened. If we know who they are we can start a handshake; if not
