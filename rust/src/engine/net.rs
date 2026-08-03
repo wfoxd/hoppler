@@ -526,8 +526,9 @@ impl Net {
             .insert(peer.to_string(), established.persona.clone());
         // The nearby list reads names off the *sighting*, and only the
         // initiator ever fetches a persona over the discovery channel. Without
-        // this the responder — always the larger id, so always the same phone —
-        // shows a live, session-bearing peer as a nameless tile forever.
+        // this the responder — whichever side drew the larger id this time —
+        // shows a live, session-bearing peer as a nameless tile for as long as
+        // the session lasts.
         self.discovery
             .note_persona(peer, established.persona.clone());
         self.sessions.open(peer, established, now);

@@ -440,8 +440,9 @@ impl Discovery {
     /// Only one side of a pair ever *asks* for a persona: the initiator, which
     /// the tie-break fixes as the smaller id. The responder learns the same
     /// persona from the handshake instead, and had no way to say so, so its
-    /// sighting stayed nameless for the life of the session. Deterministically,
-    /// not intermittently — the larger id always showed the other as unnamed.
+    /// sighting stayed nameless for the life of the session — the side holding
+    /// the larger id, whichever device that happens to be until the next
+    /// rotation deals the ids again.
     ///
     /// What arrives here is *better* attested than what `accept_persona`
     /// verifies. A record off the discovery channel proves only that it was
@@ -451,7 +452,14 @@ impl Discovery {
     ///
     /// A peer with no sighting is left alone: nothing has advertised it, so
     /// there is no tile to name.
-    pub fn note_persona(&self, peer: &str, persona: identity::VerifiedPersona) {
+    ///
+    /// `pub(crate)` deliberately. Unlike [`Self::accept_persona`], which
+    /// verifies bytes, this takes the verdict as a type — and
+    /// `VerifiedPersona` has all-public fields and no private constructor, so
+    /// the name is a claim rather than something the type enforces. Keeping
+    /// this off the public API means the only way in from outside is the one
+    /// that actually checks a signature.
+    pub(crate) fn note_persona(&self, peer: &str, persona: identity::VerifiedPersona) {
         // Recorded first and unconditionally, so a persona that arrives before
         // the advertisement is not lost. Locks are taken one at a time and in
         // this order everywhere; this module has already paid for a lock
