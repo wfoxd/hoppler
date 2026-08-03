@@ -20,6 +20,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelUuid
@@ -171,7 +172,7 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
         } catch (e: SecurityException) {
             // Permission revoked while running. Reported, not crashed.
             fail(result, "unavailable", "permission denied: ${e.message}")
-            emitAvailability(available = false, reason = "permission denied")
+            emitAvailability("Hoppler needs permission to use Bluetooth")
         } catch (e: Exception) {
             fail(result, "io", e.message ?: e.toString())
         }
@@ -284,7 +285,7 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
             }
 
             override fun onScanFailed(errorCode: Int) {
-                emitAvailability(available = false, reason = "scan failed (code $errorCode)")
+                emitAvailability("scan failed (code $errorCode)")
             }
         }
         // Hardware filtering: an unfiltered scan wakes the CPU for every BLE
@@ -486,24 +487,72 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
 
     // ── availability and teardown ───────────────────────────────────────────
 
-    private fun emitAvailability(
-        available: Boolean = adapter?.isEnabled == true,
-        reason: String? = if (adapter?.isEnabled == true) null else "Bluetooth is off"
-    ) {
-        emit(mapOf("type" to "availability", "available" to available, "reason" to reason))
+    /** This device's permission state, as [BlePermissions] sees it. */
+    private fun permissions(): BlePermissions.State = BlePermissions.state {
+        context.checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED
+    }
+
+    /**
+     * Why the radio cannot be used, or `null` if it can.
+     *
+     * Permission is checked before the adapter, and not only because it is the
+     * one the user can do something about: from Android 12 `isEnabled` itself
+     * requires `BLUETOOTH_CONNECT`, so an unpermitted app asking whether
+     * Bluetooth is on is asking a question it has no right to.
+     */
+    private fun unusable(): String? {
+        BlePermissions.reason(permissions())?.let { return it }
+        return if (adapter?.isEnabled == true) null else "Bluetooth is off"
+    }
+
+    /**
+     * Re-report availability. The host calls this when it has changed something
+     * the adapter cannot observe — a permission granted in a dialog, or in
+     * Settings while the app was away. Nothing broadcasts either.
+     */
+    fun refreshAvailability() = emitAvailability()
+
+    /**
+     * Say whether the radio can be used, and if not, why.
+     *
+     * `reason` defaults to the live answer. Pass one only to report something a
+     * re-check would miss: a `SecurityException` that has already happened, or
+     * a `TURNING_OFF` broadcast that arrives before `isEnabled` flips.
+     *
+     * There is deliberately no way to force *available*. Before this checked
+     * permissions, Bluetooth being on was reported as the radio being usable —
+     * which on a device that had never been asked for the three permissions was
+     * simply untrue, and left "nobody is nearby" as the only symptom.
+     */
+    private fun emitAvailability(reason: String? = unusable()) {
+        emit(mapOf("type" to "availability", "available" to (reason == null), "reason" to reason))
     }
 
     private val bluetoothStateReceiver = object : BroadcastReceiver() {
         override fun onReceive(ctx: Context?, intent: Intent?) {
             if (intent?.action != BluetoothAdapter.ACTION_STATE_CHANGED) return
             when (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)) {
-                BluetoothAdapter.STATE_ON -> emitAvailability(true, null)
+                // Recomputed rather than asserted: Bluetooth coming back on a
+                // device that never granted the permissions is not the radio
+                // becoming usable.
+                BluetoothAdapter.STATE_ON -> emitAvailability()
                 BluetoothAdapter.STATE_OFF, BluetoothAdapter.STATE_TURNING_OFF -> {
                     // The radio takes every pipe with it; say so rather than
                     // leaving the core believing in links that no longer exist.
                     pipes.keys.toList().forEach { closePipe(it, report = true) }
                     seen.clear()
-                    emitAvailability(false, "Bluetooth is off")
+                    // The listener goes with them. It is bound to a Bluetooth
+                    // stack that is being torn down, and a stale one is worse
+                    // than none: `startAdvertising` skips opening a listener
+                    // when this is non-null, so the rung would come back
+                    // advertising a PSM nothing is accepting on — a peer that
+                    // is visible and undialable.
+                    runCatching { serverSocket?.close() }
+                    serverSocket = null
+                    localPsm = 0
+                    stopAdvertisingInternal()
+                    scanCallback = null
+                    emitAvailability("Bluetooth is off")
                 }
             }
         }

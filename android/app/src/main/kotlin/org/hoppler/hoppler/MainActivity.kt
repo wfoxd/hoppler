@@ -1,14 +1,26 @@
 package org.hoppler.hoppler
 
 import android.content.Context
+import android.content.pm.PackageManager
 import android.net.wifi.WifiManager
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodChannel
 import org.hoppler.hoppler.ble.BleAdapter
+import org.hoppler.hoppler.ble.BlePermissions
 
 class MainActivity : FlutterActivity() {
+    private companion object {
+        const val BLE_PERMISSION_REQUEST = 1
+
+        /**
+         * Process-scoped, not per-activity: asking again because the activity
+         * was rebuilt is still asking again.
+         */
+        var asked = false
+    }
+
     private var ble: BleAdapter? = null
 
     /**
@@ -47,6 +59,55 @@ class MainActivity : FlutterActivity() {
                 acquire()
             }
         }
+        askForTheRadio()
+    }
+
+    /**
+     * Ask for the Bluetooth permissions, once.
+     *
+     * Nothing asked before this. BLE worked on the two phones it was developed
+     * on because their permissions had been granted by hand over `adb`, and
+     * would have failed on every other device as an empty peer list — the app
+     * has no way to reach the radio and no way to ask for one.
+     *
+     * Once per process rather than once per resume: after a second refusal
+     * Android answers immediately with "denied" and shows no dialog, so asking
+     * on every resume would be a loop the user cannot get out of. A refusal is
+     * answered by an availability event carrying the reason, and a grant made
+     * later in Settings is picked up by the re-check below.
+     *
+     * The reason reaches the core but stops there — `Net` folds availability
+     * into a bare `PeersChanged` and drops it — so a refusal is still an empty
+     * list on screen. Carrying it through is the other half of acceptance
+     * check 6 and is not done here.
+     */
+    private fun askForTheRadio() {
+        val state = BlePermissions.state {
+            checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED
+        }
+        if (state is BlePermissions.State.Missing && !asked) {
+            asked = true
+            requestPermissions(state.permissions.toTypedArray(), BLE_PERMISSION_REQUEST)
+            return
+        }
+        // A grant made in Settings while we were away is invisible to the
+        // adapter — Android broadcasts nothing for it, and the app is
+        // restarted only if a permission is *revoked*. Resume is where it gets
+        // noticed, and the re-arm on the way back through is what actually
+        // starts the radio.
+        ble?.refreshAvailability()
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        // Reported either way, and a grant is the case that matters: it is what
+        // flips the rung to available, which is what re-arms the radio. Without
+        // this the permission is held and nothing has started using it.
+        if (requestCode == BLE_PERMISSION_REQUEST) ble?.refreshAvailability()
     }
 
     override fun onPause() {
