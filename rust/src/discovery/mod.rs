@@ -400,15 +400,36 @@ impl Discovery {
     /// is not skippable by any path that populates the list.
     pub fn accept_persona(&self, peer: &str, wire: &[u8]) -> Result<(), identity::IdentityError> {
         let verified = identity::verify_persona_record(wire)?;
+        self.note_persona(peer, verified);
+        Ok(())
+    }
+
+    /// Record a persona that was verified somewhere else — in practice the
+    /// session handshake.
+    ///
+    /// Only one side of a pair ever *asks* for a persona: the initiator, which
+    /// the tie-break fixes as the smaller id. The responder learns the same
+    /// persona from the handshake instead, and had no way to say so, so its
+    /// sighting stayed nameless for the life of the session. Deterministically,
+    /// not intermittently — the larger id always showed the other as unnamed.
+    ///
+    /// What arrives here is *better* attested than what `accept_persona`
+    /// verifies. A record off the discovery channel proves only that it was
+    /// signed; one that came through the handshake is additionally bound to the
+    /// static key the peer proved possession of, which is the check that closed
+    /// the T10 impersonation hole. So overwriting is an upgrade.
+    ///
+    /// A peer with no sighting is left alone: nothing has advertised it, so
+    /// there is no tile to name.
+    pub fn note_persona(&self, peer: &str, persona: identity::VerifiedPersona) {
         let mut sightings = self
             .inner
             .sightings
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if let Some(sighting) = sightings.get_mut(peer) {
-            sighting.persona = Some(verified);
+            sighting.persona = Some(persona);
         }
-        Ok(())
     }
 }
 

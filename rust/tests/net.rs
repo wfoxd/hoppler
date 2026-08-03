@@ -568,3 +568,61 @@ fn a_second_pipe_opened_does_not_wreck_the_handshake_in_flight() {
         "the Ping did not arrive after a duplicate announcement: {b_events:?}"
     );
 }
+
+/// Both sides must end up able to name the other, not just the one that asked.
+///
+/// Names on the nearby list come from `Discovery`'s sightings, and only the
+/// *initiator* fetches a persona over the discovery channel. The tie-break
+/// fixes the initiator as the smaller id, so before the fix the larger id
+/// showed a live peer — session open, Pings arriving — as a nameless tile, for
+/// the life of the session and every session after it.
+///
+/// Deterministic, which is why the two-phone runs looked inconsistent: whichever
+/// handset drew the larger id that run was the one with the blank tile.
+///
+/// Both directions are asserted because only one of them was ever broken, and a
+/// test that checked the responder alone would not notice the fix breaking the
+/// initiator.
+#[test]
+fn both_sides_learn_the_others_name() {
+    let air = air();
+    let now = Instant::now();
+    let alice = node(&air, "alice", "Alice", now);
+    let bob = node(&air, "bob", "Bob", now);
+
+    // Both advertising and both scanning, so each has a sighting of the other
+    // to carry a name. "alice" < "bob", so Alice initiates and Bob responds.
+    alice.net.discovery().set_enabled(true, now).unwrap();
+    bob.net.discovery().set_enabled(true, now).unwrap();
+    alice.net.discovery().start_scanning().unwrap();
+    bob.net.discovery().start_scanning().unwrap();
+    settle(&alice, &bob, now);
+
+    alice.net.reach(&bob.id).unwrap();
+    let (a_events, b_events) = settle(&alice, &bob, now);
+    assert!(
+        opened_with(&a_events).is_some() && opened_with(&b_events).is_some(),
+        "no session, so this test would prove nothing: {a_events:?} / {b_events:?}"
+    );
+
+    let named = |node: &Node, peer: &str| -> Option<String> {
+        node.net
+            .discovery()
+            .sightings()
+            .into_iter()
+            .find(|s| s.peer == peer)
+            .and_then(|s| s.persona)
+            .map(|p| p.name)
+    };
+
+    assert_eq!(
+        named(&alice, &bob.id).as_deref(),
+        Some("Bob"),
+        "the initiator lost the name it fetched"
+    );
+    assert_eq!(
+        named(&bob, &alice.id).as_deref(),
+        Some("Alice"),
+        "the responder never learned the name, so its tile stays blank forever"
+    );
+}
