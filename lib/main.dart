@@ -21,7 +21,15 @@ Future<void> main() async {
   // late costs latency rather than correctness — but there is no reason to be.
   await HostDispatcher.overBridge().start();
   final dir = await getApplicationSupportDirectory();
-  final persona = await coreInit(supportDir: dir.path);
+  // A BLE-only build for the radio acceptance, selected at build time:
+  //   flutter build apk --debug --dart-define=HOPPLER_RADIO=ble
+  // Default stays LAN, which is what every hardware run so far exercised.
+  // One rung at a time on purpose — with both running, a peer found over Wi-Fi
+  // is indistinguishable from one found over the air.
+  const radio = String.fromEnvironment('HOPPLER_RADIO') == 'ble'
+      ? RadioChoice.ble
+      : RadioChoice.lan;
+  final persona = await coreInit(supportDir: dir.path, radio: radio);
   runApp(HopplerApp(persona: persona));
 }
 

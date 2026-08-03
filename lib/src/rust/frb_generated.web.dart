@@ -63,6 +63,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   HostFact dco_decode_host_fact(dynamic raw);
 
   @protected
+  int dco_decode_i_32(dynamic raw);
+
+  @protected
   PlatformInt64 dco_decode_i_64(dynamic raw);
 
   @protected
@@ -88,6 +91,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   PersonaDto dco_decode_persona_dto(dynamic raw);
+
+  @protected
+  RadioChoice dco_decode_radio_choice(dynamic raw);
 
   @protected
   ThreadSummary dco_decode_thread_summary(dynamic raw);
@@ -142,6 +148,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   HostFact sse_decode_host_fact(SseDeserializer deserializer);
 
   @protected
+  int sse_decode_i_32(SseDeserializer deserializer);
+
+  @protected
   PlatformInt64 sse_decode_i_64(SseDeserializer deserializer);
 
   @protected
@@ -175,6 +184,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   PersonaDto sse_decode_persona_dto(SseDeserializer deserializer);
 
   @protected
+  RadioChoice sse_decode_radio_choice(SseDeserializer deserializer);
+
+  @protected
   ThreadSummary sse_decode_thread_summary(SseDeserializer deserializer);
 
   @protected
@@ -188,9 +200,6 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_decode_unit(SseDeserializer deserializer);
-
-  @protected
-  int sse_decode_i_32(SseDeserializer deserializer);
 
   @protected
   void sse_encode_AnyhowException(
@@ -244,6 +253,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_host_fact(HostFact self, SseSerializer serializer);
 
   @protected
+  void sse_encode_i_32(int self, SseSerializer serializer);
+
+  @protected
   void sse_encode_i_64(PlatformInt64 self, SseSerializer serializer);
 
   @protected
@@ -286,6 +298,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_persona_dto(PersonaDto self, SseSerializer serializer);
 
   @protected
+  void sse_encode_radio_choice(RadioChoice self, SseSerializer serializer);
+
+  @protected
   void sse_encode_thread_summary(ThreadSummary self, SseSerializer serializer);
 
   @protected
@@ -299,9 +314,6 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_unit(void self, SseSerializer serializer);
-
-  @protected
-  void sse_encode_i_32(int self, SseSerializer serializer);
 }
 
 // Section: wire_class

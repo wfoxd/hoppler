@@ -7,6 +7,8 @@ import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 import 'types.dart';
 
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_fields_are_eq`, `clone`, `eq`, `fmt`
+
 String coreVersion() => RustLib.instance.api.crateApiCoreCoreVersion();
 
 /// The core API contract version. Breaking changes to any `crate::api` surface
@@ -15,5 +17,25 @@ String apiVersion() => RustLib.instance.api.crateApiCoreApiVersion();
 
 /// Initialise the core at `support_dir` (the app's private data directory).
 /// Returns the local persona. Call once at startup, before other API calls.
-Future<PersonaDto> coreInit({required String supportDir}) =>
-    RustLib.instance.api.crateApiCoreCoreInit(supportDir: supportDir);
+Future<PersonaDto> coreInit({
+  required String supportDir,
+  required RadioChoice radio,
+}) => RustLib.instance.api.crateApiCoreCoreInit(
+  supportDir: supportDir,
+  radio: radio,
+);
+
+/// Which radio the core should run on.
+///
+/// One rung, not the tech spec §9 ladder — running several at once is T15's
+/// job. The choice exists because the BLE acceptance needs the radio in
+/// isolation: with LAN also running, a peer found over Wi-Fi looks exactly like
+/// one found over the air and the run proves nothing about the radio.
+enum RadioChoice {
+  /// mDNS and TCP. The default, and what every hardware run so far used.
+  lan,
+
+  /// The BLE rung, driven through the host seam. A host dispatcher must be
+  /// attached before `core_init` or every command simply queues.
+  ble,
+}

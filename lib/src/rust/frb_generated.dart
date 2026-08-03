@@ -89,7 +89,10 @@ abstract class RustLibApi extends BaseApi {
 
   Stream<CoreEvent> crateApiEventsCoreEventStream();
 
-  Future<PersonaDto> crateApiCoreCoreInit({required String supportDir});
+  Future<PersonaDto> crateApiCoreCoreInit({
+    required String supportDir,
+    required RadioChoice radio,
+  });
 
   String crateApiCoreCoreVersion();
 
@@ -197,12 +200,16 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       const TaskConstMeta(debugName: "core_event_stream", argNames: ["sink"]);
 
   @override
-  Future<PersonaDto> crateApiCoreCoreInit({required String supportDir}) {
+  Future<PersonaDto> crateApiCoreCoreInit({
+    required String supportDir,
+    required RadioChoice radio,
+  }) {
     return handler.executeNormal(
       NormalTask(
         callFfi: (port_) {
           final serializer = SseSerializer(generalizedFrbRustBinding);
           sse_encode_String(supportDir, serializer);
+          sse_encode_radio_choice(radio, serializer);
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
@@ -215,14 +222,16 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           decodeErrorData: sse_decode_String,
         ),
         constMeta: kCrateApiCoreCoreInitConstMeta,
-        argValues: [supportDir],
+        argValues: [supportDir, radio],
         apiImpl: this,
       ),
     );
   }
 
-  TaskConstMeta get kCrateApiCoreCoreInitConstMeta =>
-      const TaskConstMeta(debugName: "core_init", argNames: ["supportDir"]);
+  TaskConstMeta get kCrateApiCoreCoreInitConstMeta => const TaskConstMeta(
+    debugName: "core_init",
+    argNames: ["supportDir", "radio"],
+  );
 
   @override
   String crateApiCoreCoreVersion() {
@@ -813,6 +822,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  int dco_decode_i_32(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw as int;
+  }
+
+  @protected
   PlatformInt64 dco_decode_i_64(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return dcoDecodeI64(raw);
@@ -879,6 +894,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       colour: dco_decode_u_32(arr[1]),
       version: dco_decode_u_32(arr[2]),
     );
+  }
+
+  @protected
+  RadioChoice dco_decode_radio_choice(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return RadioChoice.values[raw as int];
   }
 
   @protected
@@ -1109,6 +1130,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  int sse_decode_i_32(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return deserializer.buffer.getInt32();
+  }
+
+  @protected
   PlatformInt64 sse_decode_i_64(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return deserializer.buffer.getPlatformInt64();
@@ -1210,6 +1237,13 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  RadioChoice sse_decode_radio_choice(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var inner = sse_decode_i_32(deserializer);
+    return RadioChoice.values[inner];
+  }
+
+  @protected
   ThreadSummary sse_decode_thread_summary(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var var_threadId = sse_decode_i_64(deserializer);
@@ -1243,12 +1277,6 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   @protected
   void sse_decode_unit(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
-  }
-
-  @protected
-  int sse_decode_i_32(SseDeserializer deserializer) {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    return deserializer.buffer.getInt32();
   }
 
   @protected
@@ -1451,6 +1479,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_i_32(int self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    serializer.buffer.putInt32(self);
+  }
+
+  @protected
   void sse_encode_i_64(PlatformInt64 self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     serializer.buffer.putPlatformInt64(self);
@@ -1543,6 +1577,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_radio_choice(RadioChoice self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.index, serializer);
+  }
+
+  @protected
   void sse_encode_thread_summary(ThreadSummary self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_i_64(self.threadId, serializer);
@@ -1571,11 +1611,5 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   @protected
   void sse_encode_unit(void self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
-  }
-
-  @protected
-  void sse_encode_i_32(int self, SseSerializer serializer) {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    serializer.buffer.putInt32(self);
   }
 }

@@ -66,8 +66,30 @@ pub fn emit(event: CoreEvent) {
 
 // ── lifecycle ─────────────────────────────────────────────────────────────────
 
+/// Which rung the core should run on.
+///
+/// Not the tech spec §9 ladder — that runs several rungs at once and is T15's
+/// job. This picks exactly one, because the BLE acceptance needs the radio in
+/// isolation: with LAN also running, a peer found over Wi-Fi is
+/// indistinguishable from one found over the air, and the run would prove
+/// nothing about the radio.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Radio {
+    /// mDNS and TCP. The default, and the only rung with hardware behind it.
+    #[default]
+    Lan,
+    /// The BLE rung, driven through the platform seam. Requires a host
+    /// dispatcher to be attached, or every command queues and nothing happens.
+    Ble,
+}
+
 /// Initialise the core at `support_dir`, returning the local persona.
 pub fn init(support_dir: String) -> Result<PersonaDto, String> {
+    init_on(support_dir, Radio::default())
+}
+
+/// Initialise on a chosen rung.
+pub fn init_on(support_dir: String, radio: Radio) -> Result<PersonaDto, String> {
     let store = open_store(support_dir)?;
     let (tx, rx) = std::sync::mpsc::channel();
     let sink: crate::transport::EventSink = Box::new(move |e| {
@@ -79,9 +101,28 @@ pub fn init(support_dir: String) -> Result<PersonaDto, String> {
     // reports itself unavailable, and every reach fails with a reason — which
     // is what lets the UI say why instead of showing an empty list that reads
     // as "nobody is nearby" (R0-F2).
-    let transport = crate::transport::lan::LanTransport::new(&local_id, sink)
-        .ok()
-        .map(|t| Arc::new(t) as Arc<dyn crate::transport::Transport>);
+    let transport: Option<Arc<dyn crate::transport::Transport>> = match radio {
+        Radio::Lan => crate::transport::lan::LanTransport::new(&local_id, sink)
+            .ok()
+            .map(|t| Arc::new(t) as Arc<dyn crate::transport::Transport>),
+        Radio::Ble => {
+            let bridge = crate::platform::bridge().clone();
+            let radio = crate::platform::ble::HostBleRadio::new(bridge.clone());
+            crate::transport::ble::BleTransport::new(&local_id, Arc::new(radio), sink)
+                .ok()
+                .map(|t| {
+                    // Facts have somewhere to land before any command goes out,
+                    // so a radio that answers immediately is not reporting into
+                    // nothing.
+                    bridge.attach_ble(t.ingress());
+                    Arc::new(t) as Arc<dyn crate::transport::Transport>
+                })
+        }
+    };
+    log::info!(
+        "core starting on the {radio:?} rung (transport built: {})",
+        transport.is_some()
+    );
     install(store, transport, &local_id, rx)
 }
 
