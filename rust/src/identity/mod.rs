@@ -537,7 +537,7 @@ mod tests {
     fn our_own_record_always_verifies_despite_extreme_input() {
         // Normalisation at creation makes an unverifiable local persona
         // unrepresentable: even absurd input yields a record we can verify.
-        let id = Identity::generate(&"x".repeat(500), 0xffff_ffff);
+        let id = Identity::generate("x".repeat(500), 0xffff_ffff);
         let verified = verify_persona_record(&id.persona_record()).unwrap();
         assert!(verified.name.len() <= MAX_PERSONA_NAME_LEN);
         assert_eq!(verified.colour, 0x00ff_ffff);

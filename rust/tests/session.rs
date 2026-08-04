@@ -322,8 +322,10 @@ fn a_responder_impersonating_another_persona_is_caught() {
 #[test]
 fn a_payload_beyond_the_bound_is_refused_rather_than_allocated() {
     // The bound exists so a peer cannot make us allocate on its say-so; the
-    // constant is public so a caller can size its own buffers to match.
-    assert!(MAX_HANDSHAKE_PAYLOAD <= 4096);
+    // constant is public so a caller can size its own buffers to match. Checked
+    // at compile time, because a runtime assert on two constants can only fail
+    // in a build that already compiled.
+    const { assert!(MAX_HANDSHAKE_PAYLOAD <= 4096) };
     let (alice, _, bob_persona) = pair();
     let record = alice.persona_record();
     assert!(
