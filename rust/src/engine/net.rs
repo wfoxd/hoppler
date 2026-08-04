@@ -67,6 +67,16 @@ pub enum NetEvent {
     ChatReceived { peer: PeerId, text: String },
     /// A queued Ping was dropped because the pipe never opened.
     PingUndeliverable { peer: PeerId, why: String },
+    /// The radio became usable or unusable, and why.
+    ///
+    /// Separate from [`NetEvent::PeersChanged`] because an empty list and an
+    /// unusable radio are different facts that look identical on screen. F2
+    /// turns on being able to tell them apart, and the reason is the only thing
+    /// that can: without it "Bluetooth is off" reads as "nobody is nearby".
+    RadioChanged {
+        available: bool,
+        reason: Option<String>,
+    },
 }
 
 /// Everything the engine needs a network for.
@@ -272,7 +282,21 @@ impl Net {
                 self.on_pipe_gone(peer)
             }
             TransportEvent::Received { peer, bytes } => self.on_stream(&peer, &bytes, now),
-            TransportEvent::Availability { .. } => vec![NetEvent::PeersChanged],
+            // Both, and in this order. The reason is what the screen needs;
+            // the list still has to be redrawn, because a radio going down
+            // takes every peer with it. Folding the two together is what threw
+            // the reason away — `TransportEvent::Availability` has always
+            // carried it, and nothing downstream ever saw it.
+            TransportEvent::Availability { available, reason } => {
+                match &reason {
+                    Some(why) => log::info!("radio unavailable: {why}"),
+                    None => log::info!("radio available"),
+                }
+                vec![
+                    NetEvent::RadioChanged { available, reason },
+                    NetEvent::PeersChanged,
+                ]
+            }
         }
     }
 

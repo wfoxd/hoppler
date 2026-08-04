@@ -64,4 +64,15 @@ pub enum CoreEvent {
     },
     /// A transfer finished (or failed).
     TransferCompleted { transfer_id: String, success: bool },
+    /// The radio became usable or unusable.
+    ///
+    /// [`CoreEvent::DiscoveryUpdated`] cannot carry this: an empty device list
+    /// is what both "the radio is off" and "nobody is nearby" look like, and
+    /// R0-F2 turns on the user being able to tell those apart. `reason` is
+    /// `None` when the radio is fine, and a sentence fit to show when it is
+    /// not — the rung writes it, because only the rung knows.
+    RadioChanged {
+        available: bool,
+        reason: Option<String>,
+    },
 }

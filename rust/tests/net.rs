@@ -712,3 +712,79 @@ fn a_persona_learned_before_the_sighting_survives() {
          sighting appeared, leaving a nameless tile above a live session"
     );
 }
+
+/// The radio's reason has to survive the trip, because nothing downstream can
+/// reconstruct it.
+///
+/// `Availability` used to fold into a bare `PeersChanged`, which threw both
+/// fields away — and `TransportEvent::Availability`'s own doc says it exists so
+/// the UI can say "Bluetooth is off" instead of showing an empty list that
+/// reads as "nobody is nearby" (R0-F2). The type promised it and the pipeline
+/// dropped it, which is a thing only an end-to-end assertion catches: every
+/// layer in between compiled perfectly happily.
+#[test]
+fn an_unusable_radio_says_why_and_does_not_just_empty_the_list() {
+    let now = Instant::now();
+    let air = air();
+    let alice = node(&air, "alice", "Alice", now);
+
+    let events = alice.net.handle(
+        TransportEvent::Availability {
+            available: false,
+            reason: Some("Bluetooth is off".into()),
+        },
+        now,
+    );
+
+    let told = events.iter().find_map(|e| match e {
+        NetEvent::RadioChanged { available, reason } => Some((*available, reason.clone())),
+        _ => None,
+    });
+    assert_eq!(
+        told,
+        Some((false, Some("Bluetooth is off".into()))),
+        "the reason the radio is unusable never reached the engine, so the \
+         screen can only show an empty list — which is what being out of \
+         range looks like too"
+    );
+
+    // The list still has to be redrawn: a radio going down takes every peer
+    // with it. Losing this while adding the reason would trade one bug for
+    // another.
+    assert!(
+        events.contains(&NetEvent::PeersChanged),
+        "the nearby list was left stale after the radio went away"
+    );
+}
+
+/// A radio that comes back must clear the sentence, not add to it.
+#[test]
+fn a_radio_that_returns_reports_itself_available_with_no_reason() {
+    let now = Instant::now();
+    let air = air();
+    let alice = node(&air, "alice", "Alice", now);
+
+    alice.net.handle(
+        TransportEvent::Availability {
+            available: false,
+            reason: Some("Bluetooth is off".into()),
+        },
+        now,
+    );
+    let events = alice.net.handle(
+        TransportEvent::Availability {
+            available: true,
+            reason: None,
+        },
+        now,
+    );
+
+    assert!(
+        events.contains(&NetEvent::RadioChanged {
+            available: true,
+            reason: None
+        }),
+        "recovery went unreported, so a screen showing \"Bluetooth is off\" \
+         has nothing to tell it otherwise"
+    );
+}

@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:hoppler/features/nearby/nearby_tile.dart';
+import 'package:hoppler/features/nearby/nearby_view.dart';
 import 'package:hoppler/features/ping/ping_service.dart';
 import 'package:hoppler/src/rust/api/core.dart';
 import 'package:hoppler/src/rust/api/discovery.dart';
@@ -60,6 +61,13 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   bool _discovery = false;
   List<NearbyDevice> _devices = [];
+
+  /// Why the radio cannot be used, or null when it can.
+  ///
+  /// Held apart from [_devices] because an empty list is what "the radio is
+  /// off" and "nobody is nearby" both look like, and R0-F2 turns on the user
+  /// being able to tell those apart.
+  String? _radioReason;
   final List<String> _log = [];
   double? _transfer; // 0..1 while a Drop is in flight
   StreamSubscription<CoreEvent>? _events;
@@ -99,6 +107,13 @@ class _HomePageState extends State<HomePage> {
         case CoreEvent_TransferCompleted(:final success):
           _transfer = null;
           _log.insert(0, success ? 'Drop complete' : 'Drop failed');
+        // `available` decides, not `reason`. Reading the reason alone would
+        // leave a stale sentence on screen when the radio comes back without
+        // one — which is the same lie in the other direction.
+        case CoreEvent_RadioChanged(:final available, :final reason):
+          _radioReason = available
+              ? null
+              : (reason ?? 'The radio is unavailable');
       }
     });
   }
@@ -130,9 +145,11 @@ class _HomePageState extends State<HomePage> {
               child: LinearProgressIndicator(value: _transfer),
             ),
           Expanded(
-            child: _devices.isEmpty
-                ? const Center(child: Text('No one nearby. Turn on Discovery.'))
-                : ListView(children: _devices.map(_deviceTile).toList()),
+            child: NearbyView(
+              radioReason: _radioReason,
+              devices: _devices,
+              tile: (d) => _deviceTile(d as NearbyDevice),
+            ),
           ),
           const Divider(height: 1),
           SizedBox(

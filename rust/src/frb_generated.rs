@@ -735,6 +735,14 @@ impl SseDecode for crate::api::types::CoreEvent {
                     success: var_success,
                 };
             }
+            6 => {
+                let mut var_available = <bool>::sse_decode(deserializer);
+                let mut var_reason = <Option<String>>::sse_decode(deserializer);
+                return crate::api::types::CoreEvent::RadioChanged {
+                    available: var_available,
+                    reason: var_reason,
+                };
+            }
             _ => {
                 unimplemented!("");
             }
@@ -1151,6 +1159,12 @@ impl flutter_rust_bridge::IntoDart for crate::api::types::CoreEvent {
                 success.into_into_dart().into_dart(),
             ]
             .into_dart(),
+            crate::api::types::CoreEvent::RadioChanged { available, reason } => [
+                6.into_dart(),
+                available.into_into_dart().into_dart(),
+                reason.into_into_dart().into_dart(),
+            ]
+            .into_dart(),
             _ => {
                 unimplemented!("");
             }
@@ -1446,6 +1460,11 @@ impl SseEncode for crate::api::types::CoreEvent {
                 <i32>::sse_encode(5, serializer);
                 <String>::sse_encode(transfer_id, serializer);
                 <bool>::sse_encode(success, serializer);
+            }
+            crate::api::types::CoreEvent::RadioChanged { available, reason } => {
+                <i32>::sse_encode(6, serializer);
+                <bool>::sse_encode(available, serializer);
+                <Option<String>>::sse_encode(reason, serializer);
             }
             _ => {
                 unimplemented!("");

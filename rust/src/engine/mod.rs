@@ -515,6 +515,9 @@ fn on_net_event(net: &Arc<net::Net>, event: net::NetEvent) {
                 name: persona_name,
             });
         }
+        net::NetEvent::RadioChanged { available, reason } => {
+            emit(CoreEvent::RadioChanged { available, reason });
+        }
         net::NetEvent::PingUndeliverable { peer, why } => {
             emit(CoreEvent::PingFailed {
                 device_id: peer,

@@ -89,6 +89,18 @@ sealed class CoreEvent with _$CoreEvent {
     required String transferId,
     required bool success,
   }) = CoreEvent_TransferCompleted;
+
+  /// The radio became usable or unusable.
+  ///
+  /// [`CoreEvent::DiscoveryUpdated`] cannot carry this: an empty device list
+  /// is what both "the radio is off" and "nobody is nearby" look like, and
+  /// R0-F2 turns on the user being able to tell those apart. `reason` is
+  /// `None` when the radio is fine, and a sentence fit to show when it is
+  /// not — the rung writes it, because only the rung knows.
+  const factory CoreEvent.radioChanged({
+    required bool available,
+    String? reason,
+  }) = CoreEvent_RadioChanged;
 }
 
 /// A device visible in Discovery.
