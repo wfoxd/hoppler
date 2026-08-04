@@ -807,6 +807,47 @@ mod tests {
         );
     }
 
+    /// Transfers follow the conversation, and do not come adrift of it.
+    ///
+    /// `transfers.thread_id` is `ON DELETE SET NULL`, so a merge that forgot to
+    /// move them would not fail — it would silently null them out when the old
+    /// thread went, and a Drop would survive with no conversation to belong to.
+    /// A regression here is invisible without this assertion.
+    #[test]
+    fn merging_moves_the_transfers_too() {
+        let (s, _d) = store();
+        let known = s.add_contact(&a_contact()).unwrap();
+        let known_thread = s.create_thread(known, 1000).unwrap();
+        let stray = s
+            .add_contact(&NewContact {
+                l1_pub: [8u8; 32],
+                ..a_contact()
+            })
+            .unwrap();
+        let stray_thread = s.create_thread(stray, 2000).unwrap();
+        let transfer = s
+            .add_transfer(&NewTransfer {
+                thread_id: Some(stray_thread),
+                direction: Direction::Incoming,
+                name: "photo.jpg".into(),
+                size: 10,
+                mime: "image/jpeg".into(),
+                state: TransferState::Offered,
+                root_hash: [3u8; 32],
+                chunk_bitmap: vec![0u8],
+                created_at: 2000,
+            })
+            .unwrap();
+
+        s.merge_contact(stray, known).unwrap();
+
+        assert_eq!(
+            s.transfer_by_id(transfer).unwrap().unwrap().thread_id,
+            Some(known_thread),
+            "the transfer was left on the old thread or nulled out with it"
+        );
+    }
+
     /// A stray with no thread of its own still has to stop existing.
     #[test]
     fn merging_moves_a_lone_thread_rather_than_dropping_it() {
