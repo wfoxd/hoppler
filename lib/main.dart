@@ -145,10 +145,10 @@ class _HomePageState extends State<HomePage> {
               child: LinearProgressIndicator(value: _transfer),
             ),
           Expanded(
-            child: NearbyView(
+            child: NearbyView<NearbyDevice>(
               radioReason: _radioReason,
               devices: _devices,
-              tile: (d) => _deviceTile(d as NearbyDevice),
+              tile: _deviceTile,
             ),
           ),
           const Divider(height: 1),

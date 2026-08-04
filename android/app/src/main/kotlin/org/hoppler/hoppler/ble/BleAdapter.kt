@@ -135,13 +135,18 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
          * and no reviewer should have to.
          */
         fun linkFailureReason(gattLinks: Int): String = when {
-            // -1 is the adapter failing to count at all; inventing "0 in use"
+            // -1 is the adapter failing to count at all; inventing "0 open"
             // from that would be a number we do not have.
             gattLinks < 0 -> "Could not open a Bluetooth connection."
+            // "around $CROWDED_LINKS", never "the limit". The real ceiling is
+            // not readable from an app and differs by device, so stating it as
+            // fact would be false on any phone with a larger pool — and at, say,
+            // twenty open it would be absurd on its face. The measured count is
+            // ours to assert; the ceiling is not.
             gattLinks >= CROWDED_LINKS ->
                 "Could not open a Bluetooth connection. This phone already has " +
-                    "$gattLinks open, which is as many as Android allows — " +
-                    "turning Bluetooth off and on again frees them."
+                    "$gattLinks open, and Android usually allows around " +
+                    "$CROWDED_LINKS — turning Bluetooth off and on again frees them."
             else -> "Could not open a Bluetooth connection ($gattLinks already open)."
         }
     }

@@ -10,7 +10,10 @@ import 'package:flutter/material.dart';
 /// while Bluetooth is off tells the user something false about the world around
 /// them. The reason therefore wins whenever there is one, even if devices are
 /// still listed from before the radio went away.
-class NearbyView extends StatelessWidget {
+/// Generic in the device type so the caller keeps its own: a `List<Object>`
+/// here would push a down-cast back onto `HomePage`, and a cast is a mistake
+/// that waits until runtime to happen.
+class NearbyView<T> extends StatelessWidget {
   const NearbyView({
     super.key,
     required this.radioReason,
@@ -23,11 +26,11 @@ class NearbyView extends StatelessWidget {
 
   /// The devices last reported. May be non-empty even with [radioReason] set:
   /// the radio can go down before the list is cleared.
-  final List<Object> devices;
+  final List<T> devices;
 
-  /// How to draw one device. Kept as a callback so this widget needs nothing
-  /// from the bridge, which is what lets it be tested at all.
-  final Widget Function(Object device) tile;
+  /// How to draw one device. A callback so this widget needs nothing from the
+  /// bridge, which is what lets it be tested at all.
+  final Widget Function(T device) tile;
 
   static const emptyText = 'No one nearby. Turn on Discovery.';
 

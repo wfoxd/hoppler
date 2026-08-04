@@ -28,8 +28,25 @@ class LinkFailureReasonTest {
 
     @Test
     fun `the threshold is where the observed failure was total`() {
-        assertTrue("seven is full", reason(7).contains("as many as Android allows"))
-        assertFalse("six is not", reason(6).contains("as many as Android allows"))
+        assertTrue("seven is full", reason(7).contains("usually allows"))
+        assertFalse("six is not", reason(6).contains("usually allows"))
+    }
+
+    @Test
+    fun `the ceiling is offered as typical, never asserted as the limit`() {
+        // The real maximum is not readable from an app and differs by device.
+        // Stating it as fact would be false on any phone with a larger pool,
+        // and at twenty open it would be absurd on its face — which is the
+        // overclaim this whole rung keeps producing.
+        for (links in listOf(7, 8, 20)) {
+            val said = reason(links)
+            assertTrue("the measured count is ours to assert", said.contains("$links"))
+            assertTrue("the ceiling is hedged", said.contains("usually allows around"))
+            assertFalse(
+                "a device with a bigger pool would be told something false",
+                said.contains("as many as Android allows")
+            )
+        }
     }
 
     @Test
@@ -38,7 +55,7 @@ class LinkFailureReasonTest {
         assertFalse(
             "claiming exhaustion at zero links would send the reader after the " +
                 "wrong cause, which is exactly what this message exists to stop",
-            said.contains("as many as Android allows")
+            said.contains("usually allows")
         )
         assertTrue(said.contains("0 already open"))
     }

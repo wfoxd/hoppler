@@ -4,7 +4,7 @@ import 'package:hoppler/features/nearby/nearby_view.dart';
 
 Widget _wrap(Widget child) => MaterialApp(home: Scaffold(body: child));
 
-Widget _tile(Object d) => ListTile(key: ValueKey(d), title: Text('$d'));
+Widget _tile(String d) => ListTile(key: ValueKey(d), title: Text(d));
 
 void main() {
   testWidgets('an unusable radio says why instead of claiming the room is empty', (
@@ -12,7 +12,7 @@ void main() {
   ) async {
     await tester.pumpWidget(
       _wrap(
-        const NearbyView(
+        const NearbyView<String>(
           radioReason: 'Bluetooth is off',
           devices: [],
           tile: _tile,
@@ -32,7 +32,7 @@ void main() {
   ) async {
     await tester.pumpWidget(
       _wrap(
-        const NearbyView(
+        const NearbyView<String>(
           radioReason: 'Bluetooth is off',
           devices: ['alice', 'bob'],
           tile: _tile,
@@ -49,7 +49,7 @@ void main() {
 
   testWidgets('a working radio with nobody about still says so', (tester) async {
     await tester.pumpWidget(
-      _wrap(const NearbyView(radioReason: null, devices: [], tile: _tile)),
+      _wrap(const NearbyView<String>(radioReason: null, devices: [], tile: _tile)),
     );
 
     expect(find.text(NearbyView.emptyText), findsOneWidget);
@@ -58,7 +58,7 @@ void main() {
   testWidgets('a working radio lists what it found', (tester) async {
     await tester.pumpWidget(
       _wrap(
-        const NearbyView(
+        const NearbyView<String>(
           radioReason: null,
           devices: ['alice', 'bob'],
           tile: _tile,
