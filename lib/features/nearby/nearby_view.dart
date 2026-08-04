@@ -1,5 +1,17 @@
 import 'package:flutter/material.dart';
 
+/// The sentence to show for a radio report, or null when the radio is fine.
+///
+/// `available` decides; `reason` only supplies the words. Deciding from the
+/// reason instead gets the state backwards in both directions — an unavailable
+/// radio with nothing to say reads as working, and a recovery that arrives
+/// carrying a stale reason leaves the old sentence on screen.
+///
+/// A pure function so that rule is testable. It was stated in a comment and
+/// got written the wrong way round one file over, in the same change.
+String? radioReasonFrom({required bool available, String? reason}) =>
+    available ? null : (reason ?? 'The radio is unavailable');
+
 /// What fills the nearby area: the devices, or the reason there are none.
 ///
 /// Split out of `HomePage` so the one rule that matters here can be tested

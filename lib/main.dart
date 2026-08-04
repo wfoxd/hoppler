@@ -107,13 +107,8 @@ class _HomePageState extends State<HomePage> {
         case CoreEvent_TransferCompleted(:final success):
           _transfer = null;
           _log.insert(0, success ? 'Drop complete' : 'Drop failed');
-        // `available` decides, not `reason`. Reading the reason alone would
-        // leave a stale sentence on screen when the radio comes back without
-        // one — which is the same lie in the other direction.
         case CoreEvent_RadioChanged(:final available, :final reason):
-          _radioReason = available
-              ? null
-              : (reason ?? 'The radio is unavailable');
+          _radioReason = radioReasonFrom(available: available, reason: reason);
       }
     });
   }

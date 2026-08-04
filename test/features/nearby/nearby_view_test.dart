@@ -7,6 +7,8 @@ Widget _wrap(Widget child) => MaterialApp(home: Scaffold(body: child));
 Widget _tile(String d) => ListTile(key: ValueKey(d), title: Text(d));
 
 void main() {
+  _radioReasonGroup();
+
   testWidgets('an unusable radio says why instead of claiming the room is empty', (
     tester,
   ) async {
@@ -69,5 +71,26 @@ void main() {
     expect(find.text('alice'), findsOneWidget);
     expect(find.text('bob'), findsOneWidget);
     expect(find.text(NearbyView.emptyText), findsNothing);
+  });
+}
+
+void _radioReasonGroup() {
+  group('radioReasonFrom', () {
+    test('an unavailable radio with nothing to say is still unavailable', () {
+      // The case that was written the wrong way round in Rust in this same
+      // change: deciding from the reason reads this as a working radio.
+      expect(radioReasonFrom(available: false, reason: null), isNotNull);
+    });
+
+    test('a recovery clears the sentence even carrying a stale reason', () {
+      expect(radioReasonFrom(available: true, reason: 'Bluetooth is off'), isNull);
+    });
+
+    test('a reason is used when there is one', () {
+      expect(
+        radioReasonFrom(available: false, reason: 'Bluetooth is off'),
+        'Bluetooth is off',
+      );
+    });
   });
 }

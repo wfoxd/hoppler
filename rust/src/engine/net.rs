@@ -288,10 +288,7 @@ impl Net {
             // the reason away — `TransportEvent::Availability` has always
             // carried it, and nothing downstream ever saw it.
             TransportEvent::Availability { available, reason } => {
-                match &reason {
-                    Some(why) => log::info!("radio unavailable: {why}"),
-                    None => log::info!("radio available"),
-                }
+                log::info!("{}", radio_log(available, reason.as_deref()));
                 vec![
                     NetEvent::RadioChanged { available, reason },
                     NetEvent::PeersChanged,
@@ -641,5 +638,41 @@ impl Net {
     /// binds to.
     pub fn pseudonym(&self, peer: &str) -> Option<dh::DhPublic> {
         self.sessions.pseudonym(peer)
+    }
+}
+
+/// What to log for a radio report.
+///
+/// `available` decides, never `reason`. Keying off the reason instead reads an
+/// unavailable radio with nothing to say as "radio available" — writing the
+/// opposite of the truth into the one place a diagnosis starts from. That is
+/// the availability lie again, in the log this time, and it went in one file
+/// away from the Dart handler that states the rule correctly.
+fn radio_log(available: bool, reason: Option<&str>) -> String {
+    match (available, reason) {
+        (true, _) => "radio available".to_string(),
+        (false, Some(why)) => format!("radio unavailable: {why}"),
+        (false, None) => "radio unavailable".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::radio_log;
+
+    #[test]
+    fn availability_is_read_from_the_flag_and_never_from_the_reason() {
+        // The case that was wrong: unavailable, with nothing to say about it.
+        assert_eq!(radio_log(false, None), "radio unavailable");
+        // And its mirror, which a reason-keyed check also gets backwards.
+        assert_eq!(radio_log(true, Some("stale")), "radio available");
+    }
+
+    #[test]
+    fn a_reason_is_carried_when_there_is_one() {
+        assert_eq!(
+            radio_log(false, Some("Bluetooth is off")),
+            "radio unavailable: Bluetooth is off"
+        );
     }
 }
