@@ -497,7 +497,21 @@ fn require_net() -> Result<Arc<net::Net>, String> {
 /// persisting. Runs on the pump thread, never while the store lock is held.
 fn on_net_event(net: &Arc<net::Net>, event: net::NetEvent) {
     match event {
-        net::NetEvent::PeersChanged | net::NetEvent::SessionOpened { .. } => {
+        net::NetEvent::PeersChanged => {
+            if let Ok(devices) = nearby_devices() {
+                emit(CoreEvent::DiscoveryUpdated { devices });
+            }
+        }
+        net::NetEvent::SessionOpened { peer, .. } => {
+            // The moment the peer is proved is the moment a row keyed on their
+            // rotating id can be moved onto the real one. Doing it only on the
+            // next send or receive would leave the UI opening a conversation by
+            // device id and landing on a thread that is about to be folded into
+            // another. Creates nothing, so a peer who says nothing still leaves
+            // no trace.
+            if let Err(why) = with_core_mut(|core| reconcile_contact(core, &peer)) {
+                log::warn!("could not reconcile the contact for {peer}: {why}");
+            }
             if let Ok(devices) = nearby_devices() {
                 emit(CoreEvent::DiscoveryUpdated { devices });
             }
@@ -608,52 +622,57 @@ fn contact_id_for_device(core: &Core, device_id: &str) -> Result<Option<i64>, St
 ///
 /// The device id is still the fallback, because before a session it is
 /// genuinely all there is — a chat can be sent to someone not yet connected.
-/// A row opened that way does not stay there:
+/// A row opened that way does not stay there: [`reconcile_contact`] moves it,
+/// either by re-keying it or by folding it into the row that already holds the
+/// real key. Without that, the split would only have moved from every twelve
+/// minutes to once, which is a quieter bug rather than no bug.
 ///
-/// - alone, it is re-keyed onto the pseudonym ([`Store::rekey_contact`]);
-/// - beside an existing one, it is folded into it ([`Store::merge_contact`]),
-///   which is the case where the person was already known and their id had
-///   rotated in between.
+/// Reconciliation runs here **and** from the session-open event, so it does not
+/// wait for the next send: a UI opening a conversation by device id would
+/// otherwise land on a thread about to be folded into another.
+/// Move a device-id-keyed row onto the pseudonym now that one is proved.
 ///
-/// Without both, the split would only have moved from every twelve minutes to
-/// once, which is a quieter bug rather than no bug.
-fn ensure_contact(core: &Core, device_id: &str, now: i64) -> Result<i64, StoreError> {
-    let by_id = fake::fake_l1_pub(device_id);
-    let by_session = pseudonym_of(core, device_id);
-
-    let key = match by_session {
-        Some(real) => {
-            // Both keys are looked up before either is acted on. A row can
-            // exist under each at once: we knew this person from an earlier
-            // session, their id then rotated, and a message was queued to the
-            // new id before the next session proved it was them. Returning on
-            // the first match would leave that second row stranded — the split
-            // conversation this whole function exists to prevent, just arrived
-            // at from a different direction.
-            let known = core.store.contact_by_l1(&real)?.map(|c| c.id);
-            let stray = core.store.contact_by_l1(&by_id)?.map(|c| c.id);
-            match (known, stray) {
-                (Some(known), Some(stray)) => {
-                    // Re-keying cannot help: the real key is already taken.
-                    core.store.merge_contact(stray, known)?;
-                    return Ok(known);
-                }
-                (Some(known), None) => return Ok(known),
-                (None, Some(stray)) => {
-                    core.store.rekey_contact(stray, &real)?;
-                    return Ok(stray);
-                }
-                (None, None) => real,
-            }
-        }
-        None => {
-            if let Some(c) = core.store.contact_by_l1(&by_id)? {
-                return Ok(c.id);
-            }
-            by_id
-        }
+/// **Creates nothing.** Run from the session-open event, so it meets peers the
+/// user has never written to, and this module promises that "a device that
+/// connects and says nothing leaves no trace beyond the transport's own
+/// bookkeeping". A reconcile that inserted would break exactly that.
+///
+/// Both keys can hold a row at once — the person was known from an earlier
+/// session, their id rotated, and something was written to the new id before
+/// the next session proved it was them — so this either re-keys the stray or
+/// folds it into the row that already owns the real key.
+fn reconcile_contact(core: &Core, device_id: &str) -> Result<(), StoreError> {
+    let Some(real) = pseudonym_of(core, device_id) else {
+        return Ok(());
     };
+    let Some(stray) = core
+        .store
+        .contact_by_l1(&fake::fake_l1_pub(device_id))?
+        .map(|c| c.id)
+    else {
+        return Ok(());
+    };
+    match core.store.contact_by_l1(&real)?.map(|c| c.id) {
+        // Re-keying cannot help: the real key is already taken.
+        Some(known) => core.store.merge_contact(stray, known)?,
+        None => {
+            core.store.rekey_contact(stray, &real)?;
+        }
+    }
+    Ok(())
+}
 
+fn ensure_contact(core: &Core, device_id: &str, now: i64) -> Result<i64, StoreError> {
+    // Reconcile first, so the lookup below cannot find the stale row and hand
+    // back a thread that is about to be folded into another.
+    reconcile_contact(core, device_id)?;
+    if let Some(id) = contact_id_for_device(core, device_id)? {
+        return Ok(id);
+    }
+
+    // Nothing on file. Prefer the durable key if a session has proved one;
+    // otherwise the device id, which `reconcile_contact` will move later.
+    let key = pseudonym_of(core, device_id).unwrap_or_else(|| fake::fake_l1_pub(device_id));
     let (name, colour) = fake::peer(device_id)
         .map(|p| (p.name.to_owned(), p.colour))
         .unwrap_or_else(|| ("Unknown".into(), 0));

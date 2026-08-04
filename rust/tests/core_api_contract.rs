@@ -441,3 +441,47 @@ fn a_thread_survives_the_peers_device_id_rotating() {
         "history did not follow the person across the rotation: {texts:?}"
     );
 }
+
+/// The session reconciles the contact — the next message does not have to.
+///
+/// A chat can be written before anyone has proved who they are, and that row
+/// lands under the device id. Reconciling only on the *next* send or receive
+/// would leave a window where the UI opens a conversation by device id and
+/// lands on a thread that is about to be folded into another.
+///
+/// The rotation at the end is what makes this observable: after reconciling,
+/// the row is keyed on the pseudonym, so it is findable under an id it was
+/// never written with. Lazily reconciled, it would still be under the old id
+/// and this lookup would come back empty.
+#[test]
+fn a_session_reconciles_a_contact_written_before_it() {
+    let _g = LOCK.lock().unwrap();
+    let h = fresh();
+    set_discovery(true).unwrap();
+
+    // No session yet, so this row can only be keyed on the id.
+    let _ = send_chat("wanda-before".into(), "queued before we met".into());
+    let thread = thread_for_device("wanda-before".into())
+        .unwrap()
+        .expect("the pre-session row was not written at all");
+
+    let wanda = Arc::new(Mutex::new(Identity::generate("Wanda", 0x00_88_ff)));
+    let before = session_peer(&h.air, "wanda-before", wanda.clone());
+    until_session(&before);
+
+    // Deliberately no send here: the session alone has to have moved the row.
+    let after = session_peer(&h.air, "wanda-after", wanda.clone());
+    until_session(&after);
+
+    assert_eq!(
+        thread_for_device("wanda-after".into()).unwrap(),
+        Some(thread),
+        "the conversation was not findable under the rotated id, so the row \
+         was still keyed on the id it was written with"
+    );
+    assert_eq!(
+        list_threads().unwrap().len(),
+        1,
+        "reconciling left more than one conversation for one person"
+    );
+}

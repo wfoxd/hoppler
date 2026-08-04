@@ -275,6 +275,15 @@ impl Store {
         if from == into {
             return Ok(());
         }
+        // Checked, not assumed. With no thread on `from` nothing below touches
+        // a foreign key, so a bad `into` would sail through to the DELETE and
+        // this would quietly destroy the source contact instead of merging it —
+        // the one outcome worse than the duplicate.
+        if self.contact_by_id(into)?.is_none() {
+            return Err(StoreError::Db(format!(
+                "cannot merge contact {from} into {into}: no such contact"
+            )));
+        }
         let tx = self.conn.unchecked_transaction()?;
         match (
             self.thread_for_contact(from)?,
@@ -810,18 +819,20 @@ mod tests {
         assert!(s.contact_by_id(stray).unwrap().is_none());
     }
 
-    /// A merge that cannot complete leaves the contact standing.
+    /// Merging into a contact that is not there is refused, not half-done.
     ///
-    /// **This does not exercise the rollback.** In this path the failing
-    /// statement is the first one that would mutate anything, so `?` alone
-    /// produces the same result and the test would pass without the
-    /// transaction. It is kept because the error path is worth pinning — a
-    /// merge that deleted the contact and then failed would lose a person —
-    /// but the atomicity of the multi-statement path is argued, not proven:
-    /// nothing in this API can fail part-way through on demand. Said plainly
-    /// so the next reader does not take a green tick for a guarantee.
+    /// This was the review's catch and it was a data-loss bug: with no thread
+    /// on the source, nothing in the merge touched a foreign key, so a bad
+    /// destination sailed through to the DELETE and destroyed the source row.
+    ///
+    /// **It does not exercise the rollback.** The check now fires before the
+    /// transaction opens, so `?` alone gives the same result and this would
+    /// pass without it. Atomicity of the multi-statement path is argued, not
+    /// proven — nothing in this API can be made to fail part-way through on
+    /// demand — and that is said here so a green tick is not read as a
+    /// guarantee it does not give.
     #[test]
-    fn a_merge_into_a_contact_that_is_not_there_fails_without_damage() {
+    fn merging_into_a_contact_that_is_not_there_is_refused() {
         let (s, _d) = store();
         let stray = s.add_contact(&a_contact()).unwrap();
         let thread = s.create_thread(stray, 1000).unwrap();
