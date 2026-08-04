@@ -572,17 +572,6 @@ fn with_core_mut<T>(f: impl FnOnce(&mut Core) -> Result<T, StoreError>) -> Resul
 }
 
 /// Find or create the contact + thread for a (fake) device.
-/// Find or create the thread for a device, **still keyed by a fake Layer-1 derived from
-/// the device id — which is now wrong in a way that matters: a device id is an ephemeral radio id and
-/// rotates every twelve minutes, so a conversation would fragment into a new
-/// thread each rotation and the old one would be unreachable.
-///
-/// The right key is the pseudonym the session *proves*
-/// ([`net::Net::pseudonym`]) — stable toward us for the life of the device
-/// (R0-F10) and exactly what a block binds to. That change needs the session to
-/// exist before the thread does, which inverts the current order in
-/// `send_chat`, so it is left for T11/T12 where threads become persistent
-/// rather than smuggled in here.
 /// The contact this device belongs to, created or adopted as needed.
 ///
 /// Keyed on the peer's session pseudonym — its static DH public, which the
@@ -630,16 +619,28 @@ fn ensure_contact(core: &Core, device_id: &str, now: i64) -> Result<i64, StoreEr
 
     let key = match by_session {
         Some(real) => {
-            if let Some(c) = core.store.contact_by_l1(&real)? {
-                return Ok(c.id);
+            // Both keys are looked up before either is acted on. A row can
+            // exist under each at once: we knew this person from an earlier
+            // session, their id then rotated, and a message was queued to the
+            // new id before the next session proved it was them. Returning on
+            // the first match would leave that second row stranded — the split
+            // conversation this whole function exists to prevent, just arrived
+            // at from a different direction.
+            let known = core.store.contact_by_l1(&real)?.map(|c| c.id);
+            let stray = core.store.contact_by_l1(&by_id)?.map(|c| c.id);
+            match (known, stray) {
+                (Some(known), Some(stray)) => {
+                    // Re-keying cannot help: the real key is already taken.
+                    core.store.merge_contact(stray, known)?;
+                    return Ok(known);
+                }
+                (Some(known), None) => return Ok(known),
+                (None, Some(stray)) => {
+                    core.store.rekey_contact(stray, &real)?;
+                    return Ok(stray);
+                }
+                (None, None) => real,
             }
-            // Same peer: `by_id` is derived from the id this session is with.
-            // Checked after the real key so the UNIQUE on l1_pub cannot be hit.
-            if let Some(c) = core.store.contact_by_l1(&by_id)? {
-                core.store.rekey_contact(c.id, &real)?;
-                return Ok(c.id);
-            }
-            real
         }
         None => {
             if let Some(c) = core.store.contact_by_l1(&by_id)? {

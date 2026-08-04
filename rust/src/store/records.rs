@@ -252,6 +252,56 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// Fold one contact into another: its messages, its transfers, then the row.
+    ///
+    /// Needed when the same person has been written down twice — once under a
+    /// durable key and once under a device id, because a message was queued
+    /// after the id rotated but before the next session proved who they were.
+    /// Re-keying cannot help there: the destination key is already taken, so
+    /// without this the older conversation is simply orphaned.
+    ///
+    /// Messages are renumbered to continue the destination's `seq` per
+    /// direction rather than keeping their own. `messages_for_thread` orders by
+    /// `(seq, id)`, so two runs of 1, 2, 3 would interleave — the two halves of
+    /// one conversation shuffled together instead of the newer following the
+    /// older.
+    pub fn merge_contact(&self, from: i64, into: i64) -> Result<(), StoreError> {
+        if from == into {
+            return Ok(());
+        }
+        match (
+            self.thread_for_contact(from)?,
+            self.thread_for_contact(into)?,
+        ) {
+            (Some(from_thread), Some(into_thread)) => {
+                for dir in [Direction::Incoming, Direction::Outgoing] {
+                    let offset = self.next_seq(into_thread, dir)? - 1;
+                    self.conn.execute(
+                        "UPDATE messages SET thread_id = ?1, seq = seq + ?2
+                         WHERE thread_id = ?3 AND direction = ?4",
+                        params![into_thread, offset, from_thread, dir.to_i64()],
+                    )?;
+                }
+                self.conn.execute(
+                    "UPDATE transfers SET thread_id = ?1 WHERE thread_id = ?2",
+                    params![into_thread, from_thread],
+                )?;
+            }
+            // Nothing to merge into: move the whole thread across rather than
+            // letting the cascade take it with the contact.
+            (Some(from_thread), None) => {
+                self.conn.execute(
+                    "UPDATE threads SET contact_id = ?1 WHERE id = ?2",
+                    params![into, from_thread],
+                )?;
+            }
+            (None, _) => {}
+        }
+        self.conn
+            .execute("DELETE FROM contacts WHERE id = ?1", params![from])?;
+        Ok(())
+    }
+
     /// Update a contact's persona fields (their name/colour/version changed via
     /// a persona record). Returns whether a row matched.
     pub fn update_contact_persona(
@@ -676,6 +726,80 @@ mod tests {
             1,
             "history written before the session was lost"
         );
+    }
+
+    /// Merging keeps both halves of the conversation, in order.
+    ///
+    /// The case: we knew someone, their device id rotated, a message was queued
+    /// to the new id before the next session proved who they were, and now one
+    /// person holds two rows. Re-keying cannot fix it — the real key is taken —
+    /// so the stray has to be folded in.
+    #[test]
+    fn merging_a_contact_keeps_both_halves_in_order() {
+        let (s, _d) = store();
+        let known = s.add_contact(&a_contact()).unwrap();
+        let known_thread = s.create_thread(known, 1000).unwrap();
+        let stray = s
+            .add_contact(&NewContact {
+                l1_pub: [8u8; 32],
+                ..a_contact()
+            })
+            .unwrap();
+        let stray_thread = s.create_thread(stray, 2000).unwrap();
+
+        for (thread, text) in [(known_thread, "older"), (stray_thread, "newer")] {
+            let seq = s.next_seq(thread, Direction::Outgoing).unwrap();
+            s.add_message(&NewMessage {
+                thread_id: thread,
+                seq,
+                msg_id: text.as_bytes().to_vec(),
+                body: text.as_bytes().to_vec(),
+                direction: Direction::Outgoing,
+                state: MessageState::Sent,
+                created_at: 1000,
+            })
+            .unwrap();
+        }
+        // Both start at seq 1, which is exactly what would interleave.
+        s.merge_contact(stray, known).unwrap();
+
+        assert!(
+            s.contact_by_id(stray).unwrap().is_none(),
+            "the stray row outlived the merge, so the person is still two people"
+        );
+        let texts: Vec<String> = s
+            .messages_for_thread(known_thread)
+            .unwrap()
+            .into_iter()
+            .map(|m| String::from_utf8(m.body).unwrap())
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["older".to_string(), "newer".to_string()],
+            "the newer half did not follow the older; ordering is by (seq, id), \
+             so reused seq numbers shuffle one conversation together"
+        );
+    }
+
+    /// A stray with no thread of its own still has to stop existing.
+    #[test]
+    fn merging_moves_a_lone_thread_rather_than_dropping_it() {
+        let (s, _d) = store();
+        let known = s.add_contact(&a_contact()).unwrap();
+        let stray = s
+            .add_contact(&NewContact {
+                l1_pub: [8u8; 32],
+                ..a_contact()
+            })
+            .unwrap();
+        let stray_thread = s.create_thread(stray, 2000).unwrap();
+
+        // The destination has no thread, so the cascade would take this one
+        // with the deleted contact if it were not moved across first.
+        s.merge_contact(stray, known).unwrap();
+
+        assert_eq!(s.thread_for_contact(known).unwrap(), Some(stray_thread));
+        assert!(s.contact_by_id(stray).unwrap().is_none());
     }
 
     #[test]
