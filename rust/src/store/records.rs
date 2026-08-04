@@ -233,6 +233,101 @@ impl Store {
             .transpose()
     }
 
+    /// Move a contact onto a different Layer-1 key, keeping its id, thread and
+    /// history.
+    ///
+    /// Needed because a contact can be created before there is anything durable
+    /// to name it by. A device id is all that exists until a session does, and
+    /// R0-F2 rotates that every twelve minutes — so a row first keyed on the id
+    /// has to be adopted onto the real key rather than left behind, or one
+    /// person ends up as two contacts with the conversation split between them.
+    ///
+    /// `l1_pub` is UNIQUE, so the caller must have established that no row
+    /// already holds `new_l1`; this reports a match rather than deciding.
+    pub fn rekey_contact(&self, id: i64, new_l1: &[u8; 32]) -> Result<bool, StoreError> {
+        let n = self.conn.execute(
+            "UPDATE contacts SET l1_pub = ?1 WHERE id = ?2",
+            params![&new_l1[..], id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Fold one contact into another: its messages, its transfers, then the row.
+    ///
+    /// Needed when the same person has been written down twice — once under a
+    /// durable key and once under a device id, because a message was queued
+    /// after the id rotated but before the next session proved who they were.
+    /// Re-keying cannot help there: the destination key is already taken, so
+    /// without this the older conversation is simply orphaned.
+    ///
+    /// Messages are renumbered to continue the destination's `seq` per
+    /// direction rather than keeping their own. `messages_for_thread` orders by
+    /// `(seq, id)`, so two runs of 1, 2, 3 would interleave — the two halves of
+    /// one conversation shuffled together instead of the newer following the
+    /// older.
+    ///
+    /// Atomic. Four statements across three tables rewrite where a person's
+    /// history lives, and a failure between any two of them is worse than the
+    /// duplicate being fixed: messages moved but the old row still standing, or
+    /// transfers left pointing at a thread that has been deleted. `?` drops the
+    /// transaction unbuilt, which rolls back.
+    pub fn merge_contact(&self, from: i64, into: i64) -> Result<(), StoreError> {
+        if from == into {
+            return Ok(());
+        }
+        // Both ends checked, not assumed.
+        //
+        // `into`, because with no thread on `from` nothing below touches a
+        // foreign key: a bad destination would sail through to the DELETE and
+        // quietly destroy the source instead of merging it, which is the one
+        // outcome worse than the duplicate.
+        //
+        // `from`, because otherwise this is a silent success — the match does
+        // nothing, the DELETE hits no rows, and a caller that had the wrong id
+        // is told the merge happened. `rekey_contact` reports whether it
+        // matched; a folding operation that says nothing is worse, not better.
+        for (which, id) in [("into", into), ("from", from)] {
+            if self.contact_by_id(id)?.is_none() {
+                return Err(StoreError::Db(format!(
+                    "cannot merge contact {from} into {into}: no such {which} contact {id}"
+                )));
+            }
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        match (
+            self.thread_for_contact(from)?,
+            self.thread_for_contact(into)?,
+        ) {
+            (Some(from_thread), Some(into_thread)) => {
+                for dir in [Direction::Incoming, Direction::Outgoing] {
+                    let offset = self.next_seq(into_thread, dir)? - 1;
+                    self.conn.execute(
+                        "UPDATE messages SET thread_id = ?1, seq = seq + ?2
+                         WHERE thread_id = ?3 AND direction = ?4",
+                        params![into_thread, offset, from_thread, dir.to_i64()],
+                    )?;
+                }
+                self.conn.execute(
+                    "UPDATE transfers SET thread_id = ?1 WHERE thread_id = ?2",
+                    params![into_thread, from_thread],
+                )?;
+            }
+            // Nothing to merge into: move the whole thread across rather than
+            // letting the cascade take it with the contact.
+            (Some(from_thread), None) => {
+                self.conn.execute(
+                    "UPDATE threads SET contact_id = ?1 WHERE id = ?2",
+                    params![into, from_thread],
+                )?;
+            }
+            (None, _) => {}
+        }
+        self.conn
+            .execute("DELETE FROM contacts WHERE id = ?1", params![from])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Update a contact's persona fields (their name/colour/version changed via
     /// a persona record). Returns whether a row matched.
     pub fn update_contact_persona(
@@ -611,6 +706,224 @@ mod tests {
             persona_version: 1,
             paired_at: 1000,
         }
+    }
+
+    /// Re-keying keeps the person: same row, same thread, same history.
+    ///
+    /// A contact can be created before there is anything durable to name it by
+    /// — only a device id, which R0-F2 rotates every twelve minutes. When a
+    /// session finally supplies the real key, the existing row has to move onto
+    /// it. Adding a second row instead would split one conversation across two
+    /// contacts, which is the bug this exists to prevent.
+    #[test]
+    fn rekeying_a_contact_keeps_its_thread_and_messages() {
+        let (s, _d) = store();
+        let id = s.add_contact(&a_contact()).unwrap();
+        let thread = s.create_thread(id, 1000).unwrap();
+        s.add_message(&NewMessage {
+            thread_id: thread,
+            seq: 1,
+            msg_id: vec![7u8; 16],
+            body: b"before the session".to_vec(),
+            direction: Direction::Outgoing,
+            state: MessageState::Sent,
+            created_at: 1000,
+        })
+        .unwrap();
+
+        assert!(s.rekey_contact(id, &[42u8; 32]).unwrap());
+
+        assert_eq!(
+            s.contact_by_l1(&[42u8; 32]).unwrap().unwrap().id,
+            id,
+            "the contact did not move onto the real key"
+        );
+        assert!(
+            s.contact_by_l1(&[1u8; 32]).unwrap().is_none(),
+            "the rotating id still resolves, so the next lookup makes a duplicate"
+        );
+        assert_eq!(
+            s.thread_for_contact(id).unwrap(),
+            Some(thread),
+            "the thread came adrift from its contact"
+        );
+        assert_eq!(
+            s.messages_for_thread(thread).unwrap().len(),
+            1,
+            "history written before the session was lost"
+        );
+    }
+
+    /// Merging keeps both halves of the conversation, in order.
+    ///
+    /// The case: we knew someone, their device id rotated, a message was queued
+    /// to the new id before the next session proved who they were, and now one
+    /// person holds two rows. Re-keying cannot fix it — the real key is taken —
+    /// so the stray has to be folded in.
+    #[test]
+    fn merging_a_contact_keeps_both_halves_in_order() {
+        let (s, _d) = store();
+        let known = s.add_contact(&a_contact()).unwrap();
+        let known_thread = s.create_thread(known, 1000).unwrap();
+        let stray = s
+            .add_contact(&NewContact {
+                l1_pub: [8u8; 32],
+                ..a_contact()
+            })
+            .unwrap();
+        let stray_thread = s.create_thread(stray, 2000).unwrap();
+
+        for (thread, text) in [(known_thread, "older"), (stray_thread, "newer")] {
+            let seq = s.next_seq(thread, Direction::Outgoing).unwrap();
+            s.add_message(&NewMessage {
+                thread_id: thread,
+                seq,
+                msg_id: text.as_bytes().to_vec(),
+                body: text.as_bytes().to_vec(),
+                direction: Direction::Outgoing,
+                state: MessageState::Sent,
+                created_at: 1000,
+            })
+            .unwrap();
+        }
+        // Both start at seq 1, which is exactly what would interleave.
+        s.merge_contact(stray, known).unwrap();
+
+        assert!(
+            s.contact_by_id(stray).unwrap().is_none(),
+            "the stray row outlived the merge, so the person is still two people"
+        );
+        let texts: Vec<String> = s
+            .messages_for_thread(known_thread)
+            .unwrap()
+            .into_iter()
+            .map(|m| String::from_utf8(m.body).unwrap())
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["older".to_string(), "newer".to_string()],
+            "the newer half did not follow the older; ordering is by (seq, id), \
+             so reused seq numbers shuffle one conversation together"
+        );
+    }
+
+    /// Transfers follow the conversation, and do not come adrift of it.
+    ///
+    /// `transfers.thread_id` is `ON DELETE SET NULL`, so a merge that forgot to
+    /// move them would not fail — it would silently null them out when the old
+    /// thread went, and a Drop would survive with no conversation to belong to.
+    /// A regression here is invisible without this assertion.
+    #[test]
+    fn merging_moves_the_transfers_too() {
+        let (s, _d) = store();
+        let known = s.add_contact(&a_contact()).unwrap();
+        let known_thread = s.create_thread(known, 1000).unwrap();
+        let stray = s
+            .add_contact(&NewContact {
+                l1_pub: [8u8; 32],
+                ..a_contact()
+            })
+            .unwrap();
+        let stray_thread = s.create_thread(stray, 2000).unwrap();
+        let transfer = s
+            .add_transfer(&NewTransfer {
+                thread_id: Some(stray_thread),
+                direction: Direction::Incoming,
+                name: "photo.jpg".into(),
+                size: 10,
+                mime: "image/jpeg".into(),
+                state: TransferState::Offered,
+                root_hash: [3u8; 32],
+                chunk_bitmap: vec![0u8],
+                created_at: 2000,
+            })
+            .unwrap();
+
+        s.merge_contact(stray, known).unwrap();
+
+        assert_eq!(
+            s.transfer_by_id(transfer).unwrap().unwrap().thread_id,
+            Some(known_thread),
+            "the transfer was left on the old thread or nulled out with it"
+        );
+    }
+
+    /// A stray with no thread of its own still has to stop existing.
+    #[test]
+    fn merging_moves_a_lone_thread_rather_than_dropping_it() {
+        let (s, _d) = store();
+        let known = s.add_contact(&a_contact()).unwrap();
+        let stray = s
+            .add_contact(&NewContact {
+                l1_pub: [8u8; 32],
+                ..a_contact()
+            })
+            .unwrap();
+        let stray_thread = s.create_thread(stray, 2000).unwrap();
+
+        // The destination has no thread, so the cascade would take this one
+        // with the deleted contact if it were not moved across first.
+        s.merge_contact(stray, known).unwrap();
+
+        assert_eq!(s.thread_for_contact(known).unwrap(), Some(stray_thread));
+        assert!(s.contact_by_id(stray).unwrap().is_none());
+    }
+
+    /// Merging into a contact that is not there is refused, not half-done.
+    ///
+    /// This was the review's catch and it was a data-loss bug: with no thread
+    /// on the source, nothing in the merge touched a foreign key, so a bad
+    /// destination sailed through to the DELETE and destroyed the source row.
+    ///
+    /// **It does not exercise the rollback.** The check now fires before the
+    /// transaction opens, so `?` alone gives the same result and this would
+    /// pass without it. Atomicity of the multi-statement path is argued, not
+    /// proven — nothing in this API can be made to fail part-way through on
+    /// demand — and that is said here so a green tick is not read as a
+    /// guarantee it does not give.
+    #[test]
+    fn merging_into_a_contact_that_is_not_there_is_refused() {
+        let (s, _d) = store();
+        let stray = s.add_contact(&a_contact()).unwrap();
+        let thread = s.create_thread(stray, 1000).unwrap();
+
+        assert!(
+            s.merge_contact(stray, 9999).is_err(),
+            "merging into a contact that does not exist has to fail, or this \
+             test proves nothing at all"
+        );
+
+        assert!(
+            s.contact_by_id(stray).unwrap().is_some(),
+            "the contact was deleted by a merge that did not complete"
+        );
+        assert_eq!(
+            s.thread_for_contact(stray).unwrap(),
+            Some(thread),
+            "the thread was left detached from the only contact that owns it"
+        );
+    }
+
+    /// A merge whose source is not there is an error, not a quiet success.
+    ///
+    /// Nothing in the body would have complained: the match does nothing, the
+    /// DELETE hits no rows, and a caller holding the wrong id would be told the
+    /// fold happened. Every other contact API here reports whether it matched.
+    #[test]
+    fn merging_from_a_contact_that_is_not_there_is_refused() {
+        let (s, _d) = store();
+        let into = s.add_contact(&a_contact()).unwrap();
+        assert!(s.merge_contact(9999, into).is_err());
+        assert!(
+            s.contact_by_id(into).unwrap().is_some(),
+            "the destination was touched by a merge that could not happen"
+        );
+    }
+
+    #[test]
+    fn rekeying_a_contact_that_is_not_there_reports_it() {
+        let (s, _d) = store();
+        assert!(!s.rekey_contact(9999, &[42u8; 32]).unwrap());
     }
 
     #[test]

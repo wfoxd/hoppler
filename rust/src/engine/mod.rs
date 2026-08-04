@@ -424,12 +424,10 @@ pub fn thread_messages(thread_id: i64) -> Result<Vec<ChatMessageDto>, String> {
 /// The existing thread with a device, if any — for opening a conversation
 /// without sending first.
 pub fn thread_for_device(device_id: String) -> Result<Option<i64>, String> {
-    with_core(
-        |core| match core.store.contact_by_l1(&fake::fake_l1_pub(&device_id))? {
-            Some(c) => core.store.thread_for_contact(c.id),
-            None => Ok(None),
-        },
-    )
+    with_core(|core| match contact_id_for_device(core, &device_id)? {
+        Some(id) => core.store.thread_for_contact(id),
+        None => Ok(None),
+    })
 }
 
 /// All conversations, for the UI's thread list.
@@ -499,7 +497,21 @@ fn require_net() -> Result<Arc<net::Net>, String> {
 /// persisting. Runs on the pump thread, never while the store lock is held.
 fn on_net_event(net: &Arc<net::Net>, event: net::NetEvent) {
     match event {
-        net::NetEvent::PeersChanged | net::NetEvent::SessionOpened { .. } => {
+        net::NetEvent::PeersChanged => {
+            if let Ok(devices) = nearby_devices() {
+                emit(CoreEvent::DiscoveryUpdated { devices });
+            }
+        }
+        net::NetEvent::SessionOpened { peer, .. } => {
+            // The moment the peer is proved is the moment a row keyed on their
+            // rotating id can be moved onto the real one. Doing it only on the
+            // next send or receive would leave the UI opening a conversation by
+            // device id and landing on a thread that is about to be folded into
+            // another. Creates nothing, so a peer who says nothing still leaves
+            // no trace.
+            if let Err(why) = with_core_mut(|core| reconcile_contact(core, &peer)) {
+                log::warn!("could not reconcile the contact for {peer}: {why}");
+            }
             if let Ok(devices) = nearby_devices() {
                 emit(CoreEvent::DiscoveryUpdated { devices });
             }
@@ -573,36 +585,109 @@ fn with_core_mut<T>(f: impl FnOnce(&mut Core) -> Result<T, StoreError>) -> Resul
     f(core).map_err(stringify)
 }
 
-/// Find or create the contact + thread for a (fake) device.
-/// Find or create the thread for a device, **still keyed by a fake Layer-1 derived from
-/// the device id — which is now wrong in a way that matters: a device id is an ephemeral radio id and
-/// rotates every twelve minutes, so a conversation would fragment into a new
-/// thread each rotation and the old one would be unreachable.
+/// The peer's durable identity, if a session has authenticated one.
+fn pseudonym_of(core: &Core, device_id: &str) -> Option<[u8; 32]> {
+    core.net
+        .as_ref()
+        .and_then(|net| net.pseudonym(device_id))
+        .map(|p| p.0)
+}
+
+/// The contact for this device, if there already is one.
 ///
-/// The right key is the pseudonym the session *proves*
-/// ([`net::Net::pseudonym`]) — stable toward us for the life of the device
-/// (R0-F10) and exactly what a block binds to. That change needs the session to
-/// exist before the thread does, which inverts the current order in
-/// `send_chat`, so it is left for T11/T12 where threads become persistent
-/// rather than smuggled in here.
-fn ensure_thread(core: &Core, device_id: &str, now: i64) -> Result<i64, StoreError> {
-    let l1 = fake::fake_l1_pub(device_id);
-    let contact_id = match core.store.contact_by_l1(&l1)? {
-        Some(c) => c.id,
-        None => {
-            let (name, colour) = fake::peer(device_id)
-                .map(|p| (p.name.to_owned(), p.colour))
-                .unwrap_or_else(|| ("Unknown".into(), 0));
-            core.store.add_contact(&NewContact {
-                l1_pub: l1,
-                l2_pub: [0u8; 32], // placeholder — real Layer-2 arrives with pairing (T08–T10)
-                name,
-                colour,
-                persona_version: 1,
-                paired_at: now,
-            })?
+/// The read-only twin of [`ensure_contact`]: same two keys, tried in the same
+/// order, but it creates nothing and adopts nothing. Sharing the *order* is the
+/// point — a lookup that consulted only the device id would miss every contact
+/// that had already moved onto its session key, and report no conversation for
+/// someone the user has been talking to all afternoon.
+fn contact_id_for_device(core: &Core, device_id: &str) -> Result<Option<i64>, StoreError> {
+    if let Some(real) = pseudonym_of(core, device_id) {
+        if let Some(c) = core.store.contact_by_l1(&real)? {
+            return Ok(Some(c.id));
         }
+    }
+    Ok(core
+        .store
+        .contact_by_l1(&fake::fake_l1_pub(device_id))?
+        .map(|c| c.id))
+}
+
+/// The contact this device belongs to, created, adopted or merged as needed.
+///
+/// Keyed on the peer's session pseudonym — its static DH public, which the
+/// Noise IK handshake authenticates — and **not** on the device id. The id
+/// rotates every twelve minutes under R0-F2, so a contact keyed on it became a
+/// different contact, with a different thread, four or five times an hour: one
+/// conversation shattered into a row of identical-looking strangers.
+///
+/// The device id is still the fallback, because before a session it is
+/// genuinely all there is — a chat can be sent to someone not yet connected.
+/// A row opened that way does not stay there: [`reconcile_contact`] moves it,
+/// either by re-keying it or by folding it into the row that already holds the
+/// real key. Without that, the split would only have moved from every twelve
+/// minutes to once, which is a quieter bug rather than no bug.
+///
+/// Reconciliation runs here **and** from the session-open event, so it does not
+/// wait for the next send: a UI opening a conversation by device id would
+/// otherwise land on a thread about to be folded into another.
+/// Move a device-id-keyed row onto the pseudonym now that one is proved.
+///
+/// **Creates nothing.** Run from the session-open event, so it meets peers the
+/// user has never written to, and this module promises that "a device that
+/// connects and says nothing leaves no trace beyond the transport's own
+/// bookkeeping". A reconcile that inserted would break exactly that.
+///
+/// Both keys can hold a row at once — the person was known from an earlier
+/// session, their id rotated, and something was written to the new id before
+/// the next session proved it was them — so this either re-keys the stray or
+/// folds it into the row that already owns the real key.
+fn reconcile_contact(core: &Core, device_id: &str) -> Result<(), StoreError> {
+    let Some(real) = pseudonym_of(core, device_id) else {
+        return Ok(());
     };
+    let Some(stray) = core
+        .store
+        .contact_by_l1(&fake::fake_l1_pub(device_id))?
+        .map(|c| c.id)
+    else {
+        return Ok(());
+    };
+    match core.store.contact_by_l1(&real)?.map(|c| c.id) {
+        // Re-keying cannot help: the real key is already taken.
+        Some(known) => core.store.merge_contact(stray, known)?,
+        None => {
+            core.store.rekey_contact(stray, &real)?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_contact(core: &Core, device_id: &str, now: i64) -> Result<i64, StoreError> {
+    // Reconcile first, so the lookup below cannot find the stale row and hand
+    // back a thread that is about to be folded into another.
+    reconcile_contact(core, device_id)?;
+    if let Some(id) = contact_id_for_device(core, device_id)? {
+        return Ok(id);
+    }
+
+    // Nothing on file. Prefer the durable key if a session has proved one;
+    // otherwise the device id, which `reconcile_contact` will move later.
+    let key = pseudonym_of(core, device_id).unwrap_or_else(|| fake::fake_l1_pub(device_id));
+    let (name, colour) = fake::peer(device_id)
+        .map(|p| (p.name.to_owned(), p.colour))
+        .unwrap_or_else(|| ("Unknown".into(), 0));
+    core.store.add_contact(&NewContact {
+        l1_pub: key,
+        l2_pub: [0u8; 32], // placeholder — real Layer-2 arrives with pairing (T08–T10)
+        name,
+        colour,
+        persona_version: 1,
+        paired_at: now,
+    })
+}
+
+fn ensure_thread(core: &Core, device_id: &str, now: i64) -> Result<i64, StoreError> {
+    let contact_id = ensure_contact(core, device_id, now)?;
     match core.store.thread_for_contact(contact_id)? {
         Some(t) => Ok(t),
         None => core.store.create_thread(contact_id, now),
