@@ -424,12 +424,10 @@ pub fn thread_messages(thread_id: i64) -> Result<Vec<ChatMessageDto>, String> {
 /// The existing thread with a device, if any — for opening a conversation
 /// without sending first.
 pub fn thread_for_device(device_id: String) -> Result<Option<i64>, String> {
-    with_core(
-        |core| match core.store.contact_by_l1(&fake::fake_l1_pub(&device_id))? {
-            Some(c) => core.store.thread_for_contact(c.id),
-            None => Ok(None),
-        },
-    )
+    with_core(|core| match contact_id_for_device(core, &device_id)? {
+        Some(id) => core.store.thread_for_contact(id),
+        None => Ok(None),
+    })
 }
 
 /// All conversations, for the UI's thread list.
@@ -585,24 +583,87 @@ fn with_core_mut<T>(f: impl FnOnce(&mut Core) -> Result<T, StoreError>) -> Resul
 /// exist before the thread does, which inverts the current order in
 /// `send_chat`, so it is left for T11/T12 where threads become persistent
 /// rather than smuggled in here.
-fn ensure_thread(core: &Core, device_id: &str, now: i64) -> Result<i64, StoreError> {
-    let l1 = fake::fake_l1_pub(device_id);
-    let contact_id = match core.store.contact_by_l1(&l1)? {
-        Some(c) => c.id,
+/// The contact this device belongs to, created or adopted as needed.
+///
+/// Keyed on the peer's session pseudonym — its static DH public, which the
+/// Noise IK handshake authenticates — and **not** on the device id. The id
+/// rotates every twelve minutes under R0-F2, so a contact keyed on it became a
+/// different contact, with a different thread, four or five times an hour: one
+/// conversation shattered into a row of identical-looking strangers.
+///
+/// The device id is still the fallback, because it is genuinely all there is
+/// before a session exists — a chat can be sent to someone not yet connected.
+/// A row opened that way is *adopted* onto the real key the moment a session
+/// appears, rather than abandoned next to a new one, which is what
+/// [`Store::rekey_contact`] is for. Without that step the split would merely
+/// have moved from every twelve minutes to once.
+/// The peer's durable identity, if a session has authenticated one.
+fn pseudonym_of(core: &Core, device_id: &str) -> Option<[u8; 32]> {
+    core.net
+        .as_ref()
+        .and_then(|net| net.pseudonym(device_id))
+        .map(|p| p.0)
+}
+
+/// The contact for this device, if there already is one.
+///
+/// The read-only twin of [`ensure_contact`]: same two keys, tried in the same
+/// order, but it creates nothing and adopts nothing. Sharing the *order* is the
+/// point — a lookup that consulted only the device id would miss every contact
+/// that had already moved onto its session key, and report no conversation for
+/// someone the user has been talking to all afternoon.
+fn contact_id_for_device(core: &Core, device_id: &str) -> Result<Option<i64>, StoreError> {
+    if let Some(real) = pseudonym_of(core, device_id) {
+        if let Some(c) = core.store.contact_by_l1(&real)? {
+            return Ok(Some(c.id));
+        }
+    }
+    Ok(core
+        .store
+        .contact_by_l1(&fake::fake_l1_pub(device_id))?
+        .map(|c| c.id))
+}
+
+fn ensure_contact(core: &Core, device_id: &str, now: i64) -> Result<i64, StoreError> {
+    let by_id = fake::fake_l1_pub(device_id);
+    let by_session = pseudonym_of(core, device_id);
+
+    let key = match by_session {
+        Some(real) => {
+            if let Some(c) = core.store.contact_by_l1(&real)? {
+                return Ok(c.id);
+            }
+            // Same peer: `by_id` is derived from the id this session is with.
+            // Checked after the real key so the UNIQUE on l1_pub cannot be hit.
+            if let Some(c) = core.store.contact_by_l1(&by_id)? {
+                core.store.rekey_contact(c.id, &real)?;
+                return Ok(c.id);
+            }
+            real
+        }
         None => {
-            let (name, colour) = fake::peer(device_id)
-                .map(|p| (p.name.to_owned(), p.colour))
-                .unwrap_or_else(|| ("Unknown".into(), 0));
-            core.store.add_contact(&NewContact {
-                l1_pub: l1,
-                l2_pub: [0u8; 32], // placeholder — real Layer-2 arrives with pairing (T08–T10)
-                name,
-                colour,
-                persona_version: 1,
-                paired_at: now,
-            })?
+            if let Some(c) = core.store.contact_by_l1(&by_id)? {
+                return Ok(c.id);
+            }
+            by_id
         }
     };
+
+    let (name, colour) = fake::peer(device_id)
+        .map(|p| (p.name.to_owned(), p.colour))
+        .unwrap_or_else(|| ("Unknown".into(), 0));
+    core.store.add_contact(&NewContact {
+        l1_pub: key,
+        l2_pub: [0u8; 32], // placeholder — real Layer-2 arrives with pairing (T08–T10)
+        name,
+        colour,
+        persona_version: 1,
+        paired_at: now,
+    })
+}
+
+fn ensure_thread(core: &Core, device_id: &str, now: i64) -> Result<i64, StoreError> {
+    let contact_id = ensure_contact(core, device_id, now)?;
     match core.store.thread_for_contact(contact_id)? {
         Some(t) => Ok(t),
         None => core.store.create_thread(contact_id, now),

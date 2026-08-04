@@ -233,6 +233,25 @@ impl Store {
             .transpose()
     }
 
+    /// Move a contact onto a different Layer-1 key, keeping its id, thread and
+    /// history.
+    ///
+    /// Needed because a contact can be created before there is anything durable
+    /// to name it by. A device id is all that exists until a session does, and
+    /// R0-F2 rotates that every twelve minutes — so a row first keyed on the id
+    /// has to be adopted onto the real key rather than left behind, or one
+    /// person ends up as two contacts with the conversation split between them.
+    ///
+    /// `l1_pub` is UNIQUE, so the caller must have established that no row
+    /// already holds `new_l1`; this reports a match rather than deciding.
+    pub fn rekey_contact(&self, id: i64, new_l1: &[u8; 32]) -> Result<bool, StoreError> {
+        let n = self.conn.execute(
+            "UPDATE contacts SET l1_pub = ?1 WHERE id = ?2",
+            params![&new_l1[..], id],
+        )?;
+        Ok(n > 0)
+    }
+
     /// Update a contact's persona fields (their name/colour/version changed via
     /// a persona record). Returns whether a row matched.
     pub fn update_contact_persona(
@@ -611,6 +630,58 @@ mod tests {
             persona_version: 1,
             paired_at: 1000,
         }
+    }
+
+    /// Re-keying keeps the person: same row, same thread, same history.
+    ///
+    /// A contact can be created before there is anything durable to name it by
+    /// — only a device id, which R0-F2 rotates every twelve minutes. When a
+    /// session finally supplies the real key, the existing row has to move onto
+    /// it. Adding a second row instead would split one conversation across two
+    /// contacts, which is the bug this exists to prevent.
+    #[test]
+    fn rekeying_a_contact_keeps_its_thread_and_messages() {
+        let (s, _d) = store();
+        let id = s.add_contact(&a_contact()).unwrap();
+        let thread = s.create_thread(id, 1000).unwrap();
+        s.add_message(&NewMessage {
+            thread_id: thread,
+            seq: 1,
+            msg_id: vec![7u8; 16],
+            body: b"before the session".to_vec(),
+            direction: Direction::Outgoing,
+            state: MessageState::Sent,
+            created_at: 1000,
+        })
+        .unwrap();
+
+        assert!(s.rekey_contact(id, &[42u8; 32]).unwrap());
+
+        assert_eq!(
+            s.contact_by_l1(&[42u8; 32]).unwrap().unwrap().id,
+            id,
+            "the contact did not move onto the real key"
+        );
+        assert!(
+            s.contact_by_l1(&[1u8; 32]).unwrap().is_none(),
+            "the rotating id still resolves, so the next lookup makes a duplicate"
+        );
+        assert_eq!(
+            s.thread_for_contact(id).unwrap(),
+            Some(thread),
+            "the thread came adrift from its contact"
+        );
+        assert_eq!(
+            s.messages_for_thread(thread).unwrap().len(),
+            1,
+            "history written before the session was lost"
+        );
+    }
+
+    #[test]
+    fn rekeying_a_contact_that_is_not_there_reports_it() {
+        let (s, _d) = store();
+        assert!(!s.rekey_contact(9999, &[42u8; 32]).unwrap());
     }
 
     #[test]

@@ -346,3 +346,98 @@ fn offer_drop_returns_a_transfer_id() {
     let id = offer_drop("fake-sam".into(), "clip.mp4".into(), 5_000_000).unwrap();
     assert!(id.starts_with("xfer-"), "unexpected id {id}");
 }
+
+// ── contact identity across a rotation ────────────────────────────────────────
+
+struct SessionPeer {
+    net: rust_lib_hoppler::engine::net::Net,
+    rx: Receiver<TransportEvent>,
+    transport: Arc<dyn Transport>,
+}
+
+/// A peer that will complete a handshake with the engine, so the core holds a
+/// pseudonym for it and not merely a device id.
+///
+/// Takes the identity rather than making one, because the whole point is to
+/// bring the *same person* back under a different device id.
+fn session_peer(air: &LoopbackNet, id: &str, identity: Arc<Mutex<Identity>>) -> SessionPeer {
+    let (tx, rx) = channel();
+    let tx = Mutex::new(tx);
+    let sink: Box<dyn Fn(TransportEvent) + Send + Sync> = Box::new(move |e| {
+        let _ = tx.lock().unwrap_or_else(|p| p.into_inner()).send(e);
+    });
+    let transport: Arc<dyn Transport> = Arc::new(air.join(id, sink));
+    let net =
+        rust_lib_hoppler::engine::net::Net::new(transport.clone(), identity, id, Instant::now());
+    // Discovery on, or the peer never answers the persona request — and an IK
+    // handshake cannot start without the responder's static key in advance, so
+    // the session would never form and the rotation would go untested.
+    net.discovery().set_enabled(true, Instant::now()).unwrap();
+    SessionPeer { net, rx, transport }
+}
+
+/// Drive the peer's side until it holds a session with the engine.
+///
+/// Only this side needs pumping — the engine runs its own pump thread. Waits on
+/// the session itself rather than a sleep, so a failure here means the
+/// handshake did not happen, not that the machine was slow.
+fn until_session(p: &SessionPeer) {
+    p.transport.connect("core").unwrap();
+    until("the peer to hold a session with the engine", || {
+        let now = Instant::now();
+        while let Ok(e) = p.rx.recv_timeout(Duration::from_millis(20)) {
+            p.net.handle(e, now);
+        }
+        p.net.sessions().is_open("core")
+    });
+}
+
+/// One person, two device ids, one conversation.
+///
+/// R0-F2 rotates the device id every twelve minutes. Keying a contact on it
+/// meant the same person became a new contact, a new thread and a new
+/// conversation four or five times an hour — the history still on disk, just
+/// scattered across rows that no longer looked like anybody.
+///
+/// The session pseudonym is the peer's static DH public, which the Noise IK
+/// handshake authenticates, and it does not rotate. Both sends below succeed on
+/// the wire, which is what proves a session existed for each id: without one the
+/// engine would fall back to the id and this would pass for the wrong reason.
+#[test]
+fn a_thread_survives_the_peers_device_id_rotating() {
+    let _g = LOCK.lock().unwrap();
+    let h = fresh();
+    set_discovery(true).unwrap();
+
+    let wanda = Arc::new(Mutex::new(Identity::generate("Wanda", 0x00_88_ff)));
+
+    let before = session_peer(&h.air, "wanda-before", wanda.clone());
+    until_session(&before);
+    send_chat("wanda-before".into(), "before the rotation".into())
+        .expect("no session under the first id, so the rotation is not what is under test");
+
+    // The rotation: same identity, same static key, new device id.
+    let after = session_peer(&h.air, "wanda-after", wanda.clone());
+    until_session(&after);
+    send_chat("wanda-after".into(), "after the rotation".into())
+        .expect("no session under the second id, so the rotation is not what is under test");
+
+    let threads = list_threads().unwrap();
+    assert_eq!(
+        threads.len(),
+        1,
+        "the rotation split one person into {} conversations",
+        threads.len()
+    );
+    let thread = thread_for_device("wanda-after".into()).unwrap().unwrap();
+    let texts: Vec<String> = thread_messages(thread)
+        .unwrap()
+        .into_iter()
+        .map(|m| m.text)
+        .collect();
+    assert!(
+        texts.iter().any(|t| t == "before the rotation")
+            && texts.iter().any(|t| t == "after the rotation"),
+        "history did not follow the person across the rotation: {texts:?}"
+    );
+}
