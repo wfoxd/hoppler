@@ -566,6 +566,29 @@ fn map_contact(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Contact, StoreE
     })())
 }
 
+fn map_message(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Message, StoreError>> {
+    let id = r.get(0)?;
+    let thread_id = r.get(1)?;
+    let seq = r.get(2)?;
+    let msg_id: Vec<u8> = r.get(3)?;
+    let body: Vec<u8> = r.get(4)?;
+    let direction: i64 = r.get(5)?;
+    let state: i64 = r.get(6)?;
+    let created_at = r.get(7)?;
+    Ok((|| {
+        Ok(Message {
+            id,
+            thread_id,
+            seq,
+            msg_id,
+            body,
+            direction: Direction::from_i64(direction)?,
+            state: MessageState::from_i64(state)?,
+            created_at,
+        })
+    })())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -825,27 +848,4 @@ mod tests {
             .unwrap();
         assert!(s.messages_for_thread(t).unwrap().is_empty());
     }
-}
-
-fn map_message(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Message, StoreError>> {
-    let id = r.get(0)?;
-    let thread_id = r.get(1)?;
-    let seq = r.get(2)?;
-    let msg_id: Vec<u8> = r.get(3)?;
-    let body: Vec<u8> = r.get(4)?;
-    let direction: i64 = r.get(5)?;
-    let state: i64 = r.get(6)?;
-    let created_at = r.get(7)?;
-    Ok((|| {
-        Ok(Message {
-            id,
-            thread_id,
-            seq,
-            msg_id,
-            body,
-            direction: Direction::from_i64(direction)?,
-            state: MessageState::from_i64(state)?,
-            created_at,
-        })
-    })())
 }

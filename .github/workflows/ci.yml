@@ -21,7 +21,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with: { workspaces: rust }
       - run: cargo fmt --check
-      - run: cargo clippy -- -D warnings
+      # --all-targets: bare clippy lints the library only, so tests and benches
+      # were never checked. Keep in step with the `lint` target in the Makefile.
+      - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
   flutter:

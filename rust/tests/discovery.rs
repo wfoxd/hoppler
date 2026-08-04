@@ -45,13 +45,10 @@ fn wait_for(rx: &Events, pred: impl Fn(&TransportEvent) -> bool) -> TransportEve
     }
 }
 
-/// Drain everything currently queued, so a later assertion about what arrives
-/// cannot pass on history.
-fn drain(rx: &Events) {
-    while rx.try_recv().is_ok() {}
-}
-
 /// Feed a transport's events into a Discovery until it goes quiet.
+///
+/// Also the reason there is no separate `drain`: this leaves the queue empty,
+/// so an assertion after it cannot pass on events from before it.
 fn pump(d: &Discovery, rx: &Events, now: Instant) {
     while let Ok(event) = rx.recv_timeout(Duration::from_millis(50)) {
         d.on_event(event, now);
@@ -152,7 +149,7 @@ fn the_null_response_is_and_stays_nothing() {
     malformed.extend(
         responder
             .discovery
-            .answer("asker", &vec![0xff; REQUEST_LEN], now)
+            .answer("asker", &[0xff; REQUEST_LEN], now)
             .unwrap_or_default(),
     );
 

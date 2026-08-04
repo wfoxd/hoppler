@@ -12,8 +12,13 @@ gen:              ## Regenerate Dart<->Rust bridge and protobuf types
 	flutter_rust_bridge_codegen generate
 	./scripts/gen-proto.sh
 
+# --all-targets, because bare `cargo clippy` lints the library and nothing
+# else. Tests, benches and examples went unlinted from the first commit, and
+# five findings had accumulated there unseen — including dead code and an
+# assertion that could not fail. Test code is where the project's claims about
+# itself live, so it is the last place worth leaving unchecked.
 lint:             ## All linters, warnings are errors
-	cd rust && cargo fmt --check && cargo clippy -- -D warnings
+	cd rust && cargo fmt --check && cargo clippy --all-targets -- -D warnings
 	flutter analyze
 
 test:             ## Rust + Dart tests
