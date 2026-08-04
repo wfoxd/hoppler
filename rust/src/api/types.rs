@@ -64,4 +64,23 @@ pub enum CoreEvent {
     },
     /// A transfer finished (or failed).
     TransferCompleted { transfer_id: String, success: bool },
+    /// The radio became usable or unusable.
+    ///
+    /// A device list cannot carry this on its own: an empty list is what both
+    /// "the radio is off" and "nobody is nearby" look like, and R0-F2 turns on
+    /// the user being able to tell those apart. `reason` is absent when the
+    /// radio is fine, and a sentence fit to show when it is not — written by
+    /// the rung, because only the rung knows.
+    ///
+    /// `available` is the source of truth; `reason` is decoration on top of it.
+    /// A report can be unavailable with nothing to say, so anything deciding
+    /// from the presence of a reason gets the state backwards.
+    ///
+    /// Kept free of Rust names and Rust paths on purpose: this comment is
+    /// copied verbatim into the generated Dart, where `None` and
+    /// `CoreEvent::DiscoveryUpdated` mean nothing to the reader.
+    RadioChanged {
+        available: bool,
+        reason: Option<String>,
+    },
 }

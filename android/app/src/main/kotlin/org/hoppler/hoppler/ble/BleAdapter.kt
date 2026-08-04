@@ -105,6 +105,50 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
          * a dial to a peer that has walked away still ends.
          */
         private const val LINK_TIMEOUT_MS = 10_000L
+
+        /**
+         * How many GATT connections count as "the phone is full".
+         *
+         * `GATT_MAX_PHY_CHANNEL` is commonly 7 and is not readable from an app,
+         * so this is a threshold for phrasing a message, never a decision to
+         * skip a dial — a device with a larger pool must still be allowed to
+         * try. Chosen at the common value: at seven the observed failure was
+         * total (§5.0.15).
+         */
+        private const val CROWDED_LINKS = 7
+
+        /**
+         * What to tell the person when the link would not come up.
+         *
+         * States the facts and stops. Android's GATT pool is shared with every
+         * app and commonly holds seven, so a phone already near that many
+         * cannot open another link however healthy its radio is (§5.0.15) — but
+         * a refused link has other causes too, and naming exhaustion as *the*
+         * cause would be the same confident guess that cost eight hardware
+         * runs. The count is evidence; the reader draws the conclusion.
+         *
+         * A number, never an address. This one reaches the screen, and R0-F2
+         * does not stop at the log.
+         *
+         * In the companion so it can be tested without a `Context` — the whole
+         * class of bug this rung keeps producing is one no device test catches
+         * and no reviewer should have to.
+         */
+        fun linkFailureReason(gattLinks: Int): String = when {
+            // -1 is the adapter failing to count at all; inventing "0 open"
+            // from that would be a number we do not have.
+            gattLinks < 0 -> "Could not open a Bluetooth connection."
+            // "around $CROWDED_LINKS", never "the limit". The real ceiling is
+            // not readable from an app and differs by device, so stating it as
+            // fact would be false on any phone with a larger pool — and at, say,
+            // twenty open it would be absurd on its face. The measured count is
+            // ours to assert; the ceiling is not.
+            gattLinks >= CROWDED_LINKS ->
+                "Could not open a Bluetooth connection. This phone already has " +
+                    "$gattLinks open, and Android usually allows around " +
+                    "$CROWDED_LINKS — turning Bluetooth off and on again frees them."
+            else -> "Could not open a Bluetooth connection ($gattLinks already open)."
+        }
     }
 
     private val main = Handler(Looper.getMainLooper())
@@ -721,7 +765,7 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
             try {
                 val started = System.currentTimeMillis()
                 link = raiseLeLink(peer, device)
-                    ?: throw IOException("no le link to $peer to carry the channel")
+                    ?: throw IOException(linkFailureReason(gattLinks))
                 Log.i(TAG, "le link to $peer up in ${System.currentTimeMillis() - started}ms")
                 val socket = device.createInsecureL2capChannel(psm)
                 socket.connect()

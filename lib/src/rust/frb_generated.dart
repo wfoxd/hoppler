@@ -744,6 +744,11 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           transferId: dco_decode_String(raw[1]),
           success: dco_decode_bool(raw[2]),
         );
+      case 6:
+        return CoreEvent_RadioChanged(
+          available: dco_decode_bool(raw[1]),
+          reason: dco_decode_opt_String(raw[2]),
+        );
       default:
         throw Exception("unreachable");
     }
@@ -1045,6 +1050,13 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         return CoreEvent_TransferCompleted(
           transferId: var_transferId,
           success: var_success,
+        );
+      case 6:
+        var var_available = sse_decode_bool(deserializer);
+        var var_reason = sse_decode_opt_String(deserializer);
+        return CoreEvent_RadioChanged(
+          available: var_available,
+          reason: var_reason,
         );
       default:
         throw UnimplementedError('');
@@ -1405,6 +1417,13 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         sse_encode_i_32(5, serializer);
         sse_encode_String(transferId, serializer);
         sse_encode_bool(success, serializer);
+      case CoreEvent_RadioChanged(
+        available: final available,
+        reason: final reason,
+      ):
+        sse_encode_i_32(6, serializer);
+        sse_encode_bool(available, serializer);
+        sse_encode_opt_String(reason, serializer);
     }
   }
 
