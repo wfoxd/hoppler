@@ -275,14 +275,23 @@ impl Store {
         if from == into {
             return Ok(());
         }
-        // Checked, not assumed. With no thread on `from` nothing below touches
-        // a foreign key, so a bad `into` would sail through to the DELETE and
-        // this would quietly destroy the source contact instead of merging it —
-        // the one outcome worse than the duplicate.
-        if self.contact_by_id(into)?.is_none() {
-            return Err(StoreError::Db(format!(
-                "cannot merge contact {from} into {into}: no such contact"
-            )));
+        // Both ends checked, not assumed.
+        //
+        // `into`, because with no thread on `from` nothing below touches a
+        // foreign key: a bad destination would sail through to the DELETE and
+        // quietly destroy the source instead of merging it, which is the one
+        // outcome worse than the duplicate.
+        //
+        // `from`, because otherwise this is a silent success — the match does
+        // nothing, the DELETE hits no rows, and a caller that had the wrong id
+        // is told the merge happened. `rekey_contact` reports whether it
+        // matched; a folding operation that says nothing is worse, not better.
+        for (which, id) in [("into", into), ("from", from)] {
+            if self.contact_by_id(id)?.is_none() {
+                return Err(StoreError::Db(format!(
+                    "cannot merge contact {from} into {into}: no such {which} contact {id}"
+                )));
+            }
         }
         let tx = self.conn.unchecked_transaction()?;
         match (
@@ -851,6 +860,22 @@ mod tests {
             s.thread_for_contact(stray).unwrap(),
             Some(thread),
             "the thread was left detached from the only contact that owns it"
+        );
+    }
+
+    /// A merge whose source is not there is an error, not a quiet success.
+    ///
+    /// Nothing in the body would have complained: the match does nothing, the
+    /// DELETE hits no rows, and a caller holding the wrong id would be told the
+    /// fold happened. Every other contact API here reports whether it matched.
+    #[test]
+    fn merging_from_a_contact_that_is_not_there_is_refused() {
+        let (s, _d) = store();
+        let into = s.add_contact(&a_contact()).unwrap();
+        assert!(s.merge_contact(9999, into).is_err());
+        assert!(
+            s.contact_by_id(into).unwrap().is_some(),
+            "the destination was touched by a merge that could not happen"
         );
     }
 
