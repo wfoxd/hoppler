@@ -571,21 +571,6 @@ fn with_core_mut<T>(f: impl FnOnce(&mut Core) -> Result<T, StoreError>) -> Resul
     f(core).map_err(stringify)
 }
 
-/// Find or create the contact + thread for a (fake) device.
-/// The contact this device belongs to, created or adopted as needed.
-///
-/// Keyed on the peer's session pseudonym — its static DH public, which the
-/// Noise IK handshake authenticates — and **not** on the device id. The id
-/// rotates every twelve minutes under R0-F2, so a contact keyed on it became a
-/// different contact, with a different thread, four or five times an hour: one
-/// conversation shattered into a row of identical-looking strangers.
-///
-/// The device id is still the fallback, because it is genuinely all there is
-/// before a session exists — a chat can be sent to someone not yet connected.
-/// A row opened that way is *adopted* onto the real key the moment a session
-/// appears, rather than abandoned next to a new one, which is what
-/// [`Store::rekey_contact`] is for. Without that step the split would merely
-/// have moved from every twelve minutes to once.
 /// The peer's durable identity, if a session has authenticated one.
 fn pseudonym_of(core: &Core, device_id: &str) -> Option<[u8; 32]> {
     core.net
@@ -613,6 +598,25 @@ fn contact_id_for_device(core: &Core, device_id: &str) -> Result<Option<i64>, St
         .map(|c| c.id))
 }
 
+/// The contact this device belongs to, created, adopted or merged as needed.
+///
+/// Keyed on the peer's session pseudonym — its static DH public, which the
+/// Noise IK handshake authenticates — and **not** on the device id. The id
+/// rotates every twelve minutes under R0-F2, so a contact keyed on it became a
+/// different contact, with a different thread, four or five times an hour: one
+/// conversation shattered into a row of identical-looking strangers.
+///
+/// The device id is still the fallback, because before a session it is
+/// genuinely all there is — a chat can be sent to someone not yet connected.
+/// A row opened that way does not stay there:
+///
+/// - alone, it is re-keyed onto the pseudonym ([`Store::rekey_contact`]);
+/// - beside an existing one, it is folded into it ([`Store::merge_contact`]),
+///   which is the case where the person was already known and their id had
+///   rotated in between.
+///
+/// Without both, the split would only have moved from every twelve minutes to
+/// once, which is a quieter bug rather than no bug.
 fn ensure_contact(core: &Core, device_id: &str, now: i64) -> Result<i64, StoreError> {
     let by_id = fake::fake_l1_pub(device_id);
     let by_session = pseudonym_of(core, device_id);

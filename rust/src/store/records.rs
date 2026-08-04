@@ -265,10 +265,17 @@ impl Store {
     /// `(seq, id)`, so two runs of 1, 2, 3 would interleave — the two halves of
     /// one conversation shuffled together instead of the newer following the
     /// older.
+    ///
+    /// Atomic. Four statements across three tables rewrite where a person's
+    /// history lives, and a failure between any two of them is worse than the
+    /// duplicate being fixed: messages moved but the old row still standing, or
+    /// transfers left pointing at a thread that has been deleted. `?` drops the
+    /// transaction unbuilt, which rolls back.
     pub fn merge_contact(&self, from: i64, into: i64) -> Result<(), StoreError> {
         if from == into {
             return Ok(());
         }
+        let tx = self.conn.unchecked_transaction()?;
         match (
             self.thread_for_contact(from)?,
             self.thread_for_contact(into)?,
@@ -299,6 +306,7 @@ impl Store {
         }
         self.conn
             .execute("DELETE FROM contacts WHERE id = ?1", params![from])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -800,6 +808,39 @@ mod tests {
 
         assert_eq!(s.thread_for_contact(known).unwrap(), Some(stray_thread));
         assert!(s.contact_by_id(stray).unwrap().is_none());
+    }
+
+    /// A merge that cannot complete leaves the contact standing.
+    ///
+    /// **This does not exercise the rollback.** In this path the failing
+    /// statement is the first one that would mutate anything, so `?` alone
+    /// produces the same result and the test would pass without the
+    /// transaction. It is kept because the error path is worth pinning — a
+    /// merge that deleted the contact and then failed would lose a person —
+    /// but the atomicity of the multi-statement path is argued, not proven:
+    /// nothing in this API can fail part-way through on demand. Said plainly
+    /// so the next reader does not take a green tick for a guarantee.
+    #[test]
+    fn a_merge_into_a_contact_that_is_not_there_fails_without_damage() {
+        let (s, _d) = store();
+        let stray = s.add_contact(&a_contact()).unwrap();
+        let thread = s.create_thread(stray, 1000).unwrap();
+
+        assert!(
+            s.merge_contact(stray, 9999).is_err(),
+            "merging into a contact that does not exist has to fail, or this \
+             test proves nothing at all"
+        );
+
+        assert!(
+            s.contact_by_id(stray).unwrap().is_some(),
+            "the contact was deleted by a merge that did not complete"
+        );
+        assert_eq!(
+            s.thread_for_contact(stray).unwrap(),
+            Some(thread),
+            "the thread was left detached from the only contact that owns it"
+        );
     }
 
     #[test]
