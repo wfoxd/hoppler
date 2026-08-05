@@ -527,6 +527,9 @@ fn on_net_event(net: &Arc<net::Net>, event: net::NetEvent) {
                 name: persona_name,
             });
         }
+        net::NetEvent::PingAcked { peer } => {
+            emit(CoreEvent::PingAcked { device_id: peer });
+        }
         net::NetEvent::RadioChanged { available, reason } => {
             emit(CoreEvent::RadioChanged { available, reason });
         }

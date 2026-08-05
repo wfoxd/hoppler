@@ -20,15 +20,28 @@
 //! watching frame types go past.
 
 /// What a frame carries. One session multiplexes all of them.
+///
+/// `#[repr(u8)]` because these discriminants *are* the wire: [`Frame::encode`]
+/// writes one with `as u8`, which truncates silently. A future variant numbered
+/// past 255 would otherwise compile, go out as some other kind's byte, and be
+/// decoded by the peer as that kind. The repr turns that into a compile error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 pub enum FrameKind {
-    /// R0-F3. A nudge and its acknowledgement.
+    /// R0-F3. A nudge.
     Ping = 1,
     /// R0-F5. A chat line.
     Chat = 2,
     /// R0-F6 control plane — offers, accepts, progress. Bulk bytes ride a
     /// separate rung (T15/T16), not this session.
     DropControl = 3,
+    /// R0-F3. The answer to a [`FrameKind::Ping`], and the only thing that
+    /// makes one delivered rather than merely sent.
+    ///
+    /// A separate kind rather than a Ping sent back: two devices answering each
+    /// other with the same frame is a loop with no idle state, and a receiver
+    /// cannot tell the nudge from the answer. A Pong is never answered.
+    Pong = 4,
 }
 
 impl FrameKind {
@@ -37,6 +50,7 @@ impl FrameKind {
             1 => Some(FrameKind::Ping),
             2 => Some(FrameKind::Chat),
             3 => Some(FrameKind::DropControl),
+            4 => Some(FrameKind::Pong),
             _ => None,
         }
     }
