@@ -343,12 +343,53 @@ mod framing {
         prefix, Frame, FrameError, FrameKind, Reassembler, MAX_FRAME_PAYLOAD,
     };
 
+    /// Every kind, listed by hand on purpose.
+    ///
+    /// A new variant that is not added here is a kind nothing round-trips —
+    /// which is how `Pong` arrived, straight past a test that looked like it
+    /// covered the enum.
+    const EVERY_KIND: [FrameKind; 4] = [
+        FrameKind::Ping,
+        FrameKind::Chat,
+        FrameKind::DropControl,
+        FrameKind::Pong,
+    ];
+
     #[test]
     fn a_frame_round_trips() {
-        for kind in [FrameKind::Ping, FrameKind::Chat, FrameKind::DropControl] {
+        for kind in EVERY_KIND {
             let f = Frame::new(kind, b"payload".to_vec()).unwrap();
             assert_eq!(Frame::decode(&f.encode().unwrap()).unwrap(), f);
         }
+    }
+
+    /// The discriminants are the wire, so they are pinned rather than assumed.
+    ///
+    /// A round trip alone proves nothing about compatibility: encode and decode
+    /// share the enum, so renumbering every variant still passes while making
+    /// this build unable to talk to the last one. These bytes are the contract,
+    /// and changing one is a decision, not a refactor.
+    #[test]
+    fn the_wire_bytes_of_each_kind_are_fixed() {
+        for (kind, byte) in [
+            (FrameKind::Ping, 1u8),
+            (FrameKind::Chat, 2),
+            (FrameKind::DropControl, 3),
+            (FrameKind::Pong, 4),
+        ] {
+            let wire = Frame::new(kind, Vec::new()).unwrap().encode().unwrap();
+            assert_eq!(
+                wire[0], byte,
+                "{kind:?} went out as {} rather than {byte}; a peer on the \
+                 other version would read it as a different kind entirely",
+                wire[0]
+            );
+        }
+        assert_eq!(
+            EVERY_KIND.len(),
+            4,
+            "a kind was added without pinning its byte above"
+        );
     }
 
     #[test]

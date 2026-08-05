@@ -20,7 +20,13 @@
 //! watching frame types go past.
 
 /// What a frame carries. One session multiplexes all of them.
+///
+/// `#[repr(u8)]` because these discriminants *are* the wire: [`Frame::encode`]
+/// writes one with `as u8`, which truncates silently. A future variant numbered
+/// past 255 would otherwise compile, go out as some other kind's byte, and be
+/// decoded by the peer as that kind. The repr turns that into a compile error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 pub enum FrameKind {
     /// R0-F3. A nudge.
     Ping = 1,
