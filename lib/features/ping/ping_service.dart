@@ -20,9 +20,13 @@ class CorePingService implements PingService {
           events.isBroadcast,
           'pass a broadcast stream — each PingButton opens its own acks listener',
         ),
+        // The *answer* to our ping, not someone nudging us. These were one
+        // event once, which meant a tap looked acknowledged only if the peer
+        // happened to nudge back — so an ordinary ping always timed out, and an
+        // unrelated incoming one was mistaken for the answer.
         acks = events
-            .where((e) => e is CoreEvent_Pinged)
-            .cast<CoreEvent_Pinged>()
+            .where((e) => e is CoreEvent_PingAcked)
+            .cast<CoreEvent_PingAcked>()
             .map((e) => e.deviceId);
 
   @override

@@ -94,7 +94,11 @@ class _HomePageState extends State<HomePage> {
         case CoreEvent_DiscoveryUpdated(:final devices):
           _devices = devices;
         case CoreEvent_Pinged(:final name):
-          _log.insert(0, 'Ping ↔ $name');
+          _log.insert(0, 'Ping from $name');
+        // The answer to one of ours. The button shows it too, via PingService;
+        // this is the log's record that the round trip closed.
+        case CoreEvent_PingAcked():
+          _log.insert(0, 'Ping answered');
         // Only ever raised when we could not *reach* the device. A blocked
         // peer accepts the pipe and goes quiet, so it produces nothing here —
         // which is what keeps "blocked" indistinguishable from "not there".

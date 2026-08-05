@@ -53,11 +53,20 @@ sealed class CoreEvent with _$CoreEvent {
     required List<NearbyDevice> devices,
   }) = CoreEvent_DiscoveryUpdated;
 
-  /// A device pinged us (or our ping was acknowledged).
+  /// A device pinged us.
   const factory CoreEvent.pinged({
     required String deviceId,
     required String name,
   }) = CoreEvent_Pinged;
+
+  /// A ping we sent was answered.
+  ///
+  /// Separate from [`CoreEvent::Pinged`], which is someone nudging us. While
+  /// the two were one event, a tap looked answered only if the other person
+  /// happened to nudge back — so an ordinary ping always timed out, and an
+  /// unrelated incoming one was mistaken for the answer.
+  const factory CoreEvent.pingAcked({required String deviceId}) =
+      CoreEvent_PingAcked;
 
   /// A Ping could not be delivered — the pipe never opened.
   ///

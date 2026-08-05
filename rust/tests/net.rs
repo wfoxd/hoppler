@@ -788,3 +788,72 @@ fn a_radio_that_returns_reports_itself_available_with_no_reason() {
          has nothing to tell it otherwise"
     );
 }
+
+/// A ping comes back answered, without the other person doing anything.
+///
+/// Before there was a Pong, `Pinged` served as both the nudge and the answer —
+/// so a tap looked acknowledged only when the peer happened to nudge back, and
+/// an ordinary ping simply timed out. Worse, an unrelated incoming ping was
+/// indistinguishable from the answer to one's own.
+#[test]
+fn a_ping_is_answered_by_the_peer_that_received_it() {
+    let air = air();
+    let now = Instant::now();
+    let alice = node(&air, "alice", "Alice", now);
+    let bob = node(&air, "bob", "Bob", now);
+
+    bob.net.discovery().set_enabled(true, now).unwrap();
+    alice.net.discovery().start_scanning().unwrap();
+    settle(&alice, &bob, now);
+    alice.net.reach(&bob.id).unwrap();
+    settle(&alice, &bob, now);
+
+    alice.net.ping(&bob.id, now).unwrap();
+    let (a_events, b_events) = settle(&alice, &bob, now);
+
+    assert!(
+        b_events.contains(&NetEvent::Pinged {
+            peer: alice.id.clone(),
+            persona_name: "Alice".into(),
+        }),
+        "Bob never saw the nudge: {b_events:?}"
+    );
+    assert!(
+        a_events.contains(&NetEvent::PingAcked {
+            peer: bob.id.clone()
+        }),
+        "Alice's ping was never answered, so a tap can only ever time out: \
+         {a_events:?}"
+    );
+}
+
+/// The answer is not itself answered.
+///
+/// Two devices that each replied to the other's reply would nudge each other
+/// forever, with no idle state and a session that never goes quiet. That is the
+/// whole reason Pong is a separate kind rather than a Ping sent back.
+#[test]
+fn an_answered_ping_does_not_start_a_volley() {
+    let air = air();
+    let now = Instant::now();
+    let alice = node(&air, "alice", "Alice", now);
+    let bob = node(&air, "bob", "Bob", now);
+
+    bob.net.discovery().set_enabled(true, now).unwrap();
+    alice.net.discovery().start_scanning().unwrap();
+    settle(&alice, &bob, now);
+    alice.net.reach(&bob.id).unwrap();
+    settle(&alice, &bob, now);
+
+    alice.net.ping(&bob.id, now).unwrap();
+    settle(&alice, &bob, now);
+
+    // `settle` pumps until neither side has anything left to say. A volley
+    // would never reach that point, so arriving here at all is half the
+    // assertion; the counts are the other half.
+    let (a_again, b_again) = settle(&alice, &bob, now);
+    assert!(
+        a_again.is_empty() && b_again.is_empty(),
+        "the exchange did not go quiet: alice={a_again:?} bob={b_again:?}"
+    );
+}

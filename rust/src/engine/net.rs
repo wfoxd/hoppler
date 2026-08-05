@@ -63,6 +63,12 @@ pub enum NetEvent {
     SessionClosed { peer: PeerId },
     /// A Ping arrived from a peer we have a session with.
     Pinged { peer: PeerId, persona_name: String },
+    /// A Ping *we* sent came back answered.
+    ///
+    /// Distinct from [`NetEvent::Pinged`], which is someone nudging us. Folding
+    /// the two together made a tap look answered only when the other person
+    /// happened to nudge back, and never otherwise.
+    PingAcked { peer: PeerId },
     /// A chat line arrived.
     ChatReceived { peer: PeerId, text: String },
     /// A queued Ping was dropped because the pipe never opened.
@@ -615,9 +621,25 @@ impl Net {
         for frame in frames {
             match frame.kind {
                 FrameKind::Ping => {
+                    // Answered before it is reported, so a peer waiting on the
+                    // other end is not held up by anything the UI does with it.
+                    // Best effort: a Pong that cannot go out leaves the sender
+                    // to time out, which is what happened to every ping before
+                    // there was a Pong at all — no worse, and never a reason to
+                    // drop the nudge we did receive.
+                    if let Err(why) = self.send_frame(peer, FrameKind::Pong, Vec::new(), now) {
+                        log::warn!("could not answer {peer}'s ping: {why}");
+                    }
                     out.push(NetEvent::Pinged {
                         peer: peer.to_string(),
                         persona_name: name.clone(),
+                    });
+                }
+                // Never answered — see `FrameKind::Pong`. Two devices that each
+                // replied to the other's answer would nudge forever.
+                FrameKind::Pong => {
+                    out.push(NetEvent::PingAcked {
+                        peer: peer.to_string(),
                     });
                 }
                 FrameKind::Chat => {

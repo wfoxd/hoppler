@@ -41,8 +41,15 @@ pub struct ChatMessageDto {
 pub enum CoreEvent {
     /// The nearby-device list changed (Discovery toggled or peers moved).
     DiscoveryUpdated { devices: Vec<NearbyDevice> },
-    /// A device pinged us (or our ping was acknowledged).
+    /// A device pinged us.
     Pinged { device_id: String, name: String },
+    /// A ping we sent was answered.
+    ///
+    /// Separate from [`CoreEvent::Pinged`], which is someone nudging us. While
+    /// the two were one event, a tap looked answered only if the other person
+    /// happened to nudge back — so an ordinary ping always timed out, and an
+    /// unrelated incoming one was mistaken for the answer.
+    PingAcked { device_id: String },
     /// A Ping could not be delivered — the pipe never opened.
     ///
     /// Only ever raised for a peer we failed to *reach*. A blocked peer accepts
