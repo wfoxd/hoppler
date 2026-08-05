@@ -363,6 +363,26 @@ mod framing {
         }
     }
 
+    /// The byte a kind goes out as.
+    ///
+    /// An exhaustive match, and that is the entire point: adding a variant
+    /// fails to compile *here*, which on stable is the only way to make a new
+    /// kind impossible to forget. `std::mem::variant_count` would be tidier but
+    /// is nightly-only.
+    ///
+    /// An earlier version of this test asserted `EVERY_KIND.len() == 4`, which
+    /// guards nothing — a variant left out of the list leaves the length at 4
+    /// and the test green. It claimed in a comment to catch exactly the case it
+    /// could not, in a test written to stop that sort of thing.
+    fn wire_byte(kind: FrameKind) -> u8 {
+        match kind {
+            FrameKind::Ping => 1,
+            FrameKind::Chat => 2,
+            FrameKind::DropControl => 3,
+            FrameKind::Pong => 4,
+        }
+    }
+
     /// The discriminants are the wire, so they are pinned rather than assumed.
     ///
     /// A round trip alone proves nothing about compatibility: encode and decode
@@ -371,25 +391,16 @@ mod framing {
     /// and changing one is a decision, not a refactor.
     #[test]
     fn the_wire_bytes_of_each_kind_are_fixed() {
-        for (kind, byte) in [
-            (FrameKind::Ping, 1u8),
-            (FrameKind::Chat, 2),
-            (FrameKind::DropControl, 3),
-            (FrameKind::Pong, 4),
-        ] {
+        for kind in EVERY_KIND {
             let wire = Frame::new(kind, Vec::new()).unwrap().encode().unwrap();
+            let expected = wire_byte(kind);
             assert_eq!(
-                wire[0], byte,
-                "{kind:?} went out as {} rather than {byte}; a peer on the \
+                wire[0], expected,
+                "{kind:?} went out as {} rather than {expected}; a peer on the \
                  other version would read it as a different kind entirely",
                 wire[0]
             );
         }
-        assert_eq!(
-            EVERY_KIND.len(),
-            4,
-            "a kind was added without pinning its byte above"
-        );
     }
 
     #[test]

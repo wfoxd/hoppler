@@ -61,10 +61,14 @@ sealed class CoreEvent with _$CoreEvent {
 
   /// A ping we sent was answered.
   ///
-  /// Separate from [`CoreEvent::Pinged`], which is someone nudging us. While
-  /// the two were one event, a tap looked answered only if the other person
+  /// Separate from the "pinged" event, which is someone nudging us. While the
+  /// two were one event, a tap looked answered only if the other person
   /// happened to nudge back — so an ordinary ping always timed out, and an
   /// unrelated incoming one was mistaken for the answer.
+  ///
+  /// Named in prose rather than as a Rust path, because this comment is
+  /// copied verbatim into the generated Dart, where such a link points at
+  /// nothing.
   const factory CoreEvent.pingAcked({required String deviceId}) =
       CoreEvent_PingAcked;
 

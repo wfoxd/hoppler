@@ -96,9 +96,11 @@ class _HomePageState extends State<HomePage> {
         case CoreEvent_Pinged(:final name):
           _log.insert(0, 'Ping from $name');
         // The answer to one of ours. The button shows it too, via PingService;
-        // this is the log's record that the round trip closed.
-        case CoreEvent_PingAcked():
-          _log.insert(0, 'Ping answered');
+        // this is the log's record that the round trip closed. Named, because
+        // two pings can be in flight and a bare "answered" says nothing about
+        // which one came back.
+        case CoreEvent_PingAcked(:final deviceId):
+          _log.insert(0, 'Ping answered by ${_nameFor(deviceId)}');
         // Only ever raised when we could not *reach* the device. A blocked
         // peer accepts the pipe and goes quiet, so it produces nothing here —
         // which is what keeps "blocked" indistinguishable from "not there".
@@ -161,6 +163,18 @@ class _HomePageState extends State<HomePage> {
         ],
       ),
     );
+  }
+
+  /// A device's name if we have learned one, otherwise its id.
+  ///
+  /// The id is not pretty, but it is what distinguishes two answers — and a
+  /// peer whose persona has not arrived yet has no name to show (their tile
+  /// says so too).
+  String _nameFor(String deviceId) {
+    for (final d in _devices) {
+      if (d.deviceId == deviceId && d.name.isNotEmpty) return d.name;
+    }
+    return deviceId;
   }
 
   Widget _deviceTile(NearbyDevice d) {
