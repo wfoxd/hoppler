@@ -239,6 +239,59 @@ impl Net {
         self.send_frame(peer, FrameKind::Chat, text.as_bytes().to_vec(), now)
     }
 
+    /// One turn of the engine's clock: drop sessions that have gone quiet, then
+    /// rotate the advertised id if it is due.
+    ///
+    /// Everything else in the engine runs because the transport said something.
+    /// These two do not — they come due while nothing at all is happening, which
+    /// is exactly when no transport event will arrive to carry them. Without a
+    /// caller they are unreachable, and both were: `Discovery::tick` and
+    /// `SessionTable::sweep` were each written, documented and tested, and
+    /// neither had ever run outside a test. The id did not rotate on any real
+    /// device, and no session ever expired.
+    ///
+    /// The order is deliberate. A rotation is refused while a pipe is open
+    /// (T08 rule 4), so hanging up on idle peers first is what makes a rotation
+    /// possible at all — a device left alone would otherwise hold both its last
+    /// pipe and its last id indefinitely, which is the linkable state F2 exists
+    /// to prevent. Whether the hang-up lands in time to help *this* turn is up
+    /// to the rung: loopback disconnects synchronously, a radio does not. Either
+    /// is fine, because a refused rotation is retried on the next turn rather
+    /// than reported.
+    pub fn tick(&self, now: Instant) -> Vec<NetEvent> {
+        let closed = self.sweep_sessions(now);
+        if let Err(why) = self.discovery.tick(now) {
+            log::warn!("could not rotate the advertised id: {why}");
+        }
+        closed
+    }
+
+    /// Drop sessions idle past the timeout, and hang up on them.
+    ///
+    /// Hanging up is the point, not the freed memory. An idle pipe holds an LE
+    /// connection slot, and those come from a fixed pool shared by every app on
+    /// the phone — keeping one for a conversation that ended is precisely how
+    /// the next dial finds none free, which is the failure that cost this
+    /// project six hardware runs to diagnose.
+    fn sweep_sessions(&self, now: Instant) -> Vec<NetEvent> {
+        self.sessions
+            .sweep(now)
+            .into_iter()
+            .map(|peer| {
+                if let Err(why) = self.transport.disconnect(&peer) {
+                    // Not the benign "there was nothing to close" case — the
+                    // contract makes closing an absent pipe an `Ok`. So an error
+                    // here means the hang-up genuinely failed and the connection
+                    // slot may still be held, which is the half of this sweep
+                    // that matters.
+                    log::warn!("could not hang up on idle {peer}, slot may still be held: {why}");
+                }
+                log::info!("session with {peer} dropped: idle too long");
+                NetEvent::SessionClosed { peer }
+            })
+            .collect()
+    }
+
     fn send_frame(
         &self,
         peer: &str,

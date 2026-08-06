@@ -142,6 +142,27 @@ pub fn init_with_transport(
     install(store, Some(transport), local_id, events)
 }
 
+/// Whether the engine holds a session with `device_id`.
+///
+/// For tests, on the same terms as [`init_with_transport`] and deliberately not
+/// on the `crate::api` surface. A session is a two-sided fact and the peer's
+/// half arrives first: the engine adopts its own on the pump thread, a moment
+/// later. A test that waits only on the peer is racing that pump, and two did —
+/// invisibly on an idle machine, and 13 times in 15 under CPU load.
+///
+/// Reading it through the engine rather than the peer is the only way a test
+/// can wait for the side it is actually about to make assertions on.
+pub fn has_session(device_id: &str) -> bool {
+    CORE.lock()
+        .map(|guard| {
+            guard
+                .as_ref()
+                .and_then(|core| core.net.as_ref())
+                .is_some_and(|net| net.sessions().is_open(device_id))
+        })
+        .unwrap_or(false)
+}
+
 fn open_store(support_dir: String) -> Result<Store, String> {
     let dir = PathBuf::from(support_dir);
     let db = dir.join("hoppler.db");
@@ -184,6 +205,7 @@ fn install(
             std::time::Instant::now(),
         ));
         spawn_pump(net.clone(), events);
+        spawn_clock(&net, CLOCK_INTERVAL);
         net
     });
 
@@ -214,6 +236,48 @@ fn spawn_pump(
             }
         })
         .expect("core event pump");
+}
+
+/// How often the engine's clock wakes.
+///
+/// It serves two deadlines — a five-minute idle timeout and a twelve-minute id
+/// rotation — so this only has to be small against those, and every second it
+/// is smaller costs battery for nothing. Thirty seconds bounds a rotation's
+/// lateness to 4% of its period while waking twice a minute, against a radio
+/// that is scanning continuously; N4's budget is not spent here.
+const CLOCK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Wake periodically and give `Net` its turn.
+///
+/// The engine is otherwise entirely event-driven — [`spawn_pump`] blocks on the
+/// transport, and the only other thread is the one-shot that watches a Ping's
+/// deadline. That was the whole design, and it left the two things that come
+/// due *during silence* with nothing to call them: the advertised id never
+/// rotated, so R0-F2 unlinkability was not delivered on any device, and no
+/// session ever expired. A periodic wake is the only shape that fixes either,
+/// because there is no event to hang them off — the absence of events is the
+/// condition they fire on.
+///
+/// Holds a [`Weak`] rather than an `Arc`: nothing shuts the engine down today,
+/// but a second `init` replaces the core, and a clock still ticking against the
+/// previous one would rotate ids on a transport no longer in use. Losing the
+/// upgrade is how this thread learns it has been replaced.
+fn spawn_clock(net: &Arc<net::Net>, interval: std::time::Duration) {
+    let net = Arc::downgrade(net);
+    std::thread::Builder::new()
+        .name("hoppler-core-clock".into())
+        .spawn(move || loop {
+            std::thread::sleep(interval);
+            let Some(net) = net.upgrade() else { return };
+            for out in net.tick(std::time::Instant::now()) {
+                on_net_event(&net, out);
+            }
+        })
+        // Loudly, like the pump. A dropped spawn error here is silent and total:
+        // the id stops rotating and sessions stop expiring, which is precisely
+        // the state this thread was added to end, restored without a trace. It
+        // was written `let _ =` first, and review was right to call that out.
+        .expect("core clock");
 }
 
 /// A fresh node id for the rung: random, and carrying nothing derived from our

@@ -23,7 +23,7 @@ use rust_lib_hoppler::api::messaging::{
 };
 use rust_lib_hoppler::api::transfers::offer_drop;
 use rust_lib_hoppler::discovery::Discovery;
-use rust_lib_hoppler::engine::init_with_transport;
+use rust_lib_hoppler::engine::{has_session, init_with_transport};
 use rust_lib_hoppler::identity::Identity;
 use rust_lib_hoppler::transport::loopback::LoopbackNet;
 use rust_lib_hoppler::transport::{Transport, TransportError, TransportEvent};
@@ -353,6 +353,9 @@ struct SessionPeer {
     net: rust_lib_hoppler::engine::net::Net,
     rx: Receiver<TransportEvent>,
     transport: Arc<dyn Transport>,
+    /// The id the engine knows this peer by, so the wait can ask the engine's
+    /// side about it and not only the peer's.
+    id: String,
 }
 
 /// A peer that will complete a handshake with the engine, so the core holds a
@@ -373,7 +376,12 @@ fn session_peer(air: &LoopbackNet, id: &str, identity: Arc<Mutex<Identity>>) -> 
     // handshake cannot start without the responder's static key in advance, so
     // the session would never form and the rotation would go untested.
     net.discovery().set_enabled(true, Instant::now()).unwrap();
-    SessionPeer { net, rx, transport }
+    SessionPeer {
+        net,
+        rx,
+        transport,
+        id: id.to_string(),
+    }
 }
 
 /// Drive the peer's side until it holds a session with the engine.
@@ -381,6 +389,15 @@ fn session_peer(air: &LoopbackNet, id: &str, identity: Arc<Mutex<Identity>>) -> 
 /// Only this side needs pumping — the engine runs its own pump thread. Waits on
 /// the session itself rather than a sleep, so a failure here means the
 /// handshake did not happen, not that the machine was slow.
+///
+/// Wait until **both** sides hold the session.
+///
+/// The peer's half is not enough, and waiting only on it is a race every caller
+/// here loses. The engine adopts its own side on the pump thread, so a test can
+/// see the peer connected and still make its assertions before the engine has
+/// reconciled the contact or become able to send. Idle, the pump wins and this
+/// is invisible; under CPU load the two tests below failed 13 times in 15, and
+/// on CI they failed for real.
 fn until_session(p: &SessionPeer) {
     p.transport.connect("core").unwrap();
     until("the peer to hold a session with the engine", || {
@@ -390,6 +407,7 @@ fn until_session(p: &SessionPeer) {
         }
         p.net.sessions().is_open("core")
     });
+    until("the engine to hold the session too", || has_session(&p.id));
 }
 
 /// One person, two device ids, one conversation.
