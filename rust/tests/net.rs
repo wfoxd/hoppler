@@ -14,8 +14,10 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use rust_lib_hoppler::discovery::ROTATION_PERIOD;
 use rust_lib_hoppler::engine::net::{Net, NetEvent, PING_DEADLINE};
 use rust_lib_hoppler::identity::Identity;
+use rust_lib_hoppler::session::table::IDLE_TIMEOUT;
 use rust_lib_hoppler::transport::loopback::LoopbackNet;
 use rust_lib_hoppler::transport::{Transport, TransportEvent};
 
@@ -855,5 +857,148 @@ fn an_answered_ping_does_not_start_a_volley() {
     assert!(
         a_again.is_empty() && b_again.is_empty(),
         "the exchange did not go quiet: alice={a_again:?} bob={b_again:?}"
+    );
+}
+
+// ── the clock ───────────────────────────────────────────────────────────────
+
+// The two things that come due during silence, and so had no caller.
+//
+// `Discovery::tick` and `SessionTable::sweep` were both written, documented and
+// unit-tested, and neither had ever run outside a test: nothing in the engine
+// consulted a clock. On hardware that meant the advertised id never rotated —
+// R0-F2 undelivered — and a session idle for nine minutes against a five-minute
+// timeout was still open. These hold the caller in place.
+
+/// A session nobody has used is dropped, and the pipe is hung up on.
+#[test]
+fn the_clock_drops_a_session_that_has_gone_quiet() {
+    let air = air();
+    let now = Instant::now();
+    let alice = node(&air, "alice", "Alice", now);
+    let bob = node(&air, "bob", "Bob", now);
+
+    bob.net.discovery().set_enabled(true, now).unwrap();
+    alice.net.discovery().start_scanning().unwrap();
+    settle(&alice, &bob, now);
+    alice.net.reach(&bob.id).unwrap();
+    settle(&alice, &bob, now);
+    assert!(
+        alice.net.sessions().is_open(&bob.id),
+        "no session to let go idle"
+    );
+
+    let idle = now + IDLE_TIMEOUT;
+    assert_eq!(
+        alice.net.tick(idle),
+        vec![NetEvent::SessionClosed {
+            peer: bob.id.clone()
+        }],
+        "the idle session was not dropped"
+    );
+    assert!(
+        !alice.net.sessions().is_open(&bob.id),
+        "the session was reported closed but is still open"
+    );
+    // The hang-up is the point: an idle pipe holds an LE connection slot from a
+    // pool shared by every app on the phone, so dropping the keys while keeping
+    // the pipe would leave the scarce half of the resource held.
+    assert!(
+        !alice.transport.pipes().contains(&bob.id),
+        "the session went but the pipe stayed open"
+    );
+}
+
+/// A session in use is not.
+///
+/// The bug this guards is an off-by-one in the other direction: a sweep that
+/// fired a moment early would tear down live conversations, which is worse than
+/// the leak it replaced.
+#[test]
+fn the_clock_leaves_a_live_session_alone() {
+    let air = air();
+    let now = Instant::now();
+    let alice = node(&air, "alice", "Alice", now);
+    let bob = node(&air, "bob", "Bob", now);
+
+    bob.net.discovery().set_enabled(true, now).unwrap();
+    alice.net.discovery().start_scanning().unwrap();
+    settle(&alice, &bob, now);
+    alice.net.reach(&bob.id).unwrap();
+    settle(&alice, &bob, now);
+
+    assert!(
+        alice
+            .net
+            .tick(now + IDLE_TIMEOUT - Duration::from_secs(1))
+            .is_empty(),
+        "a session one second short of the timeout was dropped"
+    );
+    assert!(alice.net.sessions().is_open(&bob.id));
+}
+
+/// The advertised id rotates on the clock, which is the whole of R0-F2.
+#[test]
+fn the_clock_rotates_the_advertised_id() {
+    let air = air();
+    let now = Instant::now();
+    let alice = node(&air, "alice", "Alice", now);
+
+    alice.net.discovery().set_enabled(true, now).unwrap();
+    let before = alice.net.discovery().local_id();
+
+    alice.net.tick(now + ROTATION_PERIOD);
+
+    assert_ne!(
+        alice.net.discovery().local_id(),
+        before,
+        "the id did not rotate — an observer can link across the whole session"
+    );
+}
+
+/// …but not out from under a conversation still in progress (T08 rule 4).
+///
+/// Rotating under an open pipe would break the tie-break both sides already
+/// agreed on. The engine must not treat that refusal as an error.
+///
+/// The session has to be *fresh* for this to test anything: a rotation comes
+/// due at twelve minutes and a sweep at five, so a pair that has sat still
+/// since the start gets hung up on first and then rotates quite correctly.
+/// Pinging a minute before the rotation is what makes the pipe genuinely busy
+/// at the moment it comes due — and the first draft of this test, without that,
+/// asserted the opposite of what it meant and failed.
+#[test]
+fn the_clock_does_not_rotate_out_from_under_a_busy_pipe() {
+    let air = air();
+    let now = Instant::now();
+    let alice = node(&air, "alice", "Alice", now);
+    let bob = node(&air, "bob", "Bob", now);
+
+    bob.net.discovery().set_enabled(true, now).unwrap();
+    alice.net.discovery().set_enabled(true, now).unwrap();
+    alice.net.discovery().start_scanning().unwrap();
+    settle(&alice, &bob, now);
+    alice.net.reach(&bob.id).unwrap();
+    settle(&alice, &bob, now);
+    let before = alice.net.discovery().local_id();
+
+    let busy = now + ROTATION_PERIOD - Duration::from_secs(60);
+    alice.net.ping(&bob.id, busy).unwrap();
+    settle(&alice, &bob, busy);
+
+    // Due, but refused — and the refusal must not surface as a failure.
+    let due = now + ROTATION_PERIOD;
+    assert!(
+        alice.net.tick(due).is_empty(),
+        "a session used a minute ago was swept"
+    );
+    assert!(
+        alice.transport.pipes().contains(&bob.id),
+        "the pipe this test needs open was closed"
+    );
+    assert_eq!(
+        alice.net.discovery().local_id(),
+        before,
+        "the id rotated while a pipe was open"
     );
 }

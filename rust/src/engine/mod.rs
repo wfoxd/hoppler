@@ -184,6 +184,7 @@ fn install(
             std::time::Instant::now(),
         ));
         spawn_pump(net.clone(), events);
+        spawn_clock(&net, CLOCK_INTERVAL);
         net
     });
 
@@ -214,6 +215,43 @@ fn spawn_pump(
             }
         })
         .expect("core event pump");
+}
+
+/// How often the engine's clock wakes.
+///
+/// It serves two deadlines — a five-minute idle timeout and a twelve-minute id
+/// rotation — so this only has to be small against those, and every second it
+/// is smaller costs battery for nothing. Thirty seconds bounds a rotation's
+/// lateness to 4% of its period while waking twice a minute, against a radio
+/// that is scanning continuously; N4's budget is not spent here.
+const CLOCK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Wake periodically and give `Net` its turn.
+///
+/// The engine is otherwise entirely event-driven — [`spawn_pump`] blocks on the
+/// transport, and the only other thread is the one-shot that watches a Ping's
+/// deadline. That was the whole design, and it left the two things that come
+/// due *during silence* with nothing to call them: the advertised id never
+/// rotated, so R0-F2 unlinkability was not delivered on any device, and no
+/// session ever expired. A periodic wake is the only shape that fixes either,
+/// because there is no event to hang them off — the absence of events is the
+/// condition they fire on.
+///
+/// Holds a [`Weak`] rather than an `Arc`: nothing shuts the engine down today,
+/// but a second `init` replaces the core, and a clock still ticking against the
+/// previous one would rotate ids on a transport no longer in use. Losing the
+/// upgrade is how this thread learns it has been replaced.
+fn spawn_clock(net: &Arc<net::Net>, interval: std::time::Duration) {
+    let net = Arc::downgrade(net);
+    let _ = std::thread::Builder::new()
+        .name("hoppler-core-clock".into())
+        .spawn(move || loop {
+            std::thread::sleep(interval);
+            let Some(net) = net.upgrade() else { return };
+            for out in net.tick(std::time::Instant::now()) {
+                on_net_event(&net, out);
+            }
+        });
 }
 
 /// A fresh node id for the rung: random, and carrying nothing derived from our
