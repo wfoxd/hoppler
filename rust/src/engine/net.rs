@@ -279,9 +279,12 @@ impl Net {
             .into_iter()
             .map(|peer| {
                 if let Err(why) = self.transport.disconnect(&peer) {
-                    // Worth a line but not a failure: the pipe may already be
-                    // gone, and the session is dropped either way.
-                    log::info!("idle {peer} did not need hanging up: {why}");
+                    // Not the benign "there was nothing to close" case — the
+                    // contract makes closing an absent pipe an `Ok`. So an error
+                    // here means the hang-up genuinely failed and the connection
+                    // slot may still be held, which is the half of this sweep
+                    // that matters.
+                    log::warn!("could not hang up on idle {peer}, slot may still be held: {why}");
                 }
                 log::info!("session with {peer} dropped: idle too long");
                 NetEvent::SessionClosed { peer }

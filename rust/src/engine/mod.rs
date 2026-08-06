@@ -243,7 +243,7 @@ const CLOCK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 /// upgrade is how this thread learns it has been replaced.
 fn spawn_clock(net: &Arc<net::Net>, interval: std::time::Duration) {
     let net = Arc::downgrade(net);
-    let _ = std::thread::Builder::new()
+    std::thread::Builder::new()
         .name("hoppler-core-clock".into())
         .spawn(move || loop {
             std::thread::sleep(interval);
@@ -251,7 +251,12 @@ fn spawn_clock(net: &Arc<net::Net>, interval: std::time::Duration) {
             for out in net.tick(std::time::Instant::now()) {
                 on_net_event(&net, out);
             }
-        });
+        })
+        // Loudly, like the pump. A dropped spawn error here is silent and total:
+        // the id stops rotating and sessions stop expiring, which is precisely
+        // the state this thread was added to end, restored without a trace. It
+        // was written `let _ =` first, and review was right to call that out.
+        .expect("core clock");
 }
 
 /// A fresh node id for the rung: random, and carrying nothing derived from our
