@@ -142,6 +142,27 @@ pub fn init_with_transport(
     install(store, Some(transport), local_id, events)
 }
 
+/// Whether the engine holds a session with `device_id`.
+///
+/// For tests, on the same terms as [`init_with_transport`] and deliberately not
+/// on the `crate::api` surface. A session is a two-sided fact and the peer's
+/// half arrives first: the engine adopts its own on the pump thread, a moment
+/// later. A test that waits only on the peer is racing that pump, and two did —
+/// invisibly on an idle machine, and 13 times in 15 under CPU load.
+///
+/// Reading it through the engine rather than the peer is the only way a test
+/// can wait for the side it is actually about to make assertions on.
+pub fn has_session(device_id: &str) -> bool {
+    CORE.lock()
+        .map(|guard| {
+            guard
+                .as_ref()
+                .and_then(|core| core.net.as_ref())
+                .is_some_and(|net| net.sessions().is_open(device_id))
+        })
+        .unwrap_or(false)
+}
+
 fn open_store(support_dir: String) -> Result<Store, String> {
     let dir = PathBuf::from(support_dir);
     let db = dir.join("hoppler.db");
