@@ -295,8 +295,17 @@ impl Discovery {
         self.inner.transport.start_advertising(Vec::new())
     }
 
-    /// Feed a transport event in.
-    pub fn on_event(&self, event: TransportEvent, _now: Instant) {
+    /// Feed a transport event in. Returns whether the nearby list actually
+    /// changed.
+    ///
+    /// The answer is not always yes, and the difference is not small. mDNS
+    /// resolves a peer once per interface and address, so a single LAN peer
+    /// appearing produced sixteen `PeerFound` events inside one second, then
+    /// another every ~98 s for as long as it sat there — measured twice,
+    /// identically, in `lan_re_resolves_a_peer_that_never_moved`. Every one of
+    /// them used to push a fresh device list across the bridge and rebuild the
+    /// screen, for a list that was identical each time.
+    pub fn on_event(&self, event: TransportEvent, _now: Instant) -> bool {
         match event {
             TransportEvent::PeerFound { peer, .. } => {
                 // Re-sent whenever the advertised payload changes (T08 rule on
@@ -314,15 +323,21 @@ impl Discovery {
                     .unwrap_or_else(|e| e.into_inner())
                     .get(&peer)
                     .cloned();
-                self.inner
+                let mut sightings = self
+                    .inner
                     .sightings
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .entry(peer.clone())
-                    .or_insert(Sighting {
-                        peer,
-                        persona: known,
-                    });
+                    .unwrap_or_else(|e| e.into_inner());
+                let fresh = !sightings.contains_key(&peer);
+                sightings.entry(peer.clone()).or_insert(Sighting {
+                    peer,
+                    persona: known,
+                });
+                // A re-resolve of a peer already listed changes nothing. The
+                // payload is deliberately not compared: `PeerFound` carries the
+                // advertisement, and this branch has never stored it — the
+                // persona comes through the endpoint instead.
+                fresh
             }
             TransportEvent::PeerLost { peer } => {
                 self.inner
@@ -334,13 +349,14 @@ impl Discovery {
                     .sightings
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .remove(&peer);
+                    .remove(&peer)
+                    .is_some()
             }
             // Bytes are *not* handled here any more. The pipe carries two
             // protocols, and telling them apart by inspecting content cannot be
             // made reliable — see `engine::pipe`. The caller demultiplexes and
             // hands whole requests to `answer`.
-            _ => {}
+            _ => false,
         }
     }
 

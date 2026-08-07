@@ -1002,3 +1002,60 @@ fn the_clock_does_not_rotate_out_from_under_a_busy_pipe() {
         "the id rotated while a pipe was open"
     );
 }
+
+/// A rung that reports the same peer over and over must not rebuild the screen
+/// each time.
+///
+/// mDNS resolves a service once per interface and per address, which on this
+/// machine meant sixteen `PeerFound` events for one peer inside a single second
+/// (measured in `transport::lan_re_resolves_a_peer_that_never_moved`), and then
+/// another every hundred seconds for as long as it stays put. Each one used to
+/// send a fresh device list over the bridge and rebuild the list, every time
+/// with identical contents.
+///
+/// The first sighting is news. The fifteen behind it are not.
+#[test]
+fn a_repeated_sighting_does_not_keep_telling_the_ui() {
+    let air = air();
+    let now = Instant::now();
+    let alice = node(&air, "alice", "Alice", now);
+
+    let sighting = || TransportEvent::PeerFound {
+        peer: "bob".to_string(),
+        payload: Vec::new(),
+    };
+    let lost = || TransportEvent::PeerLost {
+        peer: "bob".to_string(),
+    };
+
+    assert_eq!(
+        alice.net.handle(sighting(), now),
+        vec![NetEvent::PeersChanged],
+        "the first sighting of a peer has to reach the UI"
+    );
+    for i in 0..15 {
+        assert!(
+            alice.net.handle(sighting(), now).is_empty(),
+            "re-sighting {i} of a peer already listed rebuilt the list again"
+        );
+    }
+
+    // Going away is news again — the guard must not swallow real changes,
+    // which would leave someone on screen after they left.
+    assert_eq!(
+        alice.net.handle(lost(), now),
+        vec![NetEvent::PeersChanged],
+        "a peer going away did not reach the UI"
+    );
+    assert!(
+        alice.net.handle(lost(), now).is_empty(),
+        "losing a peer that had already gone reported a change that did not happen"
+    );
+
+    // And it can come back.
+    assert_eq!(
+        alice.net.handle(sighting(), now),
+        vec![NetEvent::PeersChanged],
+        "a peer returning after being lost did not reach the UI"
+    );
+}
