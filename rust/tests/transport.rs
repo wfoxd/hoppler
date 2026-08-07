@@ -12,6 +12,7 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use mdns_sd::VERIFY_TIMEOUT_DEFAULT;
 use rust_lib_hoppler::transport::lan::LanTransport;
 use rust_lib_hoppler::transport::loopback::LoopbackNet;
 use rust_lib_hoppler::transport::{Transport, TransportError, TransportEvent};
@@ -1615,18 +1616,26 @@ fn lan_verify_evicts_a_peer_that_died_without_saying_goodbye() {
     let killed = std::time::Instant::now();
     a.verify_peer("verify-ghost");
 
+    // Re-ask no faster than the probe's own window. An earlier draft asked
+    // again on every 2 s poll timeout, which stacks five probes inside one
+    // 10 s verification: `mdns-sd` may reject the extras once its command
+    // queue fills, and the elapsed time then belongs to no particular probe —
+    // which ruins the one number this test exists to report. Waiting out the
+    // timeout before asking again is also what the engine's clock does.
     let mut gone = None;
     let deadline = std::time::Duration::from_secs(60);
+    let mut ask_again_at = killed + VERIFY_TIMEOUT_DEFAULT;
     while killed.elapsed() < deadline {
-        match rx_a.recv_timeout(std::time::Duration::from_secs(2)) {
+        match rx_a.recv_timeout(std::time::Duration::from_millis(500)) {
             Ok(TransportEvent::PeerLost { peer }) if peer == "verify-ghost" => {
                 gone = Some(killed.elapsed());
                 break;
             }
-            Ok(_) => {}
-            Err(_) => {
-                // Nothing arrived; ask again, as the engine's clock would.
-                a.verify_peer("verify-ghost");
+            _ => {
+                if std::time::Instant::now() >= ask_again_at {
+                    a.verify_peer("verify-ghost");
+                    ask_again_at = std::time::Instant::now() + VERIFY_TIMEOUT_DEFAULT;
+                }
             }
         }
     }
