@@ -104,6 +104,12 @@ struct Inner {
     identity: Arc<Mutex<Identity>>,
     on: AtomicBool,
     sightings: Mutex<HashMap<PeerId, Sighting>>,
+    /// When each sighting was last confirmed by the rung.
+    ///
+    /// Beside the sightings rather than inside `Sighting`, which is public and
+    /// travels to the UI — the screen has no use for an `Instant`, and putting
+    /// one there would make every consumer carry it.
+    last_seen: Mutex<HashMap<PeerId, Instant>>,
     /// Personas learned for a peer, held independently of whether that peer has
     /// a sighting *yet*.
     ///
@@ -145,6 +151,7 @@ impl Discovery {
                 identity,
                 on: AtomicBool::new(false),
                 sightings: Mutex::new(HashMap::new()),
+                last_seen: Mutex::new(HashMap::new()),
                 personas: Mutex::new(HashMap::new()),
                 blocked: Mutex::new(Vec::new()),
                 buckets: Mutex::new(Buckets {
@@ -230,6 +237,32 @@ impl Discovery {
             .collect()
     }
 
+    /// Peers the rung has not confirmed for longer than `longer_than`.
+    ///
+    /// Not "peers that have gone" — only peers worth asking about. A rung that
+    /// re-reports constantly will never list anything here; one that re-resolves
+    /// every ~98 s, as mDNS does, will list a peer that is present and perfectly
+    /// well. The answer to that is a probe, not a deletion.
+    pub fn unheard_from(&self, now: Instant, longer_than: Duration) -> Vec<PeerId> {
+        let last_seen = self
+            .inner
+            .last_seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.inner
+            .sightings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .filter(|peer| {
+                last_seen
+                    .get(*peer)
+                    .is_none_or(|seen| now.saturating_duration_since(*seen) >= longer_than)
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Block a pseudonym. Silent and local (R0-F10).
     pub fn block(&self, pseudonym: [u8; PSEUDONYM_LEN]) {
         let mut blocked = self.inner.blocked.lock().unwrap_or_else(|e| e.into_inner());
@@ -305,9 +338,17 @@ impl Discovery {
     /// identically, in `lan_re_resolves_a_peer_that_never_moved`. Every one of
     /// them used to push a fresh device list across the bridge and rebuild the
     /// screen, for a list that was identical each time.
-    pub fn on_event(&self, event: TransportEvent, _now: Instant) -> bool {
+    pub fn on_event(&self, event: TransportEvent, now: Instant) -> bool {
         match event {
             TransportEvent::PeerFound { peer, .. } => {
+                // Recorded on *every* sighting, including the re-resolves that
+                // change nothing: the question this answers is "when did the
+                // rung last confirm it", which a repeat does confirm.
+                self.inner
+                    .last_seen
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(peer.clone(), now);
                 // Re-sent whenever the advertised payload changes (T08 rule on
                 // PeerFound), so this fires repeatedly for a peer we already
                 // know. Overwriting would discard a persona we have already
@@ -340,6 +381,11 @@ impl Discovery {
                 fresh
             }
             TransportEvent::PeerLost { peer } => {
+                self.inner
+                    .last_seen
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&peer);
                 self.inner
                     .personas
                     .lock()

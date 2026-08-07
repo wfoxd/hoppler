@@ -52,6 +52,17 @@ use crate::transport::{PeerId, Transport, TransportError, TransportEvent};
 /// answer to the tap that caused it.
 pub const PING_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How quiet a peer must go before the engine asks the rung about it.
+///
+/// Long enough that a rung reporting normally is never asked at all, short
+/// enough that a departure is noticed in tens of seconds rather than the two
+/// minutes an mDNS record TTL takes. Detection lands at roughly this plus the
+/// rung's own probe timeout plus a tick — around 45–70 s on LAN, against ~120 s
+/// before and ~15 s on BLE, which advertises continuously and needs none of
+/// this. Closer parity would mean a faster clock, and that is a battery cost
+/// (N4) paid by every rung to help one.
+const QUIET_BEFORE_ASKING: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Something the engine should act on: store a row, emit to Dart, update the UI.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NetEvent {
@@ -263,7 +274,37 @@ impl Net {
         if let Err(why) = self.discovery.tick(now) {
             log::warn!("could not rotate the advertised id: {why}");
         }
+        self.check_on_quiet_peers(now);
         closed
+    }
+
+    /// Ask the rung about anyone it has not mentioned lately.
+    ///
+    /// A peer that leaves without saying goodbye — out of range, flat battery,
+    /// interface gone — sends nothing, so the rung finds out by asking or by
+    /// waiting. Waiting is what the LAN rung did, and it costs about two
+    /// minutes against BLE's fifteen seconds, because mDNS re-resolves a
+    /// stationary peer only every ~98 s (§5.0.21).
+    ///
+    /// This does not decide anyone has gone. It asks, and the rung answers the
+    /// only way it ever does, with `PeerLost` or a fresh sighting. A rung with
+    /// nothing to ask ignores it, which is why `verify_peer` has a default.
+    ///
+    /// Self-limiting, and measured to be: a probe that finds the peer alive
+    /// comes back as a sighting, which refreshes its last-seen and takes it off
+    /// this list until it goes quiet again. Twelve probes of a live peer
+    /// produced sixteen sightings and no removals.
+    ///
+    /// Only while Discovery is on. The point of noticing quickly is a list
+    /// somebody is looking at; with it off there is no list, and probing the
+    /// neighbourhood on a timer would be traffic for nobody.
+    fn check_on_quiet_peers(&self, now: Instant) {
+        if !self.discovery.is_on() {
+            return;
+        }
+        for peer in self.discovery.unheard_from(now, QUIET_BEFORE_ASKING) {
+            self.transport.verify_peer(&peer);
+        }
     }
 
     /// Drop sessions idle past the timeout, and hang up on them.
