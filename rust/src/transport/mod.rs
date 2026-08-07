@@ -212,6 +212,24 @@ pub trait Transport: Send + Sync {
     /// Close a pipe. Emits `PipeClosed`. Closing an absent pipe is not an error.
     fn disconnect(&self, peer: &str) -> Result<(), TransportError>;
 
+    /// Ask whether a peer is still there, rather than waiting to be told.
+    ///
+    /// Rungs learn that a peer has gone at wildly different speeds when it
+    /// leaves without saying goodbye — walked out of range, went flat, lost the
+    /// interface. BLE re-advertises continuously, so its own ageing notices in
+    /// 15 s. mDNS re-resolves a peer that never moved only every ~98 s
+    /// (measured, §5.0.21), so the LAN rung waits out a record TTL and someone
+    /// who left the room stays on screen for about two minutes.
+    ///
+    /// This is the core asking the rung to go and check. A rung that already
+    /// notices quickly does nothing — hence the default. One that can probe
+    /// should, and report the answer the ordinary way, through `PeerLost`.
+    ///
+    /// Deliberately returns nothing. The answer is not available now; it
+    /// arrives as an event, like every other fact about a peer, so a caller
+    /// cannot come to depend on a synchronous reply the radios cannot give.
+    fn verify_peer(&self, _peer: &str) {}
+
     /// Peers currently known — those discovered and not since lost, plus any
     /// that dialled us.
     ///

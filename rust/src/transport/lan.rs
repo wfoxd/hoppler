@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo, VERIFY_TIMEOUT_DEFAULT};
 
 use super::{EventSink, PeerId, Transport, TransportError, TransportEvent, TransportLimits};
 
@@ -1067,6 +1067,35 @@ impl Transport for LanTransport {
                 let _ = self.disconnect(peer);
                 Err(TransportError::Io(why))
             }
+        }
+    }
+
+    /// Probe a peer with a targeted mDNS query (RFC 6762 §10.4).
+    ///
+    /// `mdns-sd` re-queries a stationary peer only every ~98 s, so passively
+    /// waiting is what makes this rung two minutes slow to notice a departure.
+    /// This asks directly: if the instance does not answer within the timeout,
+    /// its records are flushed and `ServiceRemoved` follows — which this rung
+    /// already turns into `PeerLost`, so nothing else has to change.
+    ///
+    /// Targeted rather than a fresh browse, and only for a peer already
+    /// suspected of being gone. Forcing the whole service type to re-resolve on
+    /// a timer would put multicast on a shared network every few seconds, which
+    /// is exactly the traffic mDNS's back-off exists to prevent.
+    ///
+    /// Silent on error by contract: the answer travels as `PeerLost` or not at
+    /// all, and a full command queue means the daemon is busy, not that the
+    /// peer has gone.
+    fn verify_peer(&self, peer: &str) {
+        if self.inner.shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        if let Err(why) = self
+            .inner
+            .mdns
+            .verify(Self::fullname(peer), VERIFY_TIMEOUT_DEFAULT)
+        {
+            log::debug!("could not ask whether {peer} is still there: {why}");
         }
     }
 

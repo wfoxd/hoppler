@@ -12,6 +12,7 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use mdns_sd::VERIFY_TIMEOUT_DEFAULT;
 use rust_lib_hoppler::transport::lan::LanTransport;
 use rust_lib_hoppler::transport::loopback::LoopbackNet;
 use rust_lib_hoppler::transport::{Transport, TransportError, TransportEvent};
@@ -1539,5 +1540,170 @@ fn lan_re_resolves_a_peer_that_never_moved() {
          ageing sightings in the core would delete peers that never left. \
          §5.0.3's fix is unsafe as written and the asymmetry needs another answer.",
         window.as_secs()
+    );
+}
+
+/// A peer that dies without saying goodbye, so the rung has to notice by itself.
+///
+/// Every graceful exit — Discovery off, app closed, `shutdown()` — withdraws the
+/// mDNS registration and the browser drops the peer at once. The case that
+/// matters is the ungraceful one: walked out of range, went flat, lost the
+/// interface. Nothing is sent, so the rung learns only by asking or by waiting.
+///
+/// It has to be a separate *process*, killed outright. `ServiceDaemon::shutdown`
+/// sends goodbye packets, and dropping the handle does not stop the daemon
+/// thread answering — so neither simulates a vanish. A `SIGKILL`ed child does:
+/// no goodbye, and nothing left alive to answer the query.
+#[cfg(unix)]
+fn spawn_ghost(id: &str) -> std::process::Child {
+    std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["ghost_advertiser_process", "--exact", "--ignored"])
+        .env("HOPPLER_GHOST_ID", id)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("could not spawn the ghost advertiser")
+}
+
+/// Not a test — the body of the child process [`spawn_ghost`] starts.
+#[test]
+#[ignore = "helper process, not a test; started by spawn_ghost"]
+fn ghost_advertiser_process() {
+    let Ok(id) = std::env::var("HOPPLER_GHOST_ID") else {
+        return;
+    };
+    let (sink, _rx) = recorder();
+    let t = LanTransport::new(id, sink).unwrap();
+    t.start_advertising(b"ghost".to_vec()).unwrap();
+    // Long enough for the parent to finish and kill us; short enough that a
+    // parent which crashed does not leave this advertising forever.
+    std::thread::sleep(std::time::Duration::from_secs(180));
+}
+
+/// Does asking make a departed peer go, and how much faster?
+///
+/// §5.0.21 measured the passive path: mDNS re-resolves a peer that never moved
+/// only every ~98 s, so the LAN rung waits out a record TTL and someone who
+/// left stays listed for about two minutes — against 15 s on BLE. `verify_peer`
+/// is the active path, RFC 6762 §10.4: query the instance directly and flush it
+/// if nothing answers.
+///
+/// Reports the number rather than asserting a bound, for the same reason as the
+/// cadence test: the timing belongs to `mdns-sd` and the network. What it does
+/// assert is what the design turns on — that the peer goes *at all*, and well
+/// inside the two minutes the passive path takes.
+///
+/// `cargo test --test transport -- --ignored lan_verify --nocapture`
+#[test]
+#[ignore = "needs multicast; spawns a child process; run locally"]
+#[cfg(unix)]
+fn lan_verify_evicts_a_peer_that_died_without_saying_goodbye() {
+    let (sink_a, rx_a) = recorder();
+    let a = LanTransport::new("verify-watcher", sink_a).unwrap();
+    a.start_scanning().unwrap();
+
+    let mut ghost = spawn_ghost("verify-ghost");
+    let found = wait_for(
+        &rx_a,
+        |e| matches!(e, TransportEvent::PeerFound { peer, .. } if peer == "verify-ghost"),
+    );
+    assert!(matches!(found, TransportEvent::PeerFound { .. }));
+
+    // Killed, not asked to stop: no goodbye, and nothing left to answer.
+    ghost.kill().expect("could not kill the ghost");
+    ghost.wait().ok();
+
+    let killed = std::time::Instant::now();
+    a.verify_peer("verify-ghost");
+
+    // Re-ask no faster than the probe's own window. An earlier draft asked
+    // again on every 2 s poll timeout, which stacks five probes inside one
+    // 10 s verification: `mdns-sd` may reject the extras once its command
+    // queue fills, and the elapsed time then belongs to no particular probe —
+    // which ruins the one number this test exists to report. Waiting out the
+    // timeout before asking again is also what the engine's clock does.
+    let mut gone = None;
+    let deadline = std::time::Duration::from_secs(60);
+    let mut ask_again_at = killed + VERIFY_TIMEOUT_DEFAULT;
+    while killed.elapsed() < deadline {
+        match rx_a.recv_timeout(std::time::Duration::from_millis(500)) {
+            Ok(TransportEvent::PeerLost { peer }) if peer == "verify-ghost" => {
+                gone = Some(killed.elapsed());
+                break;
+            }
+            _ => {
+                if std::time::Instant::now() >= ask_again_at {
+                    a.verify_peer("verify-ghost");
+                    ask_again_at = std::time::Instant::now() + VERIFY_TIMEOUT_DEFAULT;
+                }
+            }
+        }
+    }
+
+    match gone {
+        Some(t) => println!("PeerLost {:.1}s after the peer was killed", t.as_secs_f64()),
+        None => panic!(
+            "the peer was still listed {}s after it died — asking did not evict it, \
+             so the LAN rung is still waiting out the record TTL and §5.0.21's \
+             option 4 does not work as designed",
+            deadline.as_secs()
+        ),
+    }
+}
+
+/// Asking must never evict a peer that is still answering.
+///
+/// This is the risk that makes active verification worth testing rather than
+/// just shipping. `verify` flushes the records when nothing replies, so a probe
+/// that raced its own answer — or one issued so often the daemon could not keep
+/// up — would delete people who never left. That failure is worse than the
+/// slowness being fixed, and it is the same trap §5.0.3 flagged for a
+/// Discovery-level TTL.
+///
+/// So: a live advertiser, probed far harder than the engine ever will, and no
+/// `PeerLost` at all.
+#[test]
+#[ignore = "needs multicast; run locally"]
+fn lan_verify_does_not_evict_a_peer_that_is_still_there() {
+    let (sink_a, rx_a) = recorder();
+    let (sink_b, _rx_b) = recorder();
+    let a = LanTransport::new("live-watcher", sink_a).unwrap();
+    let b = LanTransport::new("live-peer", sink_b).unwrap();
+
+    b.start_advertising(b"still-here".to_vec()).unwrap();
+    a.start_scanning().unwrap();
+    wait_for(
+        &rx_a,
+        |e| matches!(e, TransportEvent::PeerFound { peer, .. } if peer == "live-peer"),
+    );
+
+    // Twelve probes over ~35 s, against a peer that is sitting right there.
+    // The engine's clock asks at most once every 30 s.
+    for _ in 0..12 {
+        a.verify_peer("live-peer");
+        std::thread::sleep(std::time::Duration::from_secs(3));
+    }
+
+    // Drain whatever accumulated and insist none of it was a removal.
+    //
+    // The `found` count is not incidental: it says whether a *successful* probe
+    // answers as a resolve. If it does, verifying refreshes the core's
+    // last-seen and the engine probes each peer at most once per stale window;
+    // if it does not, a peer stays stale forever and every tick probes it
+    // again. The engine's threshold depends on which.
+    let mut lost = 0usize;
+    let mut found = 0usize;
+    while let Ok(e) = rx_a.recv_timeout(std::time::Duration::from_millis(200)) {
+        match &e {
+            TransportEvent::PeerLost { peer } if peer == "live-peer" => lost += 1,
+            TransportEvent::PeerFound { peer, .. } if peer == "live-peer" => found += 1,
+            _ => {}
+        }
+    }
+    println!("12 probes of a live peer produced {found} resolve(s) and {lost} removal(s)");
+    assert_eq!(
+        lost, 0,
+        "verification evicted a peer that was still advertising, {lost} time(s) — \
+         active probing cannot be used, it deletes people who never left"
     );
 }
