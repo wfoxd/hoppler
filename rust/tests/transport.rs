@@ -1465,3 +1465,79 @@ fn a_failure_for_a_peer_with_no_pipe_is_still_reported() {
         |e| matches!(e, TransportEvent::PipeFailed { peer, .. } if peer == "stranger"),
     );
 }
+
+/// Does mDNS re-resolve a peer that is still sitting there?
+///
+/// This is the question §5.0.3 says to establish before ageing sightings in
+/// `Discovery`. The asymmetry it records — a vanished peer goes in ≤ 15 s on
+/// BLE and up to two minutes on LAN — has an obvious fix, giving every rung one
+/// rule by expiring a sighting the core has not heard about lately. That fix is
+/// only safe if `PeerFound` keeps arriving for a peer that never left. BLE
+/// re-advertises constantly so its TTL refreshes itself; `mdns-sd` was
+/// unverified, and ageing peers out on a rung that resolves once would delete
+/// people who are still in the room — worse than the slowness being fixed.
+///
+/// So this measures rather than assumes: one advertiser, one browser, and a
+/// count of how many times the browser is told about a peer that does nothing.
+///
+/// Deliberately reports rather than asserts a cadence. The number is a property
+/// of `mdns-sd` and the network, not of Hoppler, and an assertion on it would
+/// be a test of somebody else's timer. What it *does* assert is the thing the
+/// design decision turns on: more than one resolve means refreshing is
+/// possible, exactly one means a Discovery-level TTL is unsafe.
+///
+/// `cargo test --test transport -- --ignored lan_re_resolves --nocapture`
+#[test]
+#[ignore = "needs multicast and runs for two minutes; run locally"]
+fn lan_re_resolves_a_peer_that_never_moved() {
+    let (sink_a, rx_a) = recorder();
+    let (sink_b, _rx_b) = recorder();
+    let a = LanTransport::new("cadence-a", sink_a).unwrap();
+    let b = LanTransport::new("cadence-b", sink_b).unwrap();
+
+    b.start_advertising(b"still-here".to_vec()).unwrap();
+    a.start_scanning().unwrap();
+
+    let window = std::time::Duration::from_secs(120);
+    let start = std::time::Instant::now();
+    let mut seen_at: Vec<std::time::Duration> = Vec::new();
+    let mut lost = 0usize;
+
+    while start.elapsed() < window {
+        let left = window.saturating_sub(start.elapsed());
+        match rx_a.recv_timeout(left.min(std::time::Duration::from_secs(5))) {
+            Ok(TransportEvent::PeerFound { peer, .. }) if peer == "cadence-b" => {
+                seen_at.push(start.elapsed());
+            }
+            Ok(TransportEvent::PeerLost { peer }) if peer == "cadence-b" => lost += 1,
+            _ => {}
+        }
+    }
+
+    let at: Vec<String> = seen_at
+        .iter()
+        .map(|d| format!("{:.1}s", d.as_secs_f64()))
+        .collect();
+    println!(
+        "PeerFound x{} at [{}], PeerLost x{lost}",
+        seen_at.len(),
+        at.join(", ")
+    );
+
+    assert!(
+        !seen_at.is_empty(),
+        "the advertiser was never resolved at all — multicast is not working here, \
+         so this run says nothing about cadence"
+    );
+    assert!(
+        lost == 0,
+        "the peer was reported lost {lost} time(s) while it sat still and kept advertising"
+    );
+    assert!(
+        seen_at.len() > 1,
+        "resolved exactly once in {}s, so nothing would refresh a Discovery-level TTL: \
+         ageing sightings in the core would delete peers that never left. \
+         §5.0.3's fix is unsafe as written and the asymmetry needs another answer.",
+        window.as_secs()
+    );
+}

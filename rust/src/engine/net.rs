@@ -320,12 +320,24 @@ impl Net {
     /// Feed one transport event in and take whatever the engine should act on.
     pub fn handle(&self, event: TransportEvent, now: Instant) -> Vec<NetEvent> {
         // Discovery keeps its own view of sightings and answers the persona
-        // endpoint; this call is what drives both.
-        self.discovery.on_event(event.clone(), now);
+        // endpoint; this call is what drives both. It also says whether the
+        // nearby list moved, which is not the same question as whether an
+        // event arrived.
+        let list_moved = self.discovery.on_event(event.clone(), now);
 
         match event {
             TransportEvent::PeerFound { .. } | TransportEvent::PeerLost { .. } => {
-                vec![NetEvent::PeersChanged]
+                // Only when something actually changed. A rung may report the
+                // same peer many times over — mDNS resolves once per interface
+                // and address, sixteen times in a second for one peer on this
+                // machine — and telling the UI to rebuild an identical list
+                // that often is work nobody asked for, on a device whose
+                // battery budget is a Ring 0 requirement.
+                if list_moved {
+                    vec![NetEvent::PeersChanged]
+                } else {
+                    Vec::new()
+                }
             }
             TransportEvent::PipeOpened { peer } => self.on_pipe_opened(&peer),
             // Split so the reason can be logged. Every rung's failures converge
