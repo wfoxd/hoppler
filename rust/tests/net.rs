@@ -1059,3 +1059,155 @@ fn a_repeated_sighting_does_not_keep_telling_the_ui() {
         "a peer returning after being lost did not reach the UI"
     );
 }
+
+/// A rung that remembers what it was asked to check on.
+struct RecordsVerifies {
+    inner: Arc<dyn Transport>,
+    asked: Arc<Mutex<Vec<String>>>,
+}
+
+impl RecordsVerifies {
+    fn asked(&self) -> Vec<String> {
+        self.asked.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+    fn forget(&self) {
+        self.asked.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    }
+}
+
+impl Transport for RecordsVerifies {
+    fn verify_peer(&self, peer: &str) {
+        self.asked
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(peer.to_string());
+        self.inner.verify_peer(peer);
+    }
+
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+    fn limits(&self) -> rust_lib_hoppler::transport::TransportLimits {
+        self.inner.limits()
+    }
+    fn is_available(&self) -> bool {
+        self.inner.is_available()
+    }
+    fn set_local_id(&self, id: &str) -> Result<(), rust_lib_hoppler::transport::TransportError> {
+        self.inner.set_local_id(id)
+    }
+    fn start_advertising(
+        &self,
+        payload: Vec<u8>,
+    ) -> Result<(), rust_lib_hoppler::transport::TransportError> {
+        self.inner.start_advertising(payload)
+    }
+    fn stop_advertising(&self) -> Result<(), rust_lib_hoppler::transport::TransportError> {
+        self.inner.stop_advertising()
+    }
+    fn start_scanning(&self) -> Result<(), rust_lib_hoppler::transport::TransportError> {
+        self.inner.start_scanning()
+    }
+    fn stop_scanning(&self) -> Result<(), rust_lib_hoppler::transport::TransportError> {
+        self.inner.stop_scanning()
+    }
+    fn connect(&self, peer: &str) -> Result<(), rust_lib_hoppler::transport::TransportError> {
+        self.inner.connect(peer)
+    }
+    fn send(
+        &self,
+        peer: &str,
+        bytes: &[u8],
+    ) -> Result<(), rust_lib_hoppler::transport::TransportError> {
+        self.inner.send(peer, bytes)
+    }
+    fn disconnect(&self, peer: &str) -> Result<(), rust_lib_hoppler::transport::TransportError> {
+        self.inner.disconnect(peer)
+    }
+    fn peers(&self) -> Vec<String> {
+        self.inner.peers()
+    }
+    fn pipes(&self) -> Vec<String> {
+        self.inner.pipes()
+    }
+    fn shutdown(&self) {
+        self.inner.shutdown()
+    }
+}
+
+/// The clock asks the rung about peers it has stopped hearing about.
+///
+/// A peer that leaves without a goodbye sends nothing, so the rung learns by
+/// asking or by waiting — and waiting is what left someone on screen for two
+/// minutes on LAN against fifteen seconds on BLE (§5.0.21). The engine cannot
+/// decide the peer has gone; it can only ask, and let the rung answer with
+/// `PeerLost` the way it always does.
+#[test]
+fn the_clock_asks_about_a_peer_that_has_gone_quiet() {
+    let air = air();
+    let now = Instant::now();
+    let (tx, _rx) = channel();
+    let tx = Mutex::new(tx);
+    let sink: Box<dyn Fn(TransportEvent) + Send + Sync> = Box::new(move |e| {
+        let _ = tx.lock().unwrap_or_else(|p| p.into_inner()).send(e);
+    });
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let rung = Arc::new(RecordsVerifies {
+        inner: Arc::new(air.join("alice", sink)),
+        asked: asked.clone(),
+    });
+    let identity = Arc::new(Mutex::new(Identity::generate("Alice", 0x00_88_ff)));
+    let net = Net::new(rung.clone(), identity, "alice", now);
+    net.discovery().set_enabled(true, now).unwrap();
+
+    let sighted = |t| {
+        net.handle(
+            TransportEvent::PeerFound {
+                peer: "bob".to_string(),
+                payload: Vec::new(),
+            },
+            t,
+        )
+    };
+    sighted(now);
+
+    // Recently seen: there is nothing to ask about.
+    net.tick(now + Duration::from_secs(10));
+    assert!(
+        rung.asked().is_empty(),
+        "asked about a peer the rung had just reported: {:?}",
+        rung.asked()
+    );
+
+    // Gone quiet: worth a question.
+    net.tick(now + Duration::from_secs(45));
+    assert_eq!(
+        rung.asked(),
+        vec!["bob".to_string()],
+        "a peer unheard-from for 45s was never asked about"
+    );
+
+    // A sighting is an answer. This is what stops the asking being endless:
+    // on a rung that re-resolves rarely, every peer would otherwise be quiet
+    // most of the time and be probed on every single tick.
+    rung.forget();
+    sighted(now + Duration::from_secs(50));
+    net.tick(now + Duration::from_secs(60));
+    assert!(
+        rung.asked().is_empty(),
+        "kept asking about a peer that had just answered: {:?}",
+        rung.asked()
+    );
+
+    // Discovery off: no list, nobody looking, no reason to be on the air.
+    rung.forget();
+    net.discovery()
+        .set_enabled(false, now + Duration::from_secs(61))
+        .unwrap();
+    net.tick(now + Duration::from_secs(200));
+    assert!(
+        rung.asked().is_empty(),
+        "probed the neighbourhood with Discovery off: {:?}",
+        rung.asked()
+    );
+}
