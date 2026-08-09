@@ -1,7 +1,9 @@
 package org.hoppler.hoppler.ble
 
+import android.Manifest
 import android.os.Build
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -18,8 +20,10 @@ import org.junit.Test
  */
 class BlePermissionsTest {
 
-    private fun state(sdk: Int, held: Set<String>) =
-        BlePermissions.state(sdk) { it in held }
+    private fun state(sdk: Int, held: Set<String>, locationOn: Boolean = true) =
+        BlePermissions.state(sdk, locationOn) { it in held }
+
+    private val fineLocation = Manifest.permission.ACCESS_FINE_LOCATION
 
     @Test
     fun `all three granted is granted`() {
@@ -55,23 +59,75 @@ class BlePermissionsTest {
         )
     }
 
+    // ── Android 10 and 11 ───────────────────────────────────────────────────
+
     /**
-     * minSdk is 29, so Android 10 and 11 are supported devices — and there a
-     * BLE scan needs `ACCESS_FINE_LOCATION`, which Hoppler declines (G-2) and
-     * does not declare. The rung cannot work on them, so it must say so rather
-     * than scan forever and find nobody.
-     *
-     * The three runtime permissions are granted in this test on purpose: they
-     * do not exist below API 31, so a gate that only counted grants would call
-     * this device ready.
+     * minSdk is 29, so these are supported devices, and the modern three do not
+     * exist on them. They are granted in these tests on purpose: a gate that
+     * only counted grants would call such a device ready and then scan forever.
      */
     @Test
-    fun `below Android 12 the rung is unsupported however much is granted`() {
+    fun `below Android 12 the modern three count for nothing`() {
         for (sdk in 29..30) {
-            val state = state(sdk, BlePermissions.RUNTIME.toSet())
-            assertTrue("API $sdk", state is BlePermissions.State.Unsupported)
-            assertNotNull("API $sdk needs something to show", BlePermissions.reason(state))
+            assertEquals(
+                "API $sdk",
+                BlePermissions.State.Missing(listOf(fineLocation)),
+                state(sdk, BlePermissions.RUNTIME.toSet())
+            )
         }
+    }
+
+    @Test
+    fun `below Android 12 location permission is what makes the rung usable`() {
+        for (sdk in 29..30) {
+            assertEquals(
+                "API $sdk",
+                BlePermissions.State.Granted,
+                state(sdk, setOf(fineLocation))
+            )
+        }
+    }
+
+    /**
+     * The hole option 3 could have shipped.
+     *
+     * On Android 11 and older the permission is necessary and *not sufficient*:
+     * with the system location toggle off, scan results are withheld with no
+     * error and no callback. Granted-but-finding-nobody is precisely the silent
+     * failure this file exists to prevent, so it has to be a state of its own.
+     */
+    @Test
+    fun `below Android 12 location switched off blocks the rung even when granted`() {
+        for (sdk in 29..30) {
+            val s = state(sdk, setOf(fineLocation), locationOn = false)
+            assertTrue("API $sdk", s is BlePermissions.State.Blocked)
+            assertNotNull("API $sdk needs something to show", BlePermissions.reason(s))
+        }
+    }
+
+    /** …and on Android 12+ the toggle is irrelevant, because the scan is not a location fix. */
+    @Test
+    fun `from Android 12 the location toggle does not matter`() {
+        assertEquals(
+            BlePermissions.State.Granted,
+            state(Build.VERSION_CODES.S, BlePermissions.RUNTIME.toSet(), locationOn = false)
+        )
+    }
+
+    /**
+     * Asking for precise location without saying why is the thing a privacy
+     * tool cannot do, so the older-Android wording must not be the generic one.
+     */
+    @Test
+    fun `asking for location explains itself`() {
+        val legacy = BlePermissions.reason(BlePermissions.State.Missing(listOf(fineLocation)))
+        val modern = BlePermissions.reason(BlePermissions.State.Missing(BlePermissions.RUNTIME))
+        assertNotNull(legacy)
+        assertNotEquals("the location prompt got the generic Bluetooth wording", modern, legacy)
+        assertTrue(
+            "the reason must say the word, or it explains nothing: $legacy",
+            legacy!!.contains("location", ignoreCase = true)
+        )
     }
 
     /**
@@ -83,6 +139,6 @@ class BlePermissionsTest {
     fun `only a usable radio has no reason to give`() {
         assertNull(BlePermissions.reason(BlePermissions.State.Granted))
         assertNotNull(BlePermissions.reason(BlePermissions.State.Missing(BlePermissions.RUNTIME)))
-        assertNotNull(BlePermissions.reason(BlePermissions.State.Unsupported("no radio")))
+        assertNotNull(BlePermissions.reason(BlePermissions.State.Blocked("location is off")))
     }
 }

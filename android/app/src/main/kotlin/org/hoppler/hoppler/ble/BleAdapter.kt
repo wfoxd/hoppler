@@ -903,7 +903,9 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
     // ── availability and teardown ───────────────────────────────────────────
 
     /** This device's permission state, as [BlePermissions] sees it. */
-    private fun permissions(): BlePermissions.State = BlePermissions.state {
+    private fun permissions(): BlePermissions.State = BlePermissions.state(
+        locationServicesOn = BlePermissions.locationServicesOn(context),
+    ) {
         context.checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED
     }
 

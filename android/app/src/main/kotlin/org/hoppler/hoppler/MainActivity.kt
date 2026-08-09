@@ -76,13 +76,15 @@ class MainActivity : FlutterActivity() {
      * answered by an availability event carrying the reason, and a grant made
      * later in Settings is picked up by the re-check below.
      *
-     * The reason reaches the core but stops there — `Net` folds availability
-     * into a bare `PeersChanged` and drops it — so a refusal is still an empty
-     * list on screen. Carrying it through is the other half of acceptance
-     * check 6 and is not done here.
+     * A refusal reaches the screen as the reason on an availability event, so
+     * an empty list says why it is empty rather than reading as "nobody is
+     * nearby". On Android 11 and older the permission asked for is location,
+     * and the reason explains that too — see `BlePermissions.reason`.
      */
     private fun askForTheRadio() {
-        val state = BlePermissions.state {
+        val state = BlePermissions.state(
+            locationServicesOn = BlePermissions.locationServicesOn(this),
+        ) {
             checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED
         }
         if (state is BlePermissions.State.Missing && !asked) {

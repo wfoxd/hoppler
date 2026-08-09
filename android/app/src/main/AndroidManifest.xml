@@ -14,6 +14,26 @@
         android:name="android.permission.BLUETOOTH_SCAN"
         android:usesPermissionFlags="neverForLocation" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+
+    <!-- Android 11 and older. minSdk is 29, so these are real devices, and none
+         of the three above exists on them: the adapter is reached through the
+         legacy pair, and a BLE scan is treated as a location fix with no
+         `neverForLocation` to decline with. Without ACCESS_FINE_LOCATION the
+         scan returns nothing and reports no error.
+
+         Every one is capped at 30, so on Android 12 and later this block is not
+         declared at all and Hoppler still asks for no location of any kind. The
+         runtime prompt those two versions do show is explained in the app —
+         see BlePermissions.reason. -->
+    <uses-permission
+        android:name="android.permission.BLUETOOTH"
+        android:maxSdkVersion="30" />
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_ADMIN"
+        android:maxSdkVersion="30" />
+    <uses-permission
+        android:name="android.permission.ACCESS_FINE_LOCATION"
+        android:maxSdkVersion="30" />
     <uses-feature
         android:name="android.hardware.bluetooth_le"
         android:required="true" />
