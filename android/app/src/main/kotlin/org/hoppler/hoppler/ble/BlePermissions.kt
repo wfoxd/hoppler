@@ -1,7 +1,6 @@
 package org.hoppler.hoppler.ble
 
 import android.Manifest
-import android.os.Build
 
 /**
  * Which permissions the radio needs, and whether this device has granted them.
@@ -18,8 +17,14 @@ object BlePermissions {
     /**
      * Android 12 replaced the location-shaped Bluetooth permissions with three
      * that say what they mean. Hoppler declares exactly those, with
-     * `neverForLocation` on the scan, because it has no use for location and
-     * asking for it would contradict G-2.
+     * `neverForLocation` on the scan, because it has no use for location.
+     *
+     * Not, as this said for months, because location "would contradict G-2".
+     * G-2 is about server-side identity and on-device metadata; a permission
+     * prompt sends nothing anywhere and stores nothing. The objection is that
+     * asking for a capability the app has no use for costs a privacy tool
+     * trust — a good reason, and a product one. Dressing it as a requirement
+     * made a decision look already-made for months.
      */
     val RUNTIME: List<String> = listOf(
         Manifest.permission.BLUETOOTH_ADVERTISE,
@@ -33,30 +38,23 @@ object BlePermissions {
 
         /** These are not granted. Asking is the only way forward. */
         data class Missing(val permissions: List<String>) : State
-
-        /** This Android cannot run the rung at all — see [reason]. */
-        data class Unsupported(val reason: String) : State
     }
 
     /**
      * The live permission state.
      *
-     * `sdkInt` and `granted` are parameters rather than reads of the ambient
-     * runtime so the branch below can be tested for the versions we do not
-     * develop on, which is where it matters.
+     * No version branch: `minSdk` is 31, so [RUNTIME] is what every supported
+     * device uses. Below that a scan needed `ACCESS_FINE_LOCATION`, which
+     * Hoppler does not ask for, and the floor was raised rather than ask —
+     * T08b §5.0.23 for the costing.
+     *
+     * The `Unsupported` state and the `sdkInt` parameter went with that branch.
+     * Keeping a case no supported device can reach would be a guard that cannot
+     * fire pretending to protect something, and this project has now found that
+     * shape in production three times; there is no sense adding a fourth on
+     * purpose.
      */
-    fun state(
-        sdkInt: Int = Build.VERSION.SDK_INT,
-        granted: (String) -> Boolean,
-    ): State {
-        // Below API 31 a BLE scan required ACCESS_FINE_LOCATION — Android
-        // treated "what is near me" as a location fix until 12. Hoppler
-        // declines location outright (G-2), so on Android 10 and 11 the rung is
-        // honestly unavailable rather than quietly finding nobody. minSdk is
-        // 29, so this is a real device and not a hypothetical one.
-        if (sdkInt < Build.VERSION_CODES.S) {
-            return State.Unsupported("Bluetooth needs Android 12 or later")
-        }
+    fun state(granted: (String) -> Boolean): State {
         val missing = RUNTIME.filterNot(granted)
         return if (missing.isEmpty()) State.Granted else State.Missing(missing)
     }
@@ -69,6 +67,5 @@ object BlePermissions {
     fun reason(state: State): String? = when (state) {
         is State.Granted -> null
         is State.Missing -> "Hoppler needs permission to use Bluetooth"
-        is State.Unsupported -> state.reason
     }
 }

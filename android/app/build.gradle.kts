@@ -19,11 +19,20 @@ android {
         applicationId = "org.hoppler.hoppler"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
-        // R0-N7 sets the floor at Android 10, and that is also exactly where
-        // BluetoothDevice.createInsecureL2capChannel arrives (API 29). Pinning
-        // it here is what lets the BLE rung use L2CAP CoC unconditionally and
-        // skip a GATT fallback in Ring 0 — see docs/BLE_CHANNEL.md.
-        minSdk = 29
+        // R0-N7 sets the floor at Android 12 (amended 10 Aug 2026). Below it the
+        // BLE rung cannot run at all: the modern Bluetooth permissions do not
+        // exist, and a scan instead requires ACCESS_FINE_LOCATION, which Hoppler
+        // does not ask for.
+        //
+        // Secondary, and the reason the floor used to be 29:
+        // BluetoothDevice.createInsecureL2capChannel arrives at API 29, so L2CAP
+        // CoC is available unconditionally and Ring 0 needs no GATT fallback —
+        // see docs/BLE_CHANNEL.md. That holds at any floor from 29 up, so
+        // raising it costs nothing here.
+        //
+        // Costing of all three options, and what the floor excludes: the ring-0
+        // findings, T08b §5.0.23 (outside this repo).
+        minSdk = 31
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
