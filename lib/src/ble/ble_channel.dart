@@ -97,6 +97,30 @@ class WriteComplete extends BleEvent {
   final int bytes;
 }
 
+/// Every event type this decoder understands, and the whole of its side of the
+/// contract with `BleAdapter.kt`.
+///
+/// Declared as a set rather than left implicit in the switch below, because the
+/// other half of this protocol is written in Kotlin and nothing in either
+/// toolchain checks that the two agree — the tests on this side decode maps
+/// this side wrote, so a rename over there would leave everything green and the
+/// feature dead on a device. `ble_channel_vocabulary_test.dart` compares this
+/// set against the constants declared in `BleAdapter.kt`.
+///
+/// Unknown types are still ignored at decode time by contract (§3), so a newer
+/// adapter may add events without breaking an older core. This set is what the
+/// adapter is known to send *today*, not a limit on what it may send.
+const Set<String> bleEventTypes = {
+  'peerFound',
+  'peerLost',
+  'pipeOpened',
+  'pipeFailed',
+  'pipeClosed',
+  'received',
+  'writeComplete',
+  'availability',
+};
+
 /// The adapter, as the core sees it.
 class BleChannel {
   BleChannel({MethodChannel? commands, EventChannel? events})
