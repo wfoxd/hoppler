@@ -92,7 +92,6 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
         val SERVICE_UUID: UUID = UUID.fromString("6f8c1d2e-7a3b-4c5d-9e0f-1a2b3c4d5e6f")
         val SERVICE_PARCEL: ParcelUuid = ParcelUuid(SERVICE_UUID)
 
-        /** A sighting older than this is reported as `peerLost`. */
         /**
          * Every event type this adapter emits, and the whole of its side of the
          * contract with `lib/src/ble/ble_channel.dart`.
@@ -118,6 +117,7 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
         const val EVENT_WRITE_COMPLETE = "writeComplete"
         const val EVENT_AVAILABILITY = "availability"
 
+        /** A sighting older than this is reported as `peerLost`. */
         const val PEER_TTL_MS = 15_000L
         private const val AGE_SWEEP_MS = 3_000L
 

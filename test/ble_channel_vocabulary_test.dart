@@ -18,24 +18,40 @@ import 'package:hoppler/src/ble/ble_channel.dart';
 /// declarations change shape, this fails loudly — which is the correct
 /// direction to fail in, because the alternative is passing while the protocol
 /// is broken.
+const relativeAdapterPath =
+    'android/app/src/main/kotlin/org/hoppler/hoppler/ble/BleAdapter.kt';
+
 void main() {
+  /// Found by walking up from the current directory rather than assuming it.
+  ///
+  /// A hard-coded relative path silently depends on the working directory being
+  /// the package root, which `flutter test` gives it and an IDE or a run from a
+  /// subdirectory may not. That failure would look exactly like the adapter
+  /// having moved, which is the one thing this test is supposed to report
+  /// accurately.
+  File? findAdapter() {
+    for (var dir = Directory.current; ; dir = dir.parent) {
+      final candidate = File('${dir.path}/$relativeAdapterPath');
+      if (candidate.existsSync()) return candidate;
+      if (dir.parent.path == dir.path) return null;
+    }
+  }
+
   test('Kotlin emits exactly the event types Dart decodes', () {
-    final source = File(
-      'android/app/src/main/kotlin/org/hoppler/hoppler/ble/BleAdapter.kt',
-    );
+    final source = findAdapter();
     expect(
-      source.existsSync(),
-      isTrue,
+      source,
+      isNotNull,
       reason:
-          'cannot find BleAdapter.kt at ${source.path} — if the adapter moved, '
-          'point this test at it rather than deleting it: it is the only thing '
-          'holding the two halves of the channel together',
+          'cannot find $relativeAdapterPath anywhere at or above '
+          '${Directory.current.path} — if the adapter moved, point this test at '
+          'it rather than deleting it: it is the only thing holding the two '
+          'halves of the channel together',
     );
 
-    final declared = RegExp(r'const val EVENT_[A-Z_]+ = "([a-zA-Z]+)"')
-        .allMatches(source.readAsStringSync())
-        .map((m) => m.group(1)!)
-        .toSet();
+    final declared = RegExp(
+      r'const val EVENT_[A-Z_]+ = "([a-zA-Z]+)"',
+    ).allMatches(source!.readAsStringSync()).map((m) => m.group(1)!).toSet();
 
     expect(
       declared,
