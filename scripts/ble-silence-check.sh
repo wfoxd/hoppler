@@ -45,7 +45,18 @@ command -v bluetoothctl >/dev/null || { echo "bluetoothctl not found"; exit 2; }
 "$ADB" -s "$SERIAL" get-state >/dev/null 2>&1 || { echo "adb cannot reach $SERIAL"; exit 2; }
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+BTMON=""
+SCAN=""
+# Ctrl-C is the normal way out of a run you have decided against, and an
+# orphaned btmon or scan keeps the controller busy for the next one. Kill what
+# this script started, whatever the exit path.
+cleanup() {
+  [ -n "$BTMON" ] && kill "$BTMON" 2>/dev/null
+  [ -n "$SCAN" ] && kill "$SCAN" 2>/dev/null
+  wait "$BTMON" "$SCAN" 2>/dev/null
+  rm -rf "$WORK"
+}
+trap cleanup EXIT INT TERM
 CAP="$WORK/btmon.txt"
 
 echo "== starting the observer =="
@@ -84,7 +95,6 @@ echo "   seen advertising: $BEFORE_HITS reports carrying $UUID_FRAGMENT"
 MARK_LINE=$(grep -n -i "$UUID_FRAGMENT" "$CAP" | tail -1 | cut -d: -f1)
 
 echo "== turning Discovery OFF via adb =="
-TOGGLE_EPOCH=$(date +%s.%N)
 "$ADB" -s "$SERIAL" shell input tap "${TAP_X:-918}" "${TAP_Y:-364}"
 date '+   toggled at %H:%M:%S'
 
@@ -95,27 +105,38 @@ wait "$BTMON" 2>/dev/null
 
 AFTER_HITS=$(tail -n +"$((MARK_LINE + 1))" "$CAP" | grep -ci "$UUID_FRAGMENT")
 AFTER_TOTAL=$(tail -n +"$((MARK_LINE + 1))" "$CAP" | grep -c "LE Advertising Report")
+# The control has to exclude the device under test, or on a FAIL it counts the
+# very advertisements it is supposed to be independent of.
+AFTER_OTHER=$((AFTER_TOTAL - AFTER_HITS))
 
 echo
 echo "──────── result ────────"
 echo "before: $BEFORE_HITS advertisements carrying $UUID_FRAGMENT"
 echo "after : $AFTER_HITS advertisements carrying $UUID_FRAGMENT"
-echo "control: $AFTER_TOTAL advertising reports from other devices after the toggle"
+echo "control: $AFTER_OTHER advertising reports from *other* devices after the toggle"
 
 # The control matters as much as the result. A scanner that died the moment
 # Discovery went off would report perfect silence, and be measuring nothing.
-if [ "$AFTER_TOTAL" -eq 0 ]; then
+if [ "$AFTER_OTHER" -eq 0 ]; then
   echo
-  echo "INCONCLUSIVE — the controller heard nothing at all afterwards, from any"
-  echo "device. The scan probably stopped, so the silence is the observer's and"
-  echo "not the phone's."
+  echo "INCONCLUSIVE — the controller heard nothing from any *other* device"
+  echo "afterwards. The scan probably stopped, so the silence is the observer's"
+  echo "and not the phone's."
   exit 3
 fi
 
 if [ "$AFTER_HITS" -eq 0 ]; then
   echo
-  echo "PASS — the radio went quiet, while the observer kept hearing $AFTER_TOTAL"
-  echo "other advertisements. Record the phone's make, model and Android version"
+  echo "PASS — silent for the whole ${AFTER}s window, while the observer kept"
+  echo "hearing $AFTER_OTHER advertisements from other devices."
+  echo
+  echo "Note this verifies silence across the window; it does not by itself"
+  echo "assert the acceptance bound. Run with an after-window of 5 to test that"
+  echo "directly — at HCI rates a 5s window holds many advertisements, so zero"
+  echo "in it is the acceptance bound itself, not an artefact of a slow"
+  echo "observer."
+  echo
+  echo "Record the phone's make, model and Android version"
   echo "in T08b §5.4; OEM variation in BLE is the norm."
   exit 0
 fi
