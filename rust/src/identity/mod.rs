@@ -122,6 +122,32 @@ pub struct Identity {
 
 /// A persona record decoded from the wire and verified against its own
 /// embedded Layer-2 key.
+///
+/// The name is the guarantee, and until now nothing kept it. Every field was
+/// public and the struct had no private constructor, so any code in any crate
+/// could write the literal and hold a "verified" persona that had never been
+/// near [`sign::verify`]. That matters here more than most places: a persona
+/// becomes the peer's session key, the contact a thread is keyed on, and the
+/// Layer-1 pseudonym a block binds to (R0-F10). A forged one is a forged
+/// identity all the way down.
+///
+/// The seal below is what closes it. A struct with a private field cannot be
+/// built by literal outside this module, so [`verify_persona_record`] is the
+/// only way to obtain one — enforced by the compiler rather than by everyone
+/// remembering. Reading is unaffected; every field stays public.
+///
+/// ```compile_fail
+/// use rust_lib_hoppler::crypto::{dh, sign};
+/// use rust_lib_hoppler::identity::VerifiedPersona;
+/// // Nothing was signed and nothing was checked, so this must not build.
+/// let _ = VerifiedPersona {
+///     l2_pub: sign::PublicKey([0; 32]),
+///     name: "Mallory".into(),
+///     colour: 0,
+///     version: 1,
+///     session_pub: dh::DhPublic([0; 32]),
+/// };
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedPersona {
     pub l2_pub: sign::PublicKey,
@@ -131,7 +157,15 @@ pub struct VerifiedPersona {
     /// The X25519 static to open a Noise IK session toward this device.
     /// Signed alongside the rest, so it cannot be swapped in flight.
     pub session_pub: dh::DhPublic,
+    /// The seal. Private, unreadable and carrying nothing — its only job is to
+    /// make the struct literal above impossible outside this module.
+    seal: Verified,
 }
+
+/// Proof that a signature was checked. Constructible only here, which is what
+/// gives [`VerifiedPersona`] its meaning.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Verified;
 
 /// Errors from persona-record verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -352,6 +386,8 @@ pub fn verify_persona_record(wire: &[u8]) -> Result<VerifiedPersona, IdentityErr
         colour: body.colour & COLOUR_MASK,
         version: body.version,
         session_pub: dh::DhPublic(session_bytes),
+        // Only reachable past the `sign::verify` above.
+        seal: Verified,
     })
 }
 
