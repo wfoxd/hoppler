@@ -57,7 +57,7 @@ class BlePermissionsTest {
 
     /**
      * minSdk is 29, so Android 10 and 11 are supported devices — and there a
-     * BLE scan needs `ACCESS_FINE_LOCATION`, which Hoppler declines (G-2) and
+     * BLE scan needs `ACCESS_FINE_LOCATION`, which Hoppler does not ask for and
      * does not declare. The rung cannot work on them, so it must say so rather
      * than scan forever and find nobody.
      *

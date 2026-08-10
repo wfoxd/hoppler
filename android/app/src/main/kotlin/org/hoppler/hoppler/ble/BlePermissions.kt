@@ -18,8 +18,14 @@ object BlePermissions {
     /**
      * Android 12 replaced the location-shaped Bluetooth permissions with three
      * that say what they mean. Hoppler declares exactly those, with
-     * `neverForLocation` on the scan, because it has no use for location and
-     * asking for it would contradict G-2.
+     * `neverForLocation` on the scan, because it has no use for location.
+     *
+     * Not, as this said for months, because location "would contradict G-2".
+     * G-2 is about server-side identity and on-device metadata; a permission
+     * prompt sends nothing anywhere and stores nothing. The objection is that
+     * asking for a capability the app has no use for costs a privacy tool
+     * trust — a good reason, and a product one. Dressing it as a requirement
+     * made a decision look already-made for months.
      */
     val RUNTIME: List<String> = listOf(
         Manifest.permission.BLUETOOTH_ADVERTISE,
@@ -50,10 +56,10 @@ object BlePermissions {
         granted: (String) -> Boolean,
     ): State {
         // Below API 31 a BLE scan required ACCESS_FINE_LOCATION — Android
-        // treated "what is near me" as a location fix until 12. Hoppler
-        // declines location outright (G-2), so on Android 10 and 11 the rung is
-        // honestly unavailable rather than quietly finding nobody. minSdk is
-        // 29, so this is a real device and not a hypothetical one.
+        // treated "what is near me" as a location fix until 12. Hoppler does
+        // not ask for location, so on Android 10 and 11 the rung is honestly
+        // unavailable rather than quietly finding nobody. minSdk is 29, so this
+        // is a real device and not a hypothetical one.
         if (sdkInt < Build.VERSION_CODES.S) {
             return State.Unsupported("Bluetooth needs Android 12 or later")
         }
