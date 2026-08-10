@@ -23,7 +23,7 @@ android {
         // BluetoothDevice.createInsecureL2capChannel arrives (API 29). Pinning
         // it here is what lets the BLE rung use L2CAP CoC unconditionally and
         // skip a GATT fallback in Ring 0 — see docs/BLE_CHANNEL.md.
-        minSdk = 29
+        minSdk = 31
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
