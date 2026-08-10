@@ -29,12 +29,21 @@ class NearbyView<T> extends StatelessWidget {
   const NearbyView({
     super.key,
     required this.radioReason,
+    required this.discoveryOn,
     required this.devices,
     required this.tile,
   });
 
   /// Why the radio is unusable, or null when it is fine.
   final String? radioReason;
+
+  /// Whether Discovery is switched on.
+  ///
+  /// Needed only to pick the empty-list wording, and that is reason enough:
+  /// without it the screen told a user whose Discovery was already on to turn
+  /// on Discovery. A message that contradicts the switch three inches above it
+  /// teaches people to stop reading the messages.
+  final bool discoveryOn;
 
   /// The devices last reported. May be non-empty even with [radioReason] set:
   /// the radio can go down before the list is cleared.
@@ -44,7 +53,14 @@ class NearbyView<T> extends StatelessWidget {
   /// bridge, which is what lets it be tested at all.
   final Widget Function(T device) tile;
 
-  static const emptyText = 'No one nearby. Turn on Discovery.';
+  /// Shown when Discovery is off: an empty list is expected, and the way out
+  /// of it is the switch.
+  static const emptyOffText = 'No one nearby. Turn on Discovery.';
+
+  /// Shown when Discovery is on and the room really is empty. It says nothing
+  /// about *why*, because with the radio fine and Discovery on there is nothing
+  /// to explain — an instruction here would be an instruction to do nothing.
+  static const emptyOnText = 'No one nearby yet.';
 
   @override
   Widget build(BuildContext context) {
@@ -58,7 +74,7 @@ class NearbyView<T> extends StatelessWidget {
       );
     }
     if (devices.isEmpty) {
-      return const Center(child: Text(emptyText));
+      return Center(child: Text(discoveryOn ? emptyOnText : emptyOffText));
     }
     return ListView(children: devices.map(tile).toList());
   }
