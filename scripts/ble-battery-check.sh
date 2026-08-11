@@ -19,7 +19,7 @@
 # unplug` makes the framework account as if on battery, which is what lets the
 # counters accumulate at all, but it cannot stop electrons.
 #
-# For a real check 8 the phone has to be **physically unplugged**, and this
+# For a real check 8, the phone has to be **physically unplugged**, and this
 # script cannot do that for you.
 #
 # The obvious procedure does not work, and it was tried: unplug, wait an hour,
