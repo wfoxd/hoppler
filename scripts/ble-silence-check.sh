@@ -13,6 +13,22 @@
 # seconds, so absence of D-Bus traffic says nothing about absence of
 # advertisements. Measured, not assumed.
 #
+# ── What this can and cannot claim ─────────────────────────────────────────
+# BlueZ starts its scan with the controller's **duplicate filter enabled**
+# (`Filter duplicates: Enabled` in the HCI trace), so a device that is
+# advertising steadily is reported roughly once every ten seconds rather than
+# many times a second. Measured, not assumed.
+#
+# That is enough to answer *did the radio stop* over a window of twenty seconds
+# or more: a still-advertising phone will produce a report inside it. It is
+# **not** enough to assert the acceptance bound of five seconds — at that rate a
+# five-second window normally contains no report at all, so zero would be the
+# expected result from a working radio and a stopped one alike. Running this
+# with a five-second window would manufacture a pass.
+#
+# Closing the 5 s bound needs the scan driven with duplicate filtering off,
+# which BlueZ does not expose here. That is unbuilt.
+#
 # ── One-time setup ─────────────────────────────────────────────────────────
 #   sudo setcap 'cap_net_raw,cap_net_admin+eip' "$(command -v btmon)"
 # or run this whole script under sudo. btmon needs a monitor socket; nothing
@@ -34,7 +50,11 @@
 # property this check exists to prove.
 set -uo pipefail
 
-UUID_FRAGMENT="6f8c1d2e"   # BleAdapter.SERVICE_UUID, first group
+# BleAdapter.SERVICE_UUID as it appears on the wire: 128-bit UUIDs are
+# little-endian in advertising data, so the text form never appears in btmon
+# output. The first version of this script grepped for "6f8c1d2e" and could not
+# have matched anything — see the note on rates below for how that was found.
+UUID_WIRE="6f5e4d3c2b1a0f9e5d4c3b7a2e1d8c6f"
 SERIAL="${1:?usage: ble-silence-check.sh <adb-serial> [before-secs] [after-secs]}"
 BEFORE="${2:-20}"
 AFTER="${3:-20}"
@@ -59,8 +79,42 @@ cleanup() {
 trap cleanup EXIT INT TERM
 CAP="$WORK/btmon.txt"
 
+# Counts advertising reports carrying the Hoppler UUID.
+#
+# A plain grep cannot do this. btmon prints advertising data as a wrapped
+# hexdump, so the UUID's sixteen bytes are regularly split across two lines,
+# and the bytes also appear twice per advertisement (service-UUID list and
+# service data). Both would miscount. This walks the report blocks instead and
+# joins each one's data before looking.
+hoppler_reports() {
+  python3 - "$1" "$UUID_WIRE" <<'PYEOF'
+import re, sys
+path, needle = sys.argv[1], sys.argv[2]
+addr_re = re.compile(r'^\s*Address: ([0-9A-F:]{17})')
+data_re = re.compile(r'^\s*Advertising Data\[\d+\]:')
+hex_re  = re.compile(r'^\s{6,}((?:[0-9a-f]{2} )+)\s*')
+n, addr, buf, in_data = 0, None, [], False
+for ln in open(path, errors="ignore"):
+    if addr_re.match(ln):
+        if addr and needle in "".join(buf): n += 1
+        addr, buf, in_data = addr_re.match(ln).group(1), [], False
+        continue
+    if data_re.match(ln):
+        in_data = True
+        continue
+    if in_data:
+        h = hex_re.match(ln)
+        if h:
+            buf.append(h.group(1).replace(" ", ""))
+        else:
+            in_data = False
+if addr and needle in "".join(buf): n += 1
+print(n)
+PYEOF
+}
+
 echo "== starting the observer =="
-btmon --time-format=time > "$CAP" 2>"$WORK/btmon.err" &
+btmon > "$CAP" 2>"$WORK/btmon.err" &
 BTMON=$!
 sleep 1
 if ! kill -0 "$BTMON" 2>/dev/null || grep -qi "not permitted" "$WORK/btmon.err"; then
@@ -76,14 +130,14 @@ SCAN=$!
 echo "== watching for ${BEFORE}s with Discovery ON =="
 sleep "$BEFORE"
 
-BEFORE_HITS=$(grep -ci "$UUID_FRAGMENT" "$CAP")
-BEFORE_TOTAL=$(grep -c "LE Advertising Report" "$CAP")
+BEFORE_HITS=$(hoppler_reports "$CAP")
+BEFORE_TOTAL=$(grep -c "Advertising Data\[" "$CAP")
 if [ "$BEFORE_HITS" -eq 0 ]; then
   kill "$BTMON" "$SCAN" 2>/dev/null
   echo
   echo "INCONCLUSIVE — never saw the phone advertising in the first place."
   echo "  advertising reports from all devices: $BEFORE_TOTAL"
-  echo "  carrying $UUID_FRAGMENT: 0"
+  echo "  carrying the Hoppler UUID: 0"
   echo
   echo "So this run cannot judge silence: a check that only knows how to see"
   echo "nothing would pass whether or not the radio stopped. Confirm Discovery"
@@ -91,8 +145,8 @@ if [ "$BEFORE_HITS" -eq 0 ]; then
   exit 3
 fi
 
-echo "   seen advertising: $BEFORE_HITS reports carrying $UUID_FRAGMENT"
-MARK_LINE=$(grep -n -i "$UUID_FRAGMENT" "$CAP" | tail -1 | cut -d: -f1)
+echo "   seen advertising: $BEFORE_HITS report(s) carrying the Hoppler UUID"
+MARK_LINE=$(wc -l < "$CAP")
 
 echo "== turning Discovery OFF via adb =="
 "$ADB" -s "$SERIAL" shell input tap "${TAP_X:-918}" "${TAP_Y:-364}"
@@ -103,16 +157,17 @@ sleep "$AFTER"
 kill "$BTMON" "$SCAN" 2>/dev/null
 wait "$BTMON" 2>/dev/null
 
-AFTER_HITS=$(tail -n +"$((MARK_LINE + 1))" "$CAP" | grep -ci "$UUID_FRAGMENT")
-AFTER_TOTAL=$(tail -n +"$((MARK_LINE + 1))" "$CAP" | grep -c "LE Advertising Report")
+tail -n +"$((MARK_LINE + 1))" "$CAP" > "$WORK/after.txt"
+AFTER_HITS=$(hoppler_reports "$WORK/after.txt")
+AFTER_TOTAL=$(grep -c "Advertising Data\[" "$WORK/after.txt")
 # The control has to exclude the device under test, or on a FAIL it counts the
 # very advertisements it is supposed to be independent of.
 AFTER_OTHER=$((AFTER_TOTAL - AFTER_HITS))
 
 echo
 echo "──────── result ────────"
-echo "before: $BEFORE_HITS advertisements carrying $UUID_FRAGMENT"
-echo "after : $AFTER_HITS advertisements carrying $UUID_FRAGMENT"
+echo "before: $BEFORE_HITS report(s) carrying the Hoppler UUID"
+echo "after : $AFTER_HITS report(s) carrying the Hoppler UUID"
 echo "control: $AFTER_OTHER advertising reports from *other* devices after the toggle"
 
 # The control matters as much as the result. A scanner that died the moment
@@ -130,11 +185,11 @@ if [ "$AFTER_HITS" -eq 0 ]; then
   echo "PASS — silent for the whole ${AFTER}s window, while the observer kept"
   echo "hearing $AFTER_OTHER advertisements from other devices."
   echo
-  echo "Note this verifies silence across the window; it does not by itself"
-  echo "assert the acceptance bound. Run with an after-window of 5 to test that"
-  echo "directly — at HCI rates a 5s window holds many advertisements, so zero"
-  echo "in it is the acceptance bound itself, not an artefact of a slow"
-  echo "observer."
+  echo "This verifies silence across the window. It does NOT establish the"
+  echo "five-second acceptance bound: BlueZ scans with the controller's"
+  echo "duplicate filter on, so a live advertiser is only reported about once"
+  echo "every ten seconds, and a five-second window would read as silent either"
+  echo "way. Keep the window at twenty seconds or more."
   echo
   echo "Record the phone's make, model and Android version"
   echo "in T08b §5.4; OEM variation in BLE is the norm."
@@ -145,5 +200,5 @@ echo
 echo "FAIL — $AFTER_HITS advertisement(s) carrying the Hoppler UUID after"
 echo "Discovery was switched off. R0-F2 says the radio stops, not that the list"
 echo "hides. Timestamps of the offending reports:"
-tail -n +"$((MARK_LINE + 1))" "$CAP" | grep -i -B2 "$UUID_FRAGMENT" | grep -oE "^[0-9:.]+" | head -5
+grep -B12 "Advertising Data\[" "$WORK/after.txt" | grep -E "^\s*Address:" | head -5
 exit 1
