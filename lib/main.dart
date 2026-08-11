@@ -147,6 +147,7 @@ class _HomePageState extends State<HomePage> {
             ),
           Expanded(
             child: NearbyView<NearbyDevice>(
+              discoveryOn: _discovery,
               radioReason: _radioReason,
               devices: _devices,
               tile: _deviceTile,
