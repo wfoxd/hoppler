@@ -92,6 +92,31 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
         val SERVICE_UUID: UUID = UUID.fromString("6f8c1d2e-7a3b-4c5d-9e0f-1a2b3c4d5e6f")
         val SERVICE_PARCEL: ParcelUuid = ParcelUuid(SERVICE_UUID)
 
+        /**
+         * Every event type this adapter emits, and the whole of its side of the
+         * contract with `lib/src/ble/ble_channel.dart`.
+         *
+         * Named rather than written inline at each `emit`, because these
+         * strings are one half of a protocol whose other half is in another
+         * language. Nothing in either toolchain checks that the two agree: the
+         * Dart decoder is tested against literals Dart writes itself, so
+         * renaming one here would leave every test in both languages passing
+         * and the feature silently dead on a device.
+         *
+         * `ble_channel_vocabulary_test.dart` reads this block and asserts the
+         * two sets match. That is why the declarations below are plain
+         * `const val NAME = "value"` lines — keep them that way, or the test
+         * that couples the languages stops being able to see them.
+         */
+        const val EVENT_PEER_FOUND = "peerFound"
+        const val EVENT_PEER_LOST = "peerLost"
+        const val EVENT_PIPE_OPENED = "pipeOpened"
+        const val EVENT_PIPE_FAILED = "pipeFailed"
+        const val EVENT_PIPE_CLOSED = "pipeClosed"
+        const val EVENT_RECEIVED = "received"
+        const val EVENT_WRITE_COMPLETE = "writeComplete"
+        const val EVENT_AVAILABILITY = "availability"
+
         /** A sighting older than this is reported as `peerLost`. */
         const val PEER_TTL_MS = 15_000L
         private const val AGE_SWEEP_MS = 3_000L
@@ -445,7 +470,7 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
                     )
                     emit(
                         mapOf(
-                            "type" to "peerFound",
+                            "type" to EVENT_PEER_FOUND,
                             "peer" to advert.id,
                             "payload" to advert.payload
                         )
@@ -590,7 +615,7 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
                 // A peer we hold a pipe to is still here whatever the
                 // advertisement says.
                 val stale = s.lastSeen < cutoff && !pipes.containsKey(id)
-                if (stale) emit(mapOf("type" to "peerLost", "peer" to id))
+                if (stale) emit(mapOf("type" to EVENT_PEER_LOST, "peer" to id))
                 stale
             }
             main.postDelayed(this, AGE_SWEEP_MS)
@@ -787,7 +812,7 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
                     "dial to $peer on psm $psm failed: ${e.javaClass.simpleName}" +
                         "${errorCode(e)}: ${e.message}"
                 )
-                emit(mapOf("type" to "pipeFailed", "peer" to peer, "why" to (e.message ?: "dial failed")))
+                emit(mapOf("type" to EVENT_PIPE_FAILED, "peer" to peer, "why" to (e.message ?: "dial failed")))
             } finally {
                 // Still set means the pipe never adopted it, so this is the
                 // only chance to give the client interface back.
@@ -831,7 +856,7 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
             if (pipes.remove(peer, pipe)) pipe.release()
             return
         }
-        emit(mapOf("type" to "pipeOpened", "peer" to peer))
+        emit(mapOf("type" to EVENT_PIPE_OPENED, "peer" to peer))
         // Emitted before the reader is queued, so `received` can never reach
         // the core ahead of the `pipeOpened` it belongs to. If the reader then
         // cannot start, the pipe is withdrawn and the open is closed off rather
@@ -855,7 +880,7 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
                 val n = socket.inputStream.read(buf)
                 if (n < 0) break
                 if (n > 0) {
-                    emit(mapOf("type" to "received", "peer" to peer, "bytes" to buf.copyOf(n)))
+                    emit(mapOf("type" to EVENT_RECEIVED, "peer" to peer, "bytes" to buf.copyOf(n)))
                 }
             }
         } catch (e: IOException) {
@@ -870,7 +895,7 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
         val mine = pipes[peer]
         if (mine?.socket === socket && pipes.remove(peer, mine)) {
             mine.release()
-            emit(mapOf("type" to "pipeClosed", "peer" to peer))
+            emit(mapOf("type" to EVENT_PIPE_CLOSED, "peer" to peer))
         }
     }
 
@@ -887,7 +912,7 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
                 }
                 // §5.3: without this the core's window closes and the pipe
                 // wedges after ~64 kB.
-                emit(mapOf("type" to "writeComplete", "peer" to peer, "bytes" to bytes.size))
+                emit(mapOf("type" to EVENT_WRITE_COMPLETE, "peer" to peer, "bytes" to bytes.size))
             } catch (e: IOException) {
                 closePipe(peer, report = true)
             }
@@ -897,7 +922,7 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
     private fun closePipe(peer: String, report: Boolean) {
         val pipe = pipes.remove(peer) ?: return
         pipe.release()
-        if (report) emit(mapOf("type" to "pipeClosed", "peer" to peer))
+        if (report) emit(mapOf("type" to EVENT_PIPE_CLOSED, "peer" to peer))
     }
 
     // ── availability and teardown ───────────────────────────────────────────
@@ -941,7 +966,7 @@ class BleAdapter(private val context: Context) : MethodChannel.MethodCallHandler
      */
     private fun emitAvailability(reason: String? = unusable()) {
         Log.i(TAG, "radio " + (reason?.let { "unavailable: $it" } ?: "available"))
-        emit(mapOf("type" to "availability", "available" to (reason == null), "reason" to reason))
+        emit(mapOf("type" to EVENT_AVAILABILITY, "available" to (reason == null), "reason" to reason))
     }
 
     private val bluetoothStateReceiver = object : BroadcastReceiver() {
