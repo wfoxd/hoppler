@@ -20,14 +20,21 @@
 # counters accumulate at all, but it cannot stop electrons.
 #
 # For a real check 8 the phone has to be **physically unplugged**, and this
-# script cannot do that for you. There is no flag for it. By hand:
+# script cannot do that for you.
 #
-#   adb -s <serial> shell dumpsys batterystats --reset
-#   (unplug; leave it an hour with Discovery on and the screen on; replug)
-#   adb -s <serial> shell dumpsys batterystats org.hoppler.hoppler
+# The obvious procedure does not work, and it was tried: unplug, wait an hour,
+# plug back in, read. **Android resets batterystats when the phone is plugged
+# in** — `RESET:TIME` appears in `--history` at the moment of reconnection — so
+# the reading destroys the very data it came for. A 68-minute unplugged run
+# produced `Time on battery: 240ms`.
 #
-# `batterystats` accumulates on-device, so nothing is lost while adb is away,
-# and `Computed drain` comes back as a real discharge instead of zero.
+# What survives a replug is the battery *percentage*, which is a real
+# device-level discharge and attributable to nothing in particular. What does
+# not survive is the per-component breakdown, which is the only part that
+# separates Hoppler from everything else on the phone.
+#
+# So an unplugged component-level run needs adb over Wi-Fi: pair first, unplug,
+# and read while still disconnected from USB. That is unbuilt.
 #
 # ── Usage ──────────────────────────────────────────────────────────────────
 #   scripts/ble-battery-check.sh <adb-serial> [minutes-per-window]
@@ -35,6 +42,12 @@
 # The phone must have Hoppler in the foreground, Discovery ON, and the screen
 # staying on — R0-N6 makes Discovery a foreground activity, so screen-on is the
 # operating mode and not an artefact to be excluded.
+#
+# Check what else on the phone uses Bluetooth before trusting a figure. The test
+# handset here also carries `com.bitchat.droid`, another BLE mesh app, which was
+# running during the first measurements. A steady background user cancels in the
+# A/B — that is the design working — but one whose activity varies between the
+# two windows is noise this method cannot see.
 set -uo pipefail
 
 SERIAL="${1:?usage: ble-battery-check.sh <adb-serial> [minutes-per-window]}"
