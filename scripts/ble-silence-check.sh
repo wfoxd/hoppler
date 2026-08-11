@@ -44,7 +44,8 @@
 # ── Privacy note ───────────────────────────────────────────────────────────
 # This capture contains Bluetooth addresses of every device in range, including
 # ones belonging to passers-by. It is written to a temporary file, and the
-# summary deliberately reports counts and timings rather than addresses. Do not
+# summary reports counts rather than addresses, except on a FAIL where naming
+# the device that kept advertising is the whole diagnostic value. Do not
 # paste raw captures into the findings: a line pairing a Hoppler peer id with a
 # Bluetooth address outlives the id rotation and undoes R0-F2, which is the very
 # property this check exists to prove.
@@ -62,6 +63,9 @@ ADB="${ADB:-adb}"
 
 command -v btmon >/dev/null || { echo "btmon not found (bluez package)"; exit 2; }
 command -v bluetoothctl >/dev/null || { echo "bluetoothctl not found"; exit 2; }
+# The report parser is python. Without it every count comes back empty and the
+# arithmetic below fails with something that looks nothing like the real cause.
+command -v python3 >/dev/null || { echo "python3 not found (needed to parse btmon output)"; exit 2; }
 "$ADB" -s "$SERIAL" get-state >/dev/null 2>&1 || { echo "adb cannot reach $SERIAL"; exit 2; }
 
 WORK="$(mktemp -d)"
@@ -86,17 +90,23 @@ CAP="$WORK/btmon.txt"
 # and the bytes also appear twice per advertisement (service-UUID list and
 # service data). Both would miscount. This walks the report blocks instead and
 # joins each one's data before looking.
+# hoppler_reports <capture> [addresses]
+#   default     — prints how many reports carried the Hoppler UUID
+#   "addresses" — prints the addresses that carried it, with per-address counts
 hoppler_reports() {
-  python3 - "$1" "$UUID_WIRE" <<'PYEOF'
+  python3 - "$1" "$UUID_WIRE" "${2:-count}" <<'PYEOF'
 import re, sys
-path, needle = sys.argv[1], sys.argv[2]
+path, needle, mode = sys.argv[1], sys.argv[2], sys.argv[3]
 addr_re = re.compile(r'^\s*Address: ([0-9A-F:]{17})')
 data_re = re.compile(r'^\s*Advertising Data\[\d+\]:')
 hex_re  = re.compile(r'^\s{6,}((?:[0-9a-f]{2} )+)\s*')
-n, addr, buf, in_data = 0, None, [], False
+hits, addr, buf, in_data = {}, None, [], False
+def record(a, b):
+    if a and needle in "".join(b):
+        hits[a] = hits.get(a, 0) + 1
 for ln in open(path, errors="ignore"):
     if addr_re.match(ln):
-        if addr and needle in "".join(buf): n += 1
+        record(addr, buf)
         addr, buf, in_data = addr_re.match(ln).group(1), [], False
         continue
     if data_re.match(ln):
@@ -108,8 +118,12 @@ for ln in open(path, errors="ignore"):
             buf.append(h.group(1).replace(" ", ""))
         else:
             in_data = False
-if addr and needle in "".join(buf): n += 1
-print(n)
+record(addr, buf)
+if mode == "addresses":
+    for a, c in sorted(hits.items(), key=lambda kv: -kv[1]):
+        print(f"  {a}  {c} report(s)")
+else:
+    print(sum(hits.values()))
 PYEOF
 }
 
@@ -199,6 +213,11 @@ fi
 echo
 echo "FAIL — $AFTER_HITS advertisement(s) carrying the Hoppler UUID after"
 echo "Discovery was switched off. R0-F2 says the radio stops, not that the list"
-echo "hides. Timestamps of the offending reports:"
-grep -B12 "Advertising Data\[" "$WORK/after.txt" | grep -E "^\s*Address:" | head -5
+echo "hides. The addresses still advertising it, for local diagnosis only:"
+hoppler_reports "$WORK/after.txt" addresses
+echo
+echo "Those are Bluetooth addresses. They tell you *which* device did not stop —"
+echo "worth knowing when more than one Hoppler phone is in the room — and they"
+echo "must not be pasted into the findings alongside a peer id, for the same"
+echo "R0-F2 reason this check exists."
 exit 1
