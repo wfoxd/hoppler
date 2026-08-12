@@ -361,11 +361,21 @@ pub fn nearby_devices() -> Result<Vec<NearbyDevice>, String> {
 // ── sessions / threads ────────────────────────────────────────────────────────
 
 /// Ping a device visible in Discovery. Only reachable while Discovery is open —
-/// closing it makes pings undeliverable (F3). The `Pinged` event is the ack.
+/// closing it makes pings undeliverable (F3).
 ///
-/// Real cross-device reachability (the peer's Discovery state) and the
-/// receiver-side rate limiter (tech spec §7) arrive with the session layer
-/// (T09/T10); here reachability is modelled by our own Discovery flag.
+/// The ack is `PingAcked`, not `Pinged`. This comment said otherwise until
+/// today, and it was describing the defect rather than the design: `Pinged` is
+/// someone nudging *us*, so deriving an acknowledgement from it meant an
+/// ordinary ping could only look answered if the other person happened to nudge
+/// back. Fixed in PR #27 by giving the wire a Pong; the sentence outlived it.
+///
+/// Cross-device reachability is real now — a tap opens a session and crosses to
+/// another phone — so the `is_on` check below is the F3 gate on our own side,
+/// not a stand-in for the peer's state.
+///
+/// **Still missing: the receiver-side rate limiter (tech spec §7.)** It was
+/// deferred to "the session layer (T09/T10)", both of which are done, so it has
+/// no owner. Nothing in the codebase implements it.
 pub fn ping(device_id: String) -> Result<(), String> {
     let net = require_net()?;
     if !net.discovery().is_on() {
