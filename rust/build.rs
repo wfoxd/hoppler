@@ -4,6 +4,7 @@ fn main() {
             "../proto/hello.proto",
             "../proto/envelope.proto",
             "../proto/identity.proto",
+            "../proto/pairing.proto",
         ],
         &["../proto"],
     )
