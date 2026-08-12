@@ -101,7 +101,17 @@ impl std::error::Error for HandshakeError {}
 /// holds. Without the binding a handshake proves that *a* valid persona record
 /// exists — and records are public — so anyone who has discovered Alice could
 /// present hers and be believed.
-fn encode_intro(us: &Identity, our_static: &dh::DhPublic) -> Result<Vec<u8>, HandshakeError> {
+///
+/// Shared with the F4 pairing ceremony (`crate::pairing::ceremony`), which runs
+/// a different Noise pattern against the same problem: prove a persona belongs
+/// to the static just used. Deliberately one implementation rather than two —
+/// the encoding and its check are a matched pair, and the failure mode of two
+/// copies drifting apart is that one side quietly stops catching an
+/// impersonation while continuing to look correct.
+pub(crate) fn encode_intro(
+    us: &Identity,
+    our_static: &dh::DhPublic,
+) -> Result<Vec<u8>, HandshakeError> {
     let record = us.persona_record();
     if record.len() > MAX_HANDSHAKE_PAYLOAD {
         return Err(HandshakeError::PayloadTooLarge);
@@ -115,7 +125,7 @@ fn encode_intro(us: &Identity, our_static: &dh::DhPublic) -> Result<Vec<u8>, Han
 }
 
 /// Decode and fully check an intro against the static Noise proved.
-fn decode_intro(
+pub(crate) fn decode_intro(
     payload: &[u8],
     proven_static: &dh::DhPublic,
 ) -> Result<VerifiedPersona, HandshakeError> {

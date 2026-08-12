@@ -29,3 +29,17 @@ const PairingInvite$json = {
 final $typed_data.Uint8List pairingInviteDescriptor = $convert.base64Decode(
     'Cg1QYWlyaW5nSW52aXRlEhUKBmwyX3B1YhgBIAEoDFIFbDJQdWISGQoIYmxlX2hpbnQYAiABKA'
     'lSB2JsZUhpbnQSJQoOY2VyZW1vbnlfbm9uY2UYAyABKAxSDWNlcmVtb255Tm9uY2U=');
+
+@$core.Deprecated('Use l1ProofDescriptor instead')
+const L1Proof$json = {
+  '1': 'L1Proof',
+  '2': [
+    {'1': 'l1_pub', '3': 1, '4': 1, '5': 12, '10': 'l1Pub'},
+    {'1': 'signature', '3': 2, '4': 1, '5': 12, '10': 'signature'},
+  ],
+};
+
+/// Descriptor for `L1Proof`. Decode as a `google.protobuf.DescriptorProto`.
+final $typed_data.Uint8List l1ProofDescriptor = $convert.base64Decode(
+    'CgdMMVByb29mEhUKBmwxX3B1YhgBIAEoDFIFbDFQdWISHAoJc2lnbmF0dXJlGAIgASgMUglzaW'
+    'duYXR1cmU=');

@@ -23,6 +23,7 @@
 //! Layer-1 exchange it carries, and the state machine that requires both
 //! confirmations are still to come.
 
+pub mod ceremony;
 pub mod invite;
 pub mod sas;
 mod words;

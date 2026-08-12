@@ -119,6 +119,86 @@ class PairingInvite extends $pb.GeneratedMessage {
   void clearCeremonyNonce() => $_clearField(3);
 }
 
+/// A device's Layer-1 public identity, and proof it holds the matching secret.
+///
+/// This is the thing the whole ceremony exists to move, and the only message in
+/// Hoppler that carries Layer-1 material (R0-F1). It travels inside the verified
+/// ceremony channel, and only after **both** people have confirmed the SAS.
+///
+/// The signature is required even though the channel is already authenticated.
+/// The channel proves who is *speaking* — a Layer-2 persona — and a Layer-1 key
+/// is a separate claim: without a signature by that key, anyone could hand over
+/// somebody else's Layer-1 public key and have it written into the other
+/// device's contacts as their own. What is signed is a domain-separated message
+/// over the ceremony's transcript hash and both keys, so the proof binds Layer-1
+/// to Layer-2 and cannot be lifted into a different ceremony.
+class L1Proof extends $pb.GeneratedMessage {
+  factory L1Proof({
+    $core.List<$core.int>? l1Pub,
+    $core.List<$core.int>? signature,
+  }) {
+    final result = create();
+    if (l1Pub != null) result.l1Pub = l1Pub;
+    if (signature != null) result.signature = signature;
+    return result;
+  }
+
+  L1Proof._();
+
+  factory L1Proof.fromBuffer($core.List<$core.int> data,
+          [$pb.ExtensionRegistry registry = $pb.ExtensionRegistry.EMPTY]) =>
+      create()..mergeFromBuffer(data, registry);
+  factory L1Proof.fromJson($core.String json,
+          [$pb.ExtensionRegistry registry = $pb.ExtensionRegistry.EMPTY]) =>
+      create()..mergeFromJson(json, registry);
+
+  static final $pb.BuilderInfo _i = $pb.BuilderInfo(
+      _omitMessageNames ? '' : 'L1Proof',
+      package: const $pb.PackageName(_omitMessageNames ? '' : 'hoppler.v0'),
+      createEmptyInstance: create)
+    ..a<$core.List<$core.int>>(
+        1, _omitFieldNames ? '' : 'l1Pub', $pb.PbFieldType.OY)
+    ..a<$core.List<$core.int>>(
+        2, _omitFieldNames ? '' : 'signature', $pb.PbFieldType.OY)
+    ..hasRequiredFields = false;
+
+  @$core.Deprecated('See https://github.com/google/protobuf.dart/issues/998.')
+  L1Proof clone() => deepCopy();
+  @$core.Deprecated('See https://github.com/google/protobuf.dart/issues/998.')
+  L1Proof copyWith(void Function(L1Proof) updates) =>
+      super.copyWith((message) => updates(message as L1Proof)) as L1Proof;
+
+  @$core.override
+  $pb.BuilderInfo get info_ => _i;
+
+  @$core.pragma('dart2js:noInline')
+  static L1Proof create() => L1Proof._();
+  @$core.override
+  L1Proof createEmptyInstance() => create();
+  @$core.pragma('dart2js:noInline')
+  static L1Proof getDefault() =>
+      _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<L1Proof>(create);
+  static L1Proof? _defaultInstance;
+
+  @$pb.TagNumber(1)
+  $core.List<$core.int> get l1Pub => $_getN(0);
+  @$pb.TagNumber(1)
+  set l1Pub($core.List<$core.int> value) => $_setBytes(0, value);
+  @$pb.TagNumber(1)
+  $core.bool hasL1Pub() => $_has(0);
+  @$pb.TagNumber(1)
+  void clearL1Pub() => $_clearField(1);
+
+  @$pb.TagNumber(2)
+  $core.List<$core.int> get signature => $_getN(1);
+  @$pb.TagNumber(2)
+  set signature($core.List<$core.int> value) => $_setBytes(1, value);
+  @$pb.TagNumber(2)
+  $core.bool hasSignature() => $_has(1);
+  @$pb.TagNumber(2)
+  void clearSignature() => $_clearField(2);
+}
+
 const $core.bool _omitFieldNames =
     $core.bool.fromEnvironment('protobuf.omit_field_names');
 const $core.bool _omitMessageNames =

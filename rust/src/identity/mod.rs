@@ -292,6 +292,24 @@ impl Identity {
         self.layer2.sign(&binding_message(static_pub))
     }
 
+    /// Sign with **Layer 1**.
+    ///
+    /// The pairing ceremony is the only caller there will ever be, and that is
+    /// the point of this being one narrow method rather than a getter for the
+    /// key pair. R0-F1 says Layer-1 crosses only via the F4 ceremony; a
+    /// `layer1()` accessor would put the whole key in reach of any module that
+    /// felt like it, and the requirement would be a matter of everyone
+    /// remembering. Signing is the one operation the ceremony needs, so it is
+    /// the one operation offered.
+    ///
+    /// What this proves is possession of the Layer-1 secret, and nothing about
+    /// *what* is being signed — the caller supplies a domain-separated message
+    /// (see `pairing::ceremony`), because a bare signature over an attacker's
+    /// bytes is a signing oracle.
+    pub fn sign_with_layer1(&self, message: &[u8]) -> sign::Signature {
+        self.layer1.sign(message)
+    }
+
     /// The private pseudonym secret toward a counterpart — the Noise static key
     /// for a session with them (tech spec §5).
     ///
