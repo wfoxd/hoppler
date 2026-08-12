@@ -117,25 +117,50 @@ pub struct NewTransfer {
     pub created_at: i64,
 }
 
-/// A paired identity (a Circle seed).
+/// Someone we have written down.
+///
+/// Not necessarily someone we have paired with — that is [`Pairing`], and most
+/// contacts do not have one. A contact is the durable side of a person we have
+/// met: a name, a colour, and a handle stable enough to hang a conversation on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Contact {
     pub id: i64,
-    pub l1_pub: [u8; 32],
+    /// The peer's per-counterparty pseudonym — the static their session
+    /// handshake proved, or, before any session, a stand-in derived from the
+    /// rotating device id.
+    ///
+    /// **Not a Layer-1 key**, and the column was called `l1_pub` until the
+    /// ceremony made a real one possible. See the v2 migration.
+    pub pseudonym: [u8; 32],
     pub l2_pub: [u8; 32],
     pub name: String,
     pub colour: u32,
     pub persona_version: u32,
-    pub paired_at: i64,
+    /// When this row was created. Was `paired_at`, which it never was.
+    pub first_seen: i64,
 }
 
 /// Fields for inserting a new contact.
 pub struct NewContact {
-    pub l1_pub: [u8; 32],
+    pub pseudonym: [u8; 32],
     pub l2_pub: [u8; 32],
     pub name: String,
     pub colour: u32,
     pub persona_version: u32,
+    pub first_seen: i64,
+}
+
+/// A completed pairing ceremony — the Circle seed (R0-F4).
+///
+/// Its own table, and its own type, because the existence of this row *is* the
+/// claim that two people stood next to each other and both pressed confirm.
+/// Nothing else in the schema can make that claim by accident.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pairing {
+    pub contact_id: i64,
+    /// The counterpart's Layer-1 public identity, from inside the ceremony
+    /// channel. The only place in the store one of these appears.
+    pub l1_pub: [u8; 32],
     pub paired_at: i64,
 }
 
@@ -195,26 +220,29 @@ impl Store {
 
     pub fn add_contact(&self, c: &NewContact) -> Result<i64, StoreError> {
         self.conn.execute(
-            "INSERT INTO contacts (l1_pub, l2_pub, name, colour, persona_version, paired_at)
+            "INSERT INTO contacts (pseudonym, l2_pub, name, colour, persona_version, first_seen)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
-                &c.l1_pub[..],
+                &c.pseudonym[..],
                 &c.l2_pub[..],
                 c.name,
                 c.colour as i64,
                 c.persona_version as i64,
-                c.paired_at
+                c.first_seen
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
 
-    pub fn contact_by_l1(&self, l1_pub: &[u8; 32]) -> Result<Option<Contact>, StoreError> {
+    pub fn contact_by_pseudonym(
+        &self,
+        pseudonym: &[u8; 32],
+    ) -> Result<Option<Contact>, StoreError> {
         self.conn
             .query_row(
-                "SELECT id, l1_pub, l2_pub, name, colour, persona_version, paired_at
-                 FROM contacts WHERE l1_pub = ?1",
-                params![&l1_pub[..]],
+                "SELECT id, pseudonym, l2_pub, name, colour, persona_version, first_seen
+                 FROM contacts WHERE pseudonym = ?1",
+                params![&pseudonym[..]],
                 map_contact,
             )
             .optional()?
@@ -224,7 +252,7 @@ impl Store {
     pub fn contact_by_id(&self, id: i64) -> Result<Option<Contact>, StoreError> {
         self.conn
             .query_row(
-                "SELECT id, l1_pub, l2_pub, name, colour, persona_version, paired_at
+                "SELECT id, pseudonym, l2_pub, name, colour, persona_version, first_seen
                  FROM contacts WHERE id = ?1",
                 params![id],
                 map_contact,
@@ -233,7 +261,7 @@ impl Store {
             .transpose()
     }
 
-    /// Move a contact onto a different Layer-1 key, keeping its id, thread and
+    /// Move a contact onto a different pseudonym, keeping its id, thread and
     /// history.
     ///
     /// Needed because a contact can be created before there is anything durable
@@ -242,12 +270,12 @@ impl Store {
     /// has to be adopted onto the real key rather than left behind, or one
     /// person ends up as two contacts with the conversation split between them.
     ///
-    /// `l1_pub` is UNIQUE, so the caller must have established that no row
-    /// already holds `new_l1`; this reports a match rather than deciding.
-    pub fn rekey_contact(&self, id: i64, new_l1: &[u8; 32]) -> Result<bool, StoreError> {
+    /// `pseudonym` is UNIQUE, so the caller must have established that no row
+    /// already holds `new_pseudonym`; this reports a match rather than deciding.
+    pub fn rekey_contact(&self, id: i64, new_pseudonym: &[u8; 32]) -> Result<bool, StoreError> {
         let n = self.conn.execute(
-            "UPDATE contacts SET l1_pub = ?1 WHERE id = ?2",
-            params![&new_l1[..], id],
+            "UPDATE contacts SET pseudonym = ?1 WHERE id = ?2",
+            params![&new_pseudonym[..], id],
         )?;
         Ok(n > 0)
     }
@@ -346,11 +374,99 @@ impl Store {
 
     pub fn list_contacts(&self) -> Result<Vec<Contact>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, l1_pub, l2_pub, name, colour, persona_version, paired_at
-             FROM contacts ORDER BY paired_at",
+            "SELECT id, pseudonym, l2_pub, name, colour, persona_version, first_seen
+             FROM contacts ORDER BY first_seen",
         )?;
         let rows = stmt.query_map([], map_contact)?;
         rows.map(|r| r?).collect()
+    }
+
+    // ── pairings ────────────────────────────────────────────────────────────
+
+    /// Record that a ceremony completed, and open the persistent thread it
+    /// entitles (R0-F4: "a completed ceremony creates a persistent thread").
+    ///
+    /// One transaction, because the pairing and the thread are one fact. A
+    /// pairing row with no thread is a contact the UI cannot open; a thread
+    /// with no pairing is a conversation claiming a ceremony that did not
+    /// finish. Neither is a state anything downstream knows how to read, and
+    /// both are reachable if these are two calls and the second fails.
+    ///
+    /// Idempotent on the pairing: re-pairing the same two people replaces the
+    /// Layer-1 key and the timestamp rather than failing. That is not
+    /// hypothetical tidiness — a ceremony can be run again after one side
+    /// wipes (R0-F9) and regenerates, and the honest reading of the second
+    /// ceremony is that it supersedes the first.
+    ///
+    /// Returns the thread id.
+    pub fn pair_contact(
+        &self,
+        contact_id: i64,
+        l1_pub: &[u8; 32],
+        paired_at: i64,
+    ) -> Result<i64, StoreError> {
+        if self.contact_by_id(contact_id)?.is_none() {
+            return Err(StoreError::Db(format!(
+                "cannot pair: no such contact {contact_id}"
+            )));
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        self.conn.execute(
+            "INSERT INTO pairings (contact_id, l1_pub, paired_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(contact_id) DO UPDATE SET l1_pub = ?2, paired_at = ?3",
+            params![contact_id, &l1_pub[..], paired_at],
+        )?;
+        let thread = match self.thread_for_contact(contact_id)? {
+            Some(t) => t,
+            None => self.create_thread(contact_id, paired_at)?,
+        };
+        tx.commit()?;
+        Ok(thread)
+    }
+
+    pub fn pairing_for_contact(&self, contact_id: i64) -> Result<Option<Pairing>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT contact_id, l1_pub, paired_at FROM pairings WHERE contact_id = ?1",
+                params![contact_id],
+                map_pairing,
+            )
+            .optional()?
+            .transpose()
+    }
+
+    /// The contact paired to this Layer-1 identity, if any.
+    ///
+    /// The lookup that makes a pairing durable across everything else: a
+    /// pseudonym is per-counterparty and a device id rotates, but a Layer-1 key
+    /// is the person.
+    pub fn contact_by_l1(&self, l1_pub: &[u8; 32]) -> Result<Option<Contact>, StoreError> {
+        let id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT contact_id FROM pairings WHERE l1_pub = ?1",
+                params![&l1_pub[..]],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match id {
+            Some(id) => self.contact_by_id(id),
+            None => Ok(None),
+        }
+    }
+
+    /// Undo a pairing, leaving the contact and its history in place.
+    ///
+    /// R0-F10's "blocking a paired person revokes the pairing" needs this, and
+    /// so does R0-F9 in part. Deliberately does **not** delete the thread: the
+    /// messages are the person's, and a block is not a request to destroy what
+    /// was said. Returns whether there was a pairing to revoke.
+    pub fn unpair_contact(&self, contact_id: i64) -> Result<bool, StoreError> {
+        let n = self.conn.execute(
+            "DELETE FROM pairings WHERE contact_id = ?1",
+            params![contact_id],
+        )?;
+        Ok(n > 0)
     }
 
     // ── threads ─────────────────────────────────────────────────────────────
@@ -642,20 +758,33 @@ fn map_transfer(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Transfer, Stor
 
 fn map_contact(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Contact, StoreError>> {
     let id = r.get(0)?;
-    let l1: Vec<u8> = r.get(1)?;
+    let pseudonym: Vec<u8> = r.get(1)?;
     let l2: Vec<u8> = r.get(2)?;
     let name = r.get(3)?;
     let colour: i64 = r.get(4)?;
     let persona_version: i64 = r.get(5)?;
-    let paired_at = r.get(6)?;
+    let first_seen = r.get(6)?;
     Ok((|| {
         Ok(Contact {
             id,
-            l1_pub: blob32(l1)?,
+            pseudonym: blob32(pseudonym)?,
             l2_pub: blob32(l2)?,
             name,
             colour: u32_from_i64(colour)?,
             persona_version: u32_from_i64(persona_version)?,
+            first_seen,
+        })
+    })())
+}
+
+fn map_pairing(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Pairing, StoreError>> {
+    let contact_id = r.get(0)?;
+    let l1: Vec<u8> = r.get(1)?;
+    let paired_at = r.get(2)?;
+    Ok((|| {
+        Ok(Pairing {
+            contact_id,
+            l1_pub: blob32(l1)?,
             paired_at,
         })
     })())
@@ -699,13 +828,199 @@ mod tests {
 
     fn a_contact() -> NewContact {
         NewContact {
-            l1_pub: [1u8; 32],
+            pseudonym: [1u8; 32],
             l2_pub: [2u8; 32],
             name: "Alice".into(),
             colour: 0x00ff_8800,
             persona_version: 1,
-            paired_at: 1000,
+            first_seen: 1000,
         }
+    }
+
+    // ── pairings ────────────────────────────────────────────────────────────
+
+    /// The R0-F4 sentence, as a test: a completed ceremony creates a persistent
+    /// thread.
+    #[test]
+    fn pairing_records_the_layer_1_key_and_opens_a_thread() {
+        let (s, _d) = store();
+        let id = s.add_contact(&a_contact()).unwrap();
+        assert!(s.pairing_for_contact(id).unwrap().is_none());
+        assert!(s.thread_for_contact(id).unwrap().is_none());
+
+        let thread = s.pair_contact(id, &[9u8; 32], 2000).unwrap();
+        assert_eq!(s.thread_for_contact(id).unwrap(), Some(thread));
+        assert_eq!(
+            s.pairing_for_contact(id).unwrap().unwrap(),
+            Pairing {
+                contact_id: id,
+                l1_pub: [9u8; 32],
+                paired_at: 2000,
+            }
+        );
+        assert_eq!(s.contact_by_l1(&[9u8; 32]).unwrap().unwrap().id, id);
+    }
+
+    /// A pairing must not invent a second thread for someone we were already
+    /// talking to — the conversation predates the ceremony in the common case,
+    /// because R0-F3 and R0-F5 both work unpaired.
+    #[test]
+    fn pairing_someone_we_already_chat_with_keeps_the_conversation() {
+        let (s, _d) = store();
+        let id = s.add_contact(&a_contact()).unwrap();
+        let existing = s.create_thread(id, 1000).unwrap();
+        s.add_message(&NewMessage {
+            thread_id: existing,
+            seq: 1,
+            msg_id: vec![1u8; 16],
+            body: b"before we paired".to_vec(),
+            direction: Direction::Incoming,
+            state: MessageState::Delivered,
+            created_at: 1000,
+        })
+        .unwrap();
+
+        assert_eq!(s.pair_contact(id, &[9u8; 32], 2000).unwrap(), existing);
+        assert_eq!(s.messages_for_thread(existing).unwrap().len(), 1);
+    }
+
+    /// Pairing again supersedes: the other side may have wiped (R0-F9) and come
+    /// back with a new Layer-1 identity, and the second ceremony is the current
+    /// truth. The old key must not still resolve to them.
+    #[test]
+    fn pairing_again_replaces_the_key_and_keeps_the_thread() {
+        let (s, _d) = store();
+        let id = s.add_contact(&a_contact()).unwrap();
+        let thread = s.pair_contact(id, &[9u8; 32], 2000).unwrap();
+        assert_eq!(s.pair_contact(id, &[8u8; 32], 3000).unwrap(), thread);
+
+        assert_eq!(
+            s.pairing_for_contact(id).unwrap().unwrap().l1_pub,
+            [8u8; 32]
+        );
+        assert!(s.contact_by_l1(&[9u8; 32]).unwrap().is_none());
+        assert_eq!(s.contact_by_l1(&[8u8; 32]).unwrap().unwrap().id, id);
+    }
+
+    /// The reason pairings are a separate table.
+    ///
+    /// A pseudonym is a value the *peer* chooses — it is their session static —
+    /// while a Layer-1 key comes out of a ceremony. While both lived in one
+    /// UNIQUE column, telling those two apart rested on nobody being able to
+    /// present a pseudonym equal to somebody else's Layer-1 key. Now identical
+    /// bytes in the two roles are simply two different facts.
+    #[test]
+    fn a_pseudonym_and_a_layer_1_key_with_the_same_bytes_do_not_collide() {
+        let (s, _d) = store();
+        let stranger = s.add_contact(&a_contact()).unwrap(); // pseudonym [1; 32]
+        let other = s
+            .add_contact(&NewContact {
+                pseudonym: [2u8; 32],
+                ..a_contact()
+            })
+            .unwrap();
+        // Someone paired whose Layer-1 key happens to equal the stranger's
+        // pseudonym.
+        s.pair_contact(other, &[1u8; 32], 2000).unwrap();
+
+        assert_eq!(
+            s.contact_by_pseudonym(&[1u8; 32]).unwrap().unwrap().id,
+            stranger
+        );
+        assert_eq!(s.contact_by_l1(&[1u8; 32]).unwrap().unwrap().id, other);
+    }
+
+    /// One Layer-1 key, one person.
+    ///
+    /// A Layer-1 key *is* the identity, so two contacts paired to the same one
+    /// would be one person written down twice, with `contact_by_l1` returning
+    /// whichever row the index reached first. Refusing is not the only defensible
+    /// answer — merging the two would be another — but silently allowing it is
+    /// not, and the refusal must leave nothing behind.
+    ///
+    /// Here because mutation testing found the `UNIQUE` on `pairings.l1_pub`
+    /// could be deleted with every test still passing.
+    #[test]
+    fn two_contacts_cannot_claim_the_same_layer_1_identity() {
+        let (s, _d) = store();
+        let first = s.add_contact(&a_contact()).unwrap();
+        let second = s
+            .add_contact(&NewContact {
+                pseudonym: [2u8; 32],
+                ..a_contact()
+            })
+            .unwrap();
+        s.pair_contact(first, &[9u8; 32], 2000).unwrap();
+
+        assert!(s.pair_contact(second, &[9u8; 32], 3000).is_err());
+        // Rolled back whole: no pairing, and no thread opened on the way past.
+        assert!(s.pairing_for_contact(second).unwrap().is_none());
+        assert!(s.thread_for_contact(second).unwrap().is_none());
+        assert_eq!(s.contact_by_l1(&[9u8; 32]).unwrap().unwrap().id, first);
+    }
+
+    /// Blocking a paired person revokes the pairing (R0-F10) — and does not
+    /// burn the conversation, which is theirs.
+    #[test]
+    fn unpairing_keeps_the_thread_and_its_messages() {
+        let (s, _d) = store();
+        let id = s.add_contact(&a_contact()).unwrap();
+        let thread = s.pair_contact(id, &[9u8; 32], 2000).unwrap();
+        s.add_message(&NewMessage {
+            thread_id: thread,
+            seq: 1,
+            msg_id: vec![3u8; 16],
+            body: b"said while paired".to_vec(),
+            direction: Direction::Incoming,
+            state: MessageState::Delivered,
+            created_at: 2100,
+        })
+        .unwrap();
+
+        assert!(s.unpair_contact(id).unwrap());
+        assert!(s.pairing_for_contact(id).unwrap().is_none());
+        assert!(s.contact_by_l1(&[9u8; 32]).unwrap().is_none());
+        assert_eq!(s.thread_for_contact(id).unwrap(), Some(thread));
+        assert_eq!(s.messages_for_thread(thread).unwrap().len(), 1);
+        // Reports rather than pretends, like every other revoking call here.
+        assert!(!s.unpair_contact(id).unwrap());
+    }
+
+    /// A pairing for a contact that does not exist is a caller bug.
+    ///
+    /// The foreign key would refuse it anyway, so the explicit check buys
+    /// exactly one thing: an error that names the contact instead of
+    /// `FOREIGN KEY constraint failed` arriving three layers up with nothing to
+    /// say. That being the whole point, the message is what this asserts —
+    /// mutation testing was blunt about it, since deleting the check left the
+    /// original test passing on the constraint's back.
+    #[test]
+    fn pairing_an_unknown_contact_says_which_contact() {
+        let (s, _d) = store();
+        let err = s
+            .pair_contact(4242, &[9u8; 32], 2000)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("4242"), "unhelpful error: {err}");
+        assert!(s.contact_by_l1(&[9u8; 32]).unwrap().is_none());
+    }
+
+    /// Forgetting someone forgets the pairing too — R0-F9 leaves nothing that
+    /// still asserts a ceremony happened.
+    #[test]
+    fn deleting_a_contact_takes_its_pairing_with_it() {
+        let (s, _d) = store();
+        let keep = s.add_contact(&a_contact()).unwrap();
+        let go = s
+            .add_contact(&NewContact {
+                pseudonym: [3u8; 32],
+                ..a_contact()
+            })
+            .unwrap();
+        s.pair_contact(go, &[9u8; 32], 2000).unwrap();
+
+        s.merge_contact(go, keep).unwrap();
+        assert!(s.contact_by_l1(&[9u8; 32]).unwrap().is_none());
     }
 
     /// Re-keying keeps the person: same row, same thread, same history.
@@ -734,12 +1049,12 @@ mod tests {
         assert!(s.rekey_contact(id, &[42u8; 32]).unwrap());
 
         assert_eq!(
-            s.contact_by_l1(&[42u8; 32]).unwrap().unwrap().id,
+            s.contact_by_pseudonym(&[42u8; 32]).unwrap().unwrap().id,
             id,
             "the contact did not move onto the real key"
         );
         assert!(
-            s.contact_by_l1(&[1u8; 32]).unwrap().is_none(),
+            s.contact_by_pseudonym(&[1u8; 32]).unwrap().is_none(),
             "the rotating id still resolves, so the next lookup makes a duplicate"
         );
         assert_eq!(
@@ -767,7 +1082,7 @@ mod tests {
         let known_thread = s.create_thread(known, 1000).unwrap();
         let stray = s
             .add_contact(&NewContact {
-                l1_pub: [8u8; 32],
+                pseudonym: [8u8; 32],
                 ..a_contact()
             })
             .unwrap();
@@ -820,7 +1135,7 @@ mod tests {
         let known_thread = s.create_thread(known, 1000).unwrap();
         let stray = s
             .add_contact(&NewContact {
-                l1_pub: [8u8; 32],
+                pseudonym: [8u8; 32],
                 ..a_contact()
             })
             .unwrap();
@@ -855,7 +1170,7 @@ mod tests {
         let known = s.add_contact(&a_contact()).unwrap();
         let stray = s
             .add_contact(&NewContact {
-                l1_pub: [8u8; 32],
+                pseudonym: [8u8; 32],
                 ..a_contact()
             })
             .unwrap();
@@ -930,12 +1245,12 @@ mod tests {
     fn contact_round_trips_and_lists() {
         let (s, _d) = store();
         let id = s.add_contact(&a_contact()).unwrap();
-        let got = s.contact_by_l1(&[1u8; 32]).unwrap().unwrap();
+        let got = s.contact_by_pseudonym(&[1u8; 32]).unwrap().unwrap();
         assert_eq!(got.id, id);
         assert_eq!(got.name, "Alice");
         assert_eq!(got.l2_pub, [2u8; 32]);
         assert_eq!(s.list_contacts().unwrap().len(), 1);
-        assert!(s.contact_by_l1(&[9u8; 32]).unwrap().is_none());
+        assert!(s.contact_by_pseudonym(&[9u8; 32]).unwrap().is_none());
     }
 
     #[test]
