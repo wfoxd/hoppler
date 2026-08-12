@@ -30,3 +30,21 @@ message PairingInvite {
   // into another, and folded into the SAS the humans compare.
   bytes  ceremony_nonce  = 3;
 }
+
+// A device's Layer-1 public identity, and proof it holds the matching secret.
+//
+// This is the thing the whole ceremony exists to move, and the only message in
+// Hoppler that carries Layer-1 material (R0-F1). It travels inside the verified
+// ceremony channel, and only after **both** people have confirmed the SAS.
+//
+// The signature is required even though the channel is already authenticated.
+// The channel proves who is *speaking* — a Layer-2 persona — and a Layer-1 key
+// is a separate claim: without a signature by that key, anyone could hand over
+// somebody else's Layer-1 public key and have it written into the other
+// device's contacts as their own. What is signed is a domain-separated message
+// over the ceremony's transcript hash and both keys, so the proof binds Layer-1
+// to Layer-2 and cannot be lifted into a different ceremony.
+message L1Proof {
+  bytes l1_pub    = 1; // Ed25519 Layer-1 public key (32 bytes)
+  bytes signature = 2; // Ed25519 by l1_pub; see pairing::ceremony for the message
+}
