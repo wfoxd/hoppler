@@ -63,6 +63,39 @@ const MIGRATIONS: &[&str] = &[
         value BLOB NOT NULL
     );
     "#,
+    // v1 -> v2: stop calling a pseudonym a Layer-1 key, and record pairing
+    // where it actually happens.
+    //
+    // `contacts.l1_pub` never held a Layer-1 key. Until T11 there was no way to
+    // obtain one — R0-F1 says Layer-1 crosses only via the F4 ceremony, and the
+    // ceremony did not exist — so the column held whatever durable handle was
+    // available: the peer's session pseudonym once a handshake proved one, and
+    // a value derived from the rotating device id before that. `paired_at` was
+    // filled in the same spirit, for contacts that had never been paired with.
+    //
+    // That was survivable while nothing else could go in the column. It stops
+    // being survivable now, because a real Layer-1 key is about to exist, and
+    // putting it in the same UNIQUE column as peer-chosen pseudonyms would put
+    // two key spaces in one index — with row identity resting on an attacker
+    // being unable to find a pseudonym colliding with someone's Layer-1 key.
+    // That may well be true and nobody ever wrote it down as a thing being
+    // relied on, which is the wrong way to hold a security property.
+    //
+    // So: the columns are renamed to what they contain, and pairing moves to
+    // its own table, where a row existing *is* the fact that two people
+    // completed a ceremony. Renames rather than a table rebuild — SQLite
+    // updates dependent objects for `RENAME COLUMN`, whereas rebuilding
+    // `contacts` would mean dropping a table `threads` references, with foreign
+    // keys on, inside a transaction where `PRAGMA foreign_keys` is a no-op.
+    r#"
+    ALTER TABLE contacts RENAME COLUMN l1_pub TO pseudonym;
+    ALTER TABLE contacts RENAME COLUMN paired_at TO first_seen;
+    CREATE TABLE pairings (
+        contact_id INTEGER PRIMARY KEY REFERENCES contacts(id) ON DELETE CASCADE,
+        l1_pub     BLOB NOT NULL UNIQUE,
+        paired_at  INTEGER NOT NULL
+    );
+    "#,
 ];
 
 /// The schema version this build migrates to.
@@ -111,4 +144,140 @@ pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
         version = next;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Bring a bare connection up to a chosen version, so a test can stand on
+    /// an old schema rather than describing one.
+    fn at_version(conn: &Connection, version: usize) {
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        for step in &MIGRATIONS[..version] {
+            conn.execute_batch(step).unwrap();
+        }
+        conn.execute_batch(&format!("PRAGMA user_version = {version};"))
+            .unwrap();
+    }
+
+    /// The v2 migration has to move data, not just columns.
+    ///
+    /// What was in `contacts.l1_pub` was never a Layer-1 key, so it belongs in
+    /// `pseudonym` — and the rows must come out claiming **no** pairing, because
+    /// none of them was ever paired. A migration that carried `paired_at`
+    /// across would leave every existing contact asserting a ceremony that did
+    /// not happen, which is the thing this change exists to stop.
+    #[test]
+    fn v1_contacts_become_unpaired_contacts_keyed_by_pseudonym() {
+        let conn = Connection::open_in_memory().unwrap();
+        at_version(&conn, 1);
+        conn.execute(
+            "INSERT INTO contacts (id, l1_pub, l2_pub, name, colour, persona_version, paired_at)
+             VALUES (1, ?1, ?2, 'Alice', 255, 3, 1700)",
+            rusqlite::params![&[7u8; 32][..], &[8u8; 32][..]],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO threads (id, contact_id, created_at) VALUES (1, 1, 1701)",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), LATEST_VERSION);
+
+        let (pseudonym, name, first_seen): (Vec<u8>, String, i64) = conn
+            .query_row(
+                "SELECT pseudonym, name, first_seen FROM contacts WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            pseudonym,
+            vec![7u8; 32],
+            "the old key did not become the pseudonym"
+        );
+        assert_eq!(name, "Alice");
+        assert_eq!(first_seen, 1700, "the old timestamp was lost");
+
+        let pairings: i64 = conn
+            .query_row("SELECT count(*) FROM pairings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pairings, 0, "migration invented a pairing");
+    }
+
+    /// The rename must not sever `threads.contact_id`, which is the reason this
+    /// migration renames columns rather than rebuilding the table.
+    #[test]
+    fn the_rename_leaves_foreign_keys_intact() {
+        let conn = Connection::open_in_memory().unwrap();
+        at_version(&conn, 1);
+        conn.execute(
+            "INSERT INTO contacts (id, l1_pub, l2_pub, name, colour, persona_version, paired_at)
+             VALUES (1, ?1, ?2, 'Alice', 0, 1, 1)",
+            rusqlite::params![&[7u8; 32][..], &[8u8; 32][..]],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO threads (id, contact_id, created_at) VALUES (1, 1, 2)",
+            [],
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+
+        // No dangling references anywhere in the database...
+        let mut check = conn.prepare("PRAGMA foreign_key_check").unwrap();
+        assert_eq!(check.query_map([], |_| Ok(())).unwrap().count(), 0);
+        // ...and the cascade still reaches, which a rewritten reference would
+        // silently have stopped doing.
+        conn.execute("DELETE FROM contacts WHERE id = 1", [])
+            .unwrap();
+        let threads: i64 = conn
+            .query_row("SELECT count(*) FROM threads", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(threads, 0, "deleting a contact left its thread behind");
+    }
+
+    /// The columns the record queries name, spelled out.
+    ///
+    /// This replaces a test that compared a fresh database against an upgraded
+    /// one. That test could not fail: a fresh `migrate` replays every step in
+    /// the same order the upgrade path finishes with, so the two are equal by
+    /// construction, and mutation testing showed it passing happily against a
+    /// migration with a junk table added. What is actually worth pinning is
+    /// that the migrated shape is the one `records.rs` queries — a rename typo
+    /// here is a runtime failure everywhere, and nowhere at compile time.
+    #[test]
+    fn the_migrated_schema_has_the_columns_the_record_queries_name() {
+        fn columns(conn: &Connection, table: &str) -> Vec<String> {
+            let mut stmt = conn
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, String>(1)).unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        }
+
+        let conn = Connection::open_in_memory().unwrap();
+        at_version(&conn, 1);
+        migrate(&conn).unwrap();
+
+        assert_eq!(
+            columns(&conn, "contacts"),
+            [
+                "id",
+                "pseudonym",
+                "l2_pub",
+                "name",
+                "colour",
+                "persona_version",
+                "first_seen"
+            ]
+        );
+        assert_eq!(
+            columns(&conn, "pairings"),
+            ["contact_id", "l1_pub", "paired_at"]
+        );
+    }
 }

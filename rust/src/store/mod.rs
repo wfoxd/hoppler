@@ -268,12 +268,12 @@ mod tests {
             let s = Store::open(Arc::clone(&ks), &db, &files).unwrap();
             let c = s
                 .add_contact(&NewContact {
-                    l1_pub: [4u8; 32],
+                    pseudonym: [4u8; 32],
                     l2_pub: [5u8; 32],
                     name: "Bob".into(),
                     colour: 0x00abcdef,
                     persona_version: 1,
-                    paired_at: 10,
+                    first_seen: 10,
                 })
                 .unwrap();
             let t = s.create_thread(c, 11).unwrap();
@@ -290,7 +290,7 @@ mod tests {
         }
         // Reopen: migrate must not wipe, and blobs must persist.
         let s = Store::open(Arc::clone(&ks), &db, &files).unwrap();
-        let c = s.contact_by_l1(&[4u8; 32]).unwrap().unwrap();
+        let c = s.contact_by_pseudonym(&[4u8; 32]).unwrap().unwrap();
         assert_eq!(c.name, "Bob");
         let t = s.thread_for_contact(c.id).unwrap().unwrap();
         assert_eq!(s.messages_for_thread(t).unwrap()[0].body, b"hi");

@@ -60,8 +60,14 @@ pub fn canned_reply(text: &str) -> String {
     format!("(echo) {text}")
 }
 
-/// A deterministic fake Layer-1 public for a peer, so the store has a stable
-/// key to hang a contact on. Not a real key — replaced when pairing is real.
-pub fn fake_l1_pub(device_id: &str) -> [u8; 32] {
+/// A stand-in pseudonym for a peer we have not yet held a session with, so the
+/// store has a stable key to hang a contact on.
+///
+/// Not a pseudonym anyone proved: it is a hash of the rotating device id, which
+/// R0-F2 changes every twelve minutes. That is why `reconcile_contact` exists —
+/// a row keyed here is moved onto the real, handshake-proved pseudonym as soon
+/// as there is one. It was called `fake_l1_pub` while `contacts` had a column
+/// called `l1_pub`; both names were wrong in the same way.
+pub fn placeholder_pseudonym(device_id: &str) -> [u8; 32] {
     crate::crypto::hash::hash(device_id.as_bytes())
 }

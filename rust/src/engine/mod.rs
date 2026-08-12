@@ -679,13 +679,13 @@ fn pseudonym_of(core: &Core, device_id: &str) -> Option<[u8; 32]> {
 /// someone the user has been talking to all afternoon.
 fn contact_id_for_device(core: &Core, device_id: &str) -> Result<Option<i64>, StoreError> {
     if let Some(real) = pseudonym_of(core, device_id) {
-        if let Some(c) = core.store.contact_by_l1(&real)? {
+        if let Some(c) = core.store.contact_by_pseudonym(&real)? {
             return Ok(Some(c.id));
         }
     }
     Ok(core
         .store
-        .contact_by_l1(&fake::fake_l1_pub(device_id))?
+        .contact_by_pseudonym(&fake::placeholder_pseudonym(device_id))?
         .map(|c| c.id))
 }
 
@@ -724,12 +724,12 @@ fn reconcile_contact(core: &Core, device_id: &str) -> Result<(), StoreError> {
     };
     let Some(stray) = core
         .store
-        .contact_by_l1(&fake::fake_l1_pub(device_id))?
+        .contact_by_pseudonym(&fake::placeholder_pseudonym(device_id))?
         .map(|c| c.id)
     else {
         return Ok(());
     };
-    match core.store.contact_by_l1(&real)?.map(|c| c.id) {
+    match core.store.contact_by_pseudonym(&real)?.map(|c| c.id) {
         // Re-keying cannot help: the real key is already taken.
         Some(known) => core.store.merge_contact(stray, known)?,
         None => {
@@ -749,17 +749,18 @@ fn ensure_contact(core: &Core, device_id: &str, now: i64) -> Result<i64, StoreEr
 
     // Nothing on file. Prefer the durable key if a session has proved one;
     // otherwise the device id, which `reconcile_contact` will move later.
-    let key = pseudonym_of(core, device_id).unwrap_or_else(|| fake::fake_l1_pub(device_id));
+    let key =
+        pseudonym_of(core, device_id).unwrap_or_else(|| fake::placeholder_pseudonym(device_id));
     let (name, colour) = fake::peer(device_id)
         .map(|p| (p.name.to_owned(), p.colour))
         .unwrap_or_else(|| ("Unknown".into(), 0));
     core.store.add_contact(&NewContact {
-        l1_pub: key,
+        pseudonym: key,
         l2_pub: [0u8; 32], // placeholder — real Layer-2 arrives with pairing (T08–T10)
         name,
         colour,
         persona_version: 1,
-        paired_at: now,
+        first_seen: now,
     })
 }
 
