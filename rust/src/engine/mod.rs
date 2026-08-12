@@ -363,19 +363,19 @@ pub fn nearby_devices() -> Result<Vec<NearbyDevice>, String> {
 /// Ping a device visible in Discovery. Only reachable while Discovery is open —
 /// closing it makes pings undeliverable (F3).
 ///
-/// The ack is `PingAcked`, not `Pinged`. This comment said otherwise until
-/// today, and it was describing the defect rather than the design: `Pinged` is
-/// someone nudging *us*, so deriving an acknowledgement from it meant an
-/// ordinary ping could only look answered if the other person happened to nudge
-/// back. Fixed in PR #27 by giving the wire a Pong; the sentence outlived it.
+/// The ack is `PingAcked`, never `Pinged`. `Pinged` is someone nudging *us*,
+/// and an acknowledgement derived from it would only arrive when the other
+/// person happened to nudge back — so an ordinary ping would always time out
+/// while an unrelated incoming one was mistaken for the answer. The wire
+/// carries a Pong for this reason.
 ///
-/// Cross-device reachability is real now — a tap opens a session and crosses to
-/// another phone — so the `is_on` check below is the F3 gate on our own side,
-/// not a stand-in for the peer's state.
+/// The `is_on` check below is the F3 gate on this side: it says whether *we*
+/// may ping, not whether the peer is reachable. Reachability is the transport's
+/// answer, and arrives as `PingAcked` or `PingUndeliverable`.
 ///
-/// **Still missing: the receiver-side rate limiter (tech spec §7.)** It was
-/// deferred to "the session layer (T09/T10)", both of which are done, so it has
-/// no owner. Nothing in the codebase implements it.
+/// **Not implemented: the receiver-side rate limiter for Ping (tech spec §7).**
+/// Discovery has its own rate limiting for persona requests, which is a
+/// different thing; nothing bounds how often a peer may ping us.
 pub fn ping(device_id: String) -> Result<(), String> {
     let net = require_net()?;
     if !net.discovery().is_on() {
