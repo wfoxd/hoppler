@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package hoppler.v0;
+
+// What the pairing QR code — and the NFC tap, which carries the identical
+// payload — puts in front of the other person's camera (tech spec §6, R0-F4).
+//
+// Deliberately NOT signed. A signature over these fields would prove the shower
+// holds `l2_pub`, which the ceremony's Noise handshake proves anyway, and it
+// would stop nothing: an attacker who substitutes the whole code substitutes
+// their own `l2_pub` too and signs it validly. The authenticity of this payload
+// comes from the physical channel — a person holding a screen up — and from the
+// human-checked SAS at the end. Adding 64 bytes to say otherwise would make the
+// code denser and the guarantee no stronger.
+message PairingInvite {
+  // Ed25519 Layer-2 public key (32 bytes). The scanner needs it to address the
+  // ceremony and to check, at the end, that the identity it verified is the one
+  // whose code it read.
+  bytes  l2_pub          = 1;
+  // The rung-level id this device is advertising as *right now* — a shortcut so
+  // the scanner can dial without waiting for a discovery sweep.
+  //
+  // A hint and nothing more. It rotates every twelve minutes under R0-F2, so a
+  // code left on a screen goes stale, and a scanner that cannot reach it must
+  // fall back to discovery rather than fail. Nothing may be trusted on the
+  // strength of this field: it is unauthenticated and only ever an address.
+  string ble_hint        = 2;
+  // 32 random bytes binding this ceremony to this code. Mixed into the
+  // handshake as its prologue, so a handshake for one code cannot be replayed
+  // into another, and folded into the SAS the humans compare.
+  bytes  ceremony_nonce  = 3;
+}
