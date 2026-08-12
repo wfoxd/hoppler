@@ -550,10 +550,13 @@ impl Ceremony {
     // ── framing inside the channel ──────────────────────────────────────────
 
     fn seal(&mut self, kind: FrameKind, payload: &[u8]) -> Result<Vec<u8>, CeremonyError> {
+        if payload.len() > MAX_CEREMONY_FRAME {
+            return Err(CeremonyError::Malformed);
+        }
         let Stage::Confirming { transport, .. } = &mut self.stage else {
             return Err(CeremonyError::OutOfOrder);
         };
-        let mut plain = Vec::with_capacity(1 + payload.len());
+        let mut plain = Vec::with_capacity(KIND_LEN + payload.len());
         plain.push(kind as u8);
         plain.extend_from_slice(payload);
         let mut out = vec![0u8; MAX_NOISE_MESSAGE];
@@ -566,7 +569,7 @@ impl Ceremony {
         let Stage::Confirming { transport, .. } = &mut self.stage else {
             return Err(CeremonyError::OutOfOrder);
         };
-        if message.len() > MAX_CEREMONY_FRAME + MAX_NOISE_OVERHEAD {
+        if message.len() > MAX_CEREMONY_CIPHERTEXT {
             return Err(CeremonyError::Malformed);
         }
         let mut buf = vec![0u8; MAX_NOISE_MESSAGE];
@@ -581,8 +584,22 @@ impl Ceremony {
     }
 }
 
+/// The kind byte ahead of every post-handshake payload.
+const KIND_LEN: usize = 1;
+
 /// The AEAD tag Noise adds to a transport message.
 const MAX_NOISE_OVERHEAD: usize = 16;
+
+/// The outer bound, on the ciphertext as it arrives.
+///
+/// Composed from the parts rather than written as a number, because the first
+/// version was not: it bounded the ciphertext at payload + tag and forgot the
+/// kind byte, so a frame carrying a full [`MAX_CEREMONY_FRAME`] payload was
+/// rejected as malformed by the outer check that the inner one would have
+/// allowed. Harmless today — a Layer-1 proof is a hundred-odd bytes — but the
+/// two checks disagreeing about what the limit *is* is the kind of thing that
+/// only shows up once something legitimately grows.
+const MAX_CEREMONY_CIPHERTEXT: usize = KIND_LEN + MAX_CEREMONY_FRAME + MAX_NOISE_OVERHEAD;
 
 /// Check a Layer-1 proof and return the key it establishes.
 ///
@@ -1000,6 +1017,43 @@ mod tests {
         assert!(matches!(
             h.shower.read(&h.shower_id, &again),
             Err(CeremonyError::OutOfOrder)
+        ));
+    }
+
+    /// The two size checks have to agree about what the limit is.
+    ///
+    /// The outer one bounds the ciphertext before decrypting; the inner one
+    /// bounds the payload after. They are computed from different quantities,
+    /// so nothing but a test at the exact edge keeps them consistent — and the
+    /// first version of the outer check forgot the kind byte, which made a
+    /// maximum-size frame fail the outer test that the inner one allowed.
+    #[test]
+    fn a_maximum_size_frame_survives_both_length_checks() {
+        let mut h = halfway();
+        let full = h
+            .scanner
+            .seal(FrameKind::L1, &vec![0u8; MAX_CEREMONY_FRAME])
+            .expect("a full-size frame must be sealable");
+        assert!(full.len() <= MAX_CEREMONY_CIPHERTEXT);
+
+        // It reaches the payload check rather than being turned away at the
+        // door: an early Layer-1 proof is refused for being early, not for
+        // being big.
+        assert!(matches!(
+            h.shower.read(&h.shower_id, &full),
+            Err(CeremonyError::OutOfOrder)
+        ));
+
+        // And one byte more is refused, on the way out and on the way in.
+        assert!(matches!(
+            h.scanner
+                .seal(FrameKind::L1, &vec![0u8; MAX_CEREMONY_FRAME + 1]),
+            Err(CeremonyError::Malformed)
+        ));
+        assert!(matches!(
+            h.shower
+                .read(&h.shower_id, &vec![0u8; MAX_CEREMONY_CIPHERTEXT + 1]),
+            Err(CeremonyError::Malformed)
         ));
     }
 

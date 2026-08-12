@@ -306,7 +306,13 @@ impl Identity {
     /// *what* is being signed — the caller supplies a domain-separated message
     /// (see `pairing::ceremony`), because a bare signature over an attacker's
     /// bytes is a signing oracle.
-    pub fn sign_with_layer1(&self, message: &[u8]) -> sign::Signature {
+    ///
+    /// `pub(crate)` for that last reason. It was written `pub`, which made the
+    /// paragraph above a description of an intention rather than of the code:
+    /// any consumer of this crate could have asked for a Layer-1 signature over
+    /// bytes of its choosing. The ceremony is inside the crate, so nothing is
+    /// lost by saying so in the visibility.
+    pub(crate) fn sign_with_layer1(&self, message: &[u8]) -> sign::Signature {
         self.layer1.sign(message)
     }
 
