@@ -1622,3 +1622,92 @@ fn a_ceremony_that_cannot_start_does_not_block_the_retry() {
         "a ceremony that never started was left in flight"
     );
 }
+
+/// A second attempt at pairing with the same peer must not replace the first.
+///
+/// The single-threaded half of the check-then-insert fix. The race itself —
+/// two callers passing the check before either inserts — is closed by doing
+/// both under one hold of the map, which no deterministic test can demonstrate;
+/// what this pins is the behaviour that check exists to produce.
+#[test]
+fn a_second_attempt_at_the_same_peer_does_not_replace_the_first() {
+    let air = air();
+    let now = Instant::now();
+    let (alice, bob) = paired_up(&air, now);
+
+    let bobs_key = bob
+        .identity
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .layer2_public();
+    let first = Invite::fresh(bobs_key, &bob.id);
+    bob.net.show_invite(first.clone());
+    alice.net.begin_pairing(&bob.id, &first, now).unwrap();
+
+    // A second code from the same person, scanned before the first finished.
+    let second = Invite::fresh(bobs_key, &bob.id);
+    assert!(
+        alice.net.begin_pairing(&bob.id, &second, now).is_err(),
+        "a second ceremony replaced the one already running"
+    );
+
+    // The original is still the one running, and still completes.
+    let (a_events, b_events) = settle(&alice, &bob, now);
+    assert!(sas_in(&a_events).is_some(), "the first ceremony was lost");
+    assert_eq!(sas_in(&a_events), sas_in(&b_events));
+}
+
+/// A ceremony that is being used is not swept out from under the two people
+/// using it. Traffic pushes the deadline out; the sweep only takes what has
+/// genuinely gone quiet.
+#[test]
+fn traffic_keeps_a_ceremony_alive_past_the_original_deadline() {
+    let air = air();
+    let now = Instant::now();
+    let (alice, bob) = paired_up(&air, now);
+
+    let invite = Invite::fresh(
+        bob.identity
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .layer2_public(),
+        &bob.id,
+    );
+    bob.net.show_invite(invite.clone());
+    alice.net.begin_pairing(&bob.id, &invite, now).unwrap();
+
+    // Progress most of the way through the window, then exchange messages.
+    let late = now + CEREMONY_DEADLINE - Duration::from_secs(1);
+    settle(&alice, &bob, late);
+
+    // Past the deadline the ceremony *started* with, but not past the one its
+    // last message set.
+    let just_after_the_original = now + CEREMONY_DEADLINE + Duration::from_secs(1);
+    let swept = alice.net.tick(just_after_the_original);
+    assert!(
+        !swept
+            .iter()
+            .any(|e| matches!(e, NetEvent::PairingFailed { .. })),
+        "a ceremony in use was swept: {swept:?}"
+    );
+    assert!(alice.net.ceremony_in_flight(&bob.id));
+
+    // And it still finishes.
+    alice
+        .net
+        .confirm_pairing(&bob.id, just_after_the_original)
+        .unwrap();
+    settle(&alice, &bob, just_after_the_original);
+    let confirmed = bob
+        .net
+        .confirm_pairing(&alice.id, just_after_the_original)
+        .unwrap();
+    assert!(confirmed
+        .iter()
+        .all(|e| !matches!(e, NetEvent::PairingFailed { .. })));
+    let (a_events, _) = settle(&alice, &bob, just_after_the_original);
+    assert!(
+        completion_in(&a_events).is_some(),
+        "the ceremony did not finish: {a_events:?}"
+    );
+}

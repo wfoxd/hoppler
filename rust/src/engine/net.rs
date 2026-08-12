@@ -360,24 +360,30 @@ impl Net {
     /// [`Net::ping`] spells out at length: `reach` returns on acceptance, and a
     /// session is several round trips further on.
     pub fn begin_pairing(&self, peer: &str, invite: &Invite, now: Instant) -> Result<(), String> {
-        if self.ceremony_in_flight(peer) {
-            return Err(format!("already pairing with {peer}"));
-        }
         let opening = {
             // Identity first, then ceremonies — see the note on `ceremonies`.
+            //
+            // The "already pairing" check and the insert happen under *one*
+            // hold of the map, because `Net` is shared: the pump thread, the
+            // clock thread and Dart all call in. Checking through
+            // `ceremony_in_flight` and inserting afterwards — which is what
+            // this did — lets two calls for the same peer both pass the check
+            // and the second silently replace the first, leaving the first
+            // one's peer talking to a ceremony that no longer exists here.
             let identity = self.identity.lock().unwrap_or_else(|e| e.into_inner());
+            let mut ceremonies = self.ceremonies.lock().unwrap_or_else(|e| e.into_inner());
+            if ceremonies.contains_key(peer) {
+                return Err(format!("already pairing with {peer}"));
+            }
             let (ceremony, opening) =
                 Ceremony::scan(&identity, invite).map_err(|e| e.to_string())?;
-            self.ceremonies
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(
-                    peer.to_string(),
-                    InFlight {
-                        ceremony,
-                        deadline: now + CEREMONY_DEADLINE,
-                    },
-                );
+            ceremonies.insert(
+                peer.to_string(),
+                InFlight {
+                    ceremony,
+                    deadline: now + CEREMONY_DEADLINE,
+                },
+            );
             opening
         };
         // A ceremony that could not get its first message out is not a
@@ -472,16 +478,36 @@ impl Net {
     /// they fire on is the *absence* of traffic, so no transport event will ever
     /// arrive to carry them.
     fn sweep_ceremonies(&self, now: Instant) -> Vec<NetEvent> {
-        let expired: Vec<PeerId> = self
-            .ceremonies
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter(|(_, in_flight)| now >= in_flight.deadline)
-            .map(|(peer, _)| peer.clone())
-            .collect();
-        for peer in &expired {
-            self.forget_ceremony(peer);
+        // Deciding and removing happen under one hold, and deliberately not
+        // through `forget_ceremony`.
+        //
+        // The clock thread runs this while the pump thread is delivering
+        // ceremony traffic, and every inbound message pushes the deadline out.
+        // Choosing the victims, releasing the lock, and then removing them
+        // unconditionally — which is what calling the helper here did — sweeps
+        // a ceremony that made progress in between, killing a pairing two
+        // people are in the middle of. This is the one place the two maps are
+        // not cleared by the same call, so the queue half follows below.
+        let expired: Vec<PeerId> = {
+            let mut ceremonies = self.ceremonies.lock().unwrap_or_else(|e| e.into_inner());
+            let due: Vec<PeerId> = ceremonies
+                .iter()
+                .filter(|(_, in_flight)| now >= in_flight.deadline)
+                .map(|(peer, _)| peer.clone())
+                .collect();
+            for peer in &due {
+                ceremonies.remove(peer);
+            }
+            due
+        };
+        if !expired.is_empty() {
+            let mut queued = self
+                .pending_ceremony
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for peer in &expired {
+                queued.remove(peer);
+            }
         }
         expired
             .into_iter()
