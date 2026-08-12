@@ -1,4 +1,8 @@
-//! The v0 SAS word list — 256 words, one per byte.
+//! The SAS word list — 256 words, one per byte.
+//!
+//! Part of the `hoppler/sas/v1` format, whose label lives with the derivation
+//! in [`super::sas`]. There is exactly one version of this list and it is that
+//! one; the list has no separate version of its own to get out of step.
 //!
 //! The word is the third of the three things two people compare during the
 //! ceremony, and the only one they can read out over the noise of a room. That
@@ -24,8 +28,9 @@
 //! localising a SAS list is harder than translating it — the words have to stay
 //! distinct *within* the target language, and both devices must choose the same
 //! list without negotiating it over the very channel being authenticated. That
-//! is out of Ring 0's scope, and picking `v1` in the label above is what leaves
-//! room for it.
+//! is out of Ring 0's scope. What leaves room for it is that the label in
+//! [`super::sas`] is versioned at all: a second list arrives as `hoppler/sas/v2`
+//! rather than as an edit to this one.
 
 /// One word per byte value. Index is the byte; order is therefore part of the
 /// format and must never be re-sorted.

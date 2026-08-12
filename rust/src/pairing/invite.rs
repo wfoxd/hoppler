@@ -314,6 +314,29 @@ mod tests {
         assert_eq!(Invite::parse(&invite.to_uri()), Ok(invite));
     }
 
+    /// Freezes the bytes, which the round trip above cannot.
+    ///
+    /// A round trip only proves this build agrees with itself. Renumber a
+    /// protobuf field, reorder the base32 alphabet, move the version byte
+    /// behind the payload — every one of those still round-trips perfectly, and
+    /// every one of them is a code that the phone in the other person's hand
+    /// cannot read. The two devices in a ceremony are not required to be running
+    /// the same build, so self-consistency is the one property that is worth
+    /// nothing here.
+    ///
+    /// Deliberately written out in full rather than as a hash: the failure this
+    /// catches is a *format* change, and a reviewer looking at the diff should
+    /// be able to see what the format now is. The sibling vector for the SAS is
+    /// `sas::tests::golden_vector`.
+    #[test]
+    fn golden_uri() {
+        assert_eq!(
+            an_invite().to_uri(),
+            "HOPPLER://PAIR/AEFCABYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYH\
+             CIIGCMLCGJRTGZBUMU2WMNRQG4YTQGRABEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQ"
+        );
+    }
+
     #[test]
     fn fresh_invites_do_not_repeat_a_nonce() {
         let key = sign::PublicKey([1u8; sign::PUBLIC_KEY_LEN]);
