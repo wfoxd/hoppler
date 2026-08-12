@@ -361,11 +361,21 @@ pub fn nearby_devices() -> Result<Vec<NearbyDevice>, String> {
 // ── sessions / threads ────────────────────────────────────────────────────────
 
 /// Ping a device visible in Discovery. Only reachable while Discovery is open —
-/// closing it makes pings undeliverable (F3). The `Pinged` event is the ack.
+/// closing it makes pings undeliverable (F3).
 ///
-/// Real cross-device reachability (the peer's Discovery state) and the
-/// receiver-side rate limiter (tech spec §7) arrive with the session layer
-/// (T09/T10); here reachability is modelled by our own Discovery flag.
+/// The ack is `PingAcked`, never `Pinged`. `Pinged` is someone nudging *us*,
+/// and an acknowledgement derived from it would only arrive when the other
+/// person happened to nudge back — so an ordinary ping would always time out
+/// while an unrelated incoming one was mistaken for the answer. The wire
+/// carries a Pong for this reason.
+///
+/// The `is_on` check below is the F3 gate on this side: it says whether *we*
+/// may ping, not whether the peer is reachable. Reachability is the transport's
+/// answer, and arrives as `PingAcked` or `PingUndeliverable`.
+///
+/// **Not implemented: the receiver-side rate limiter for Ping (tech spec §7).**
+/// Discovery has its own rate limiting for persona requests, which is a
+/// different thing; nothing bounds how often a peer may ping us.
 pub fn ping(device_id: String) -> Result<(), String> {
     let net = require_net()?;
     if !net.discovery().is_on() {
