@@ -53,10 +53,52 @@ class QrScannerView extends StatelessWidget {
     if (!canScanQrCodes) {
       return _Unavailable(onCancel: onCancel);
     }
+    return _Scanner(onCode: onCode, onCancel: onCancel);
+  }
+}
+
+/// The camera, and what to say when there is not one.
+class _Scanner extends StatefulWidget {
+  const _Scanner({required this.onCode, required this.onCancel});
+
+  final void Function(String code) onCode;
+  final VoidCallback onCancel;
+
+  @override
+  State<_Scanner> createState() => _ScannerState();
+}
+
+class _ScannerState extends State<_Scanner> {
+  /// Why the camera did not open, if it did not.
+  ///
+  /// The plugin asks for the permission itself and reports a refusal by
+  /// failing to build a controller. Without this the screen is simply black:
+  /// no camera, no message, and nothing to suggest the person is looking at
+  /// the consequence of their own answer to a prompt. That is the same
+  /// availability lie R0-N6 rules out for the radio, and it would have been
+  /// found on two phones rather than here.
+  String? _problem;
+
+  @override
+  Widget build(BuildContext context) {
+    final problem = _problem;
+    if (problem != null) {
+      return _Blocked(reason: problem, onCancel: widget.onCancel);
+    }
     return Column(
       children: [
         Expanded(
           child: ReaderWidget(
+            onControllerCreated: (controller, error) {
+              if (error == null) return;
+              setState(() {
+                _problem = error.toString().contains('AccessDenied')
+                    ? 'Hoppler needs the camera to read a code. You can turn '
+                          'it on in Settings, or show your own code instead.'
+                    : 'The camera could not be opened. Show your own code '
+                          'instead and let the other phone scan it.';
+              });
+            },
             // Only QR. A ceremony code is a QR code, and accepting every
             // barcode format would mean decoding work on every frame for
             // formats this app has no use for — battery spent for nothing
@@ -67,7 +109,7 @@ class QrScannerView extends StatelessWidget {
             showToggleCamera: false,
             onScan: (result) {
               final text = result.text;
-              if (text != null && text.isNotEmpty) onCode(text);
+              if (text != null && text.isNotEmpty) widget.onCode(text);
             },
           ),
         ),
@@ -75,9 +117,15 @@ class QrScannerView extends StatelessWidget {
           padding: const EdgeInsets.all(16),
           child: Column(
             children: [
-              const Text(instruction, textAlign: TextAlign.center),
+              const Text(
+                QrScannerView.instruction,
+                textAlign: TextAlign.center,
+              ),
               const SizedBox(height: 8),
-              TextButton(onPressed: onCancel, child: const Text('Cancel')),
+              TextButton(
+                onPressed: widget.onCancel,
+                child: const Text('Cancel'),
+              ),
             ],
           ),
         ),
@@ -93,17 +141,33 @@ class _Unavailable extends StatelessWidget {
   final VoidCallback onCancel;
 
   @override
+  Widget build(BuildContext context) => _Blocked(
+    reason:
+        'This device cannot scan a code. Show yours instead and let the '
+        'other phone scan it.',
+    onCancel: onCancel,
+  );
+}
+
+/// A camera that is not going to appear, and why.
+///
+/// One widget for both reasons — no camera on this platform, and a camera this
+/// person has declined — because the only thing that differs is the sentence,
+/// and the way out is the same.
+class _Blocked extends StatelessWidget {
+  const _Blocked({required this.reason, required this.onCancel});
+
+  final String reason;
+  final VoidCallback onCancel;
+
+  @override
   Widget build(BuildContext context) {
     return Padding(
       padding: const EdgeInsets.all(24),
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          const Text(
-            'This device cannot scan a code. Show yours instead and let the '
-            'other phone scan it.',
-            textAlign: TextAlign.center,
-          ),
+          Text(reason, textAlign: TextAlign.center),
           const SizedBox(height: 16),
           TextButton(onPressed: onCancel, child: const Text('Back')),
         ],
