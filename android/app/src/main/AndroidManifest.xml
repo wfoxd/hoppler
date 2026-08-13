@@ -18,6 +18,22 @@
         android:name="android.hardware.bluetooth_le"
         android:required="true" />
 
+    <!-- Pairing ceremony (T11, R0-F4). Reading the other person's QR code is
+         the only thing Hoppler uses a camera for, and it is used only while
+         that screen is open.
+
+         Declared here rather than left to the plugin's manifest merge, so the
+         one permission a person is most likely to question is visible in this
+         app's own file next to a note saying what it is for.
+
+         The camera is `required="false"`: a device with no usable camera can
+         still *show* a code and be scanned, which is a whole half of the
+         ceremony. Marking it required would keep those devices off the store
+         listing for a feature they can take part in. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
+
     <application
         android:label="hoppler"
         android:name="${applicationName}"
