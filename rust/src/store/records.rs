@@ -372,6 +372,20 @@ impl Store {
         Ok(changed > 0)
     }
 
+    /// Set a contact's Layer-2 key.
+    ///
+    /// Contacts created before a ceremony carry a placeholder, because until
+    /// one runs there is nothing that proves a Layer-2 key belongs to the
+    /// person on the other end — a persona record is public and replayable. The
+    /// ceremony is where that stops being true, so it is the only caller.
+    pub fn set_contact_l2(&self, id: i64, l2_pub: &[u8; 32]) -> Result<bool, StoreError> {
+        let changed = self.conn.execute(
+            "UPDATE contacts SET l2_pub = ?1 WHERE id = ?2",
+            params![&l2_pub[..], id],
+        )?;
+        Ok(changed > 0)
+    }
+
     pub fn list_contacts(&self) -> Result<Vec<Contact>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, pseudonym, l2_pub, name, colour, persona_version, first_seen
