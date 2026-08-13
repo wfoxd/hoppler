@@ -40,6 +40,9 @@ use crate::crypto::dh;
 use crate::discovery::protocol::{Request, Response};
 use crate::discovery::Discovery;
 use crate::identity::{Identity, VerifiedPersona};
+use crate::pairing::ceremony::{Ceremony, CeremonyError, Step};
+use crate::pairing::invite::Invite;
+use crate::pairing::sas::Sas;
 use crate::session::frame::{Frame, FrameKind};
 use crate::session::handshake::{Established, Initiator, Responder};
 use crate::session::table::SessionTable;
@@ -94,6 +97,52 @@ pub enum NetEvent {
         available: bool,
         reason: Option<String>,
     },
+    /// A ceremony reached the point where two people compare colours (R0-F4).
+    ///
+    /// Nothing has been disclosed yet and nothing is written down. The next
+    /// thing that must happen is a person looking at a screen.
+    PairingSas { peer: PeerId, sas: Sas },
+    /// The other person confirmed. A cue for the UI and nothing more: it is not
+    /// a pairing, and on its own it discloses nothing.
+    PairingPeerConfirmed { peer: PeerId },
+    /// Both people confirmed and both Layer-1 proofs verified.
+    ///
+    /// Carries what a contact row needs. Not the ceremony's transport keys —
+    /// see `Net::step_ceremony` for why they are dropped here.
+    PairingCompleted {
+        peer: PeerId,
+        persona_name: String,
+        persona_colour: u32,
+        persona_version: u32,
+        l2_pub: [u8; 32],
+        l1_pub: [u8; 32],
+    },
+    /// A ceremony ended without pairing. Every abort path arrives here, and
+    /// none of them has written anything.
+    PairingFailed { peer: PeerId, why: String },
+}
+
+/// How long a ceremony may sit before it is abandoned.
+///
+/// It exists because a ceremony can be left half-open by the *other* side
+/// failing quietly, which is not a rare case — it is exactly what a stale code
+/// produces. The scanner reads a reply bound to a nonce it does not hold, gives
+/// up, and sends nothing, because there is nothing useful it could send. Without
+/// a clock the shower then holds Noise state indefinitely and, worse, refuses
+/// the next attempt from the same person as "already pairing".
+///
+/// Found by a test that expected an abort to leave zero state on both sides and
+/// discovered it left zero state on one.
+///
+/// Two minutes against R0-F4's fifteen-second budget: the budget is what the
+/// ceremony *takes*, and most of it is a person reading two colours off a
+/// screen. Sizing this to the budget would abandon anyone who looked up.
+pub const CEREMONY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// A ceremony and the moment it stops being worth holding.
+struct InFlight {
+    ceremony: Ceremony,
+    deadline: Instant,
 }
 
 /// Everything the engine needs a network for.
@@ -122,6 +171,35 @@ pub struct Net {
     /// Per-peer stream reassembly. The rung splits and merges freely (T08 rule
     /// 3), so nothing arriving here is a whole message until this says so.
     readers: Mutex<HashMap<PeerId, PipeReader>>,
+    /// Ceremonies in flight, at most one per peer (R0-F4).
+    ///
+    /// Held here rather than in the engine because a ceremony dies with its
+    /// peer: the pipe going away has to take it with it, and this is the layer
+    /// that hears about that. An abandoned ceremony is not merely untidy —
+    /// while one exists, the next code scanned from the same peer is refused as
+    /// out of order.
+    ///
+    /// **Lock order: `identity` before `ceremonies`, never the reverse.** Both
+    /// are needed at once because `Ceremony::read` and `Ceremony::confirm` take
+    /// `&Identity` while mutating the ceremony. The two orders did not actually
+    /// overlap before — `begin_pairing` released the identity guard before
+    /// touching this map — but "these happen not to overlap" is a property that
+    /// survives exactly until someone edits one of them, so it is a stated
+    /// order now. Neither lock is held across `dispatch`, which sends.
+    ceremonies: Mutex<HashMap<PeerId, InFlight>>,
+    /// The code currently on this device's screen, if any.
+    ///
+    /// Exactly one, because its nonce is what binds a ceremony. Showing a
+    /// second code makes the first one dead: a scanner working from the old
+    /// image fails the prologue and the handshake stops, which is the correct
+    /// outcome and the reason this is an `Option` rather than a set.
+    showing: Mutex<Option<Invite>>,
+    /// A ceremony's opening message, queued until a session exists.
+    ///
+    /// Same shape and the same reason as `pending_pings`: `reach` returns on
+    /// acceptance, not on a session, so sending immediately after means the
+    /// first attempt at pairing always fails and the second works.
+    pending_ceremony: Mutex<HashMap<PeerId, Vec<Vec<u8>>>>,
 }
 
 impl Net {
@@ -145,6 +223,9 @@ impl Net {
             blocked: Mutex::new(Vec::new()),
             readers: Mutex::new(HashMap::new()),
             pending_pings: Mutex::new(HashMap::new()),
+            ceremonies: Mutex::new(HashMap::new()),
+            showing: Mutex::new(None),
+            pending_ceremony: Mutex::new(HashMap::new()),
         }
     }
 
@@ -246,6 +327,330 @@ impl Net {
             .collect()
     }
 
+    // ── pairing (R0-F4) ─────────────────────────────────────────────────────
+
+    /// Put a code on this device's screen, replacing any previous one.
+    ///
+    /// Returns nothing to check because there is nothing to fail. What matters
+    /// is the replacement: a code that is no longer displayed must stop working,
+    /// and it does, because its nonce is no longer the one this device will
+    /// bind a ceremony to.
+    pub fn show_invite(&self, invite: Invite) {
+        *self.showing.lock().unwrap_or_else(|e| e.into_inner()) = Some(invite);
+    }
+
+    /// Take the code off the screen. Any ceremony already under way is
+    /// unaffected — it is bound to the nonce it started with, and the person
+    /// putting their phone down mid-ceremony has not withdrawn consent to the
+    /// ceremony they are in.
+    pub fn stop_showing(&self) {
+        *self.showing.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    pub fn showing(&self) -> Option<Invite> {
+        self.showing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Begin a ceremony toward a peer whose code this device just read.
+    ///
+    /// Queued rather than sent if there is no session yet, for the reason
+    /// [`Net::ping`] spells out at length: `reach` returns on acceptance, and a
+    /// session is several round trips further on.
+    pub fn begin_pairing(&self, peer: &str, invite: &Invite, now: Instant) -> Result<(), String> {
+        let opening = {
+            // Identity first, then ceremonies — see the note on `ceremonies`.
+            //
+            // The "already pairing" check and the insert happen under *one*
+            // hold of the map, because `Net` is shared: the pump thread, the
+            // clock thread and Dart all call in. Checking through
+            // `ceremony_in_flight` and inserting afterwards — which is what
+            // this did — lets two calls for the same peer both pass the check
+            // and the second silently replace the first, leaving the first
+            // one's peer talking to a ceremony that no longer exists here.
+            let identity = self.identity.lock().unwrap_or_else(|e| e.into_inner());
+            let mut ceremonies = self.ceremonies.lock().unwrap_or_else(|e| e.into_inner());
+            if ceremonies.contains_key(peer) {
+                return Err(format!("already pairing with {peer}"));
+            }
+            let (ceremony, opening) =
+                Ceremony::scan(&identity, invite).map_err(|e| e.to_string())?;
+            ceremonies.insert(
+                peer.to_string(),
+                InFlight {
+                    ceremony,
+                    deadline: now + CEREMONY_DEADLINE,
+                },
+            );
+            opening
+        };
+        // A ceremony that could not get its first message out is not a
+        // ceremony, and leaving it in the map would make the obvious response —
+        // try again — fail with "already pairing" until the deadline two
+        // minutes later. The insert above happens before the send because the
+        // send needs the ceremony to exist; unwinding it here is the price.
+        if let Err(why) = self.send_ceremony(peer, opening, now) {
+            self.forget_ceremony(peer);
+            return Err(why);
+        }
+        Ok(())
+    }
+
+    /// This device's human confirmed the colours match.
+    ///
+    /// Returns what came of it rather than swallowing it. The first version
+    /// discarded `dispatch`'s events behind an `Ok(())`, so a confirmation
+    /// whose bytes could not be sent looked — to the caller, and to the person
+    /// who tapped — exactly like one that worked, with the failure visible only
+    /// in a log. `Err` is a caller mistake (no such ceremony); a ceremony that
+    /// ended is a `PairingFailed` in the returned list, as everywhere else.
+    pub fn confirm_pairing(&self, peer: &str, now: Instant) -> Result<Vec<NetEvent>, String> {
+        let steps = {
+            // Identity first, then ceremonies — see the note on `ceremonies`.
+            let identity = self.identity.lock().unwrap_or_else(|e| e.into_inner());
+            let mut ceremonies = self.ceremonies.lock().unwrap_or_else(|e| e.into_inner());
+            let in_flight = ceremonies
+                .get_mut(peer)
+                .ok_or_else(|| format!("no ceremony with {peer}"))?;
+            in_flight.deadline = now + CEREMONY_DEADLINE;
+            in_flight
+                .ceremony
+                .confirm(&identity)
+                .map_err(|e| e.to_string())?
+        };
+        let events = self.dispatch(peer, steps, now);
+        // Confirming sends; it never completes. Pairing finishes when the
+        // peer's Layer-1 proof arrives, which is `read`'s job — if that stops
+        // being true, the ordering guarantee has moved and this is where it
+        // shows. The first version of this assertion was written the other way
+        // round and could only trip on success.
+        debug_assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, NetEvent::PairingCompleted { .. })),
+            "confirming completed a pairing on its own"
+        );
+        Ok(events)
+    }
+
+    /// Abandon a ceremony — the screen closed, the colours did not match, the
+    /// other person walked off.
+    ///
+    /// No message goes to the peer. There is nothing useful to tell them: a
+    /// ceremony that does not complete is indistinguishable from one that was
+    /// never started, and their side ends the same way when its own pipe or
+    /// person gives up. Nothing was written, so nothing is undone.
+    pub fn cancel_pairing(&self, peer: &str) {
+        self.forget_ceremony(peer);
+    }
+
+    /// Drop every trace of a ceremony with this peer, and say whether there was
+    /// one.
+    ///
+    /// The single place either map is cleared, because they must be cleared
+    /// together and were not: `sweep_ceremonies` dropped the expired ceremony
+    /// and left its queued opening message behind, so a session opening later
+    /// flushed bytes for a ceremony this side no longer had — starting one on
+    /// the peer that could never complete. Three callers wanted this (cancel,
+    /// sweep, the pipe going away) and only two of them did it in full.
+    fn forget_ceremony(&self, peer: &str) -> bool {
+        let had = self
+            .ceremonies
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(peer)
+            .is_some();
+        let queued = self
+            .pending_ceremony
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(peer)
+            .is_some();
+        had || queued
+    }
+
+    /// Abandon ceremonies nothing has moved for [`CEREMONY_DEADLINE`].
+    ///
+    /// Called from [`Net::tick`], alongside the session sweep and the id
+    /// rotation, and for the same reason all three live there: the condition
+    /// they fire on is the *absence* of traffic, so no transport event will ever
+    /// arrive to carry them.
+    fn sweep_ceremonies(&self, now: Instant) -> Vec<NetEvent> {
+        // Deciding and removing happen under one hold, and deliberately not
+        // through `forget_ceremony`.
+        //
+        // The clock thread runs this while the pump thread is delivering
+        // ceremony traffic, and every inbound message pushes the deadline out.
+        // Choosing the victims, releasing the lock, and then removing them
+        // unconditionally — which is what calling the helper here did — sweeps
+        // a ceremony that made progress in between, killing a pairing two
+        // people are in the middle of. This is the one place the two maps are
+        // not cleared by the same call, so the queue half follows below.
+        let expired: Vec<PeerId> = {
+            let mut ceremonies = self.ceremonies.lock().unwrap_or_else(|e| e.into_inner());
+            let due: Vec<PeerId> = ceremonies
+                .iter()
+                .filter(|(_, in_flight)| now >= in_flight.deadline)
+                .map(|(peer, _)| peer.clone())
+                .collect();
+            for peer in &due {
+                ceremonies.remove(peer);
+            }
+            due
+        };
+        if !expired.is_empty() {
+            let mut queued = self
+                .pending_ceremony
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for peer in &expired {
+                queued.remove(peer);
+            }
+        }
+        expired
+            .into_iter()
+            .map(|peer| {
+                log::info!("ceremony with {peer} abandoned: nothing moved for two minutes");
+                NetEvent::PairingFailed {
+                    peer,
+                    why: "pairing did not complete".into(),
+                }
+            })
+            .collect()
+    }
+
+    pub fn ceremony_in_flight(&self, peer: &str) -> bool {
+        self.ceremonies
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(peer)
+    }
+
+    /// Put one ceremony message on the wire, or queue it and reach.
+    fn send_ceremony(&self, peer: &str, message: Vec<u8>, now: Instant) -> Result<(), String> {
+        if self.sessions.is_open(peer) {
+            return self.send_frame(peer, FrameKind::Ceremony, message, now);
+        }
+        self.pending_ceremony
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(peer.to_string())
+            .or_default()
+            .push(message);
+        log::info!("ceremony message to {peer} queued: no session yet, reaching");
+        self.reach(peer).map_err(|e| e.to_string())
+    }
+
+    /// Feed an inbound ceremony frame to its ceremony, starting one if this
+    /// device is the side showing the code.
+    fn on_ceremony_frame(&self, peer: &str, payload: &[u8], now: Instant) -> Vec<NetEvent> {
+        let steps = {
+            // Identity first, then ceremonies — see the note on `ceremonies`.
+            let identity = self.identity.lock().unwrap_or_else(|e| e.into_inner());
+            let mut ceremonies = self.ceremonies.lock().unwrap_or_else(|e| e.into_inner());
+            let in_flight = match ceremonies.entry(peer.to_string()) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    // Nothing in flight, so this is someone answering a code we
+                    // are showing. If we are not showing one, we are not in a
+                    // ceremony, and there is nothing to answer with.
+                    //
+                    // Silently, and without an event: the person here has not
+                    // asked to pair with anybody, so a screen saying "pairing
+                    // failed" would be the first they heard of it. Their peer
+                    // learns the same thing from the silence.
+                    let Some(invite) = self.showing() else {
+                        log::info!("ignoring a ceremony message from {peer}: no code on screen");
+                        return Vec::new();
+                    };
+                    match Ceremony::show(&identity, &invite) {
+                        Ok(ceremony) => slot.insert(InFlight {
+                            ceremony,
+                            deadline: now + CEREMONY_DEADLINE,
+                        }),
+                        Err(why) => {
+                            log::warn!("could not answer {peer}'s ceremony: {why}");
+                            return Vec::new();
+                        }
+                    }
+                }
+            };
+            // Every message is progress, so the clock restarts. What the
+            // deadline bounds is a ceremony nobody is moving — not one whose
+            // human is taking their time between messages.
+            in_flight.deadline = now + CEREMONY_DEADLINE;
+            match in_flight.ceremony.read(&identity, payload) {
+                Ok(steps) => steps,
+                Err(why) => {
+                    ceremonies.remove(peer);
+                    return vec![Self::pairing_failed(peer, &why)];
+                }
+            }
+        };
+        self.dispatch(peer, steps, now)
+    }
+
+    /// Turn a ceremony's steps into wire traffic and events.
+    ///
+    /// The ceremony's own transport keys are dropped when it completes. They
+    /// are a second Noise channel inside a session that already has one, and
+    /// nothing after pairing speaks through them — keeping them would mean two
+    /// live encryption states per peer, with every later message having to pick
+    /// one and both sides having to pick the same.
+    fn dispatch(&self, peer: &str, steps: Vec<Step>, now: Instant) -> Vec<NetEvent> {
+        let mut out = Vec::new();
+        for step in steps {
+            match step {
+                Step::Send(bytes) => {
+                    if let Err(why) = self.send_ceremony(peer, bytes, now) {
+                        self.forget_ceremony(peer);
+                        out.push(NetEvent::PairingFailed {
+                            peer: peer.to_string(),
+                            why,
+                        });
+                        return out;
+                    }
+                }
+                Step::ShowSas(sas) => out.push(NetEvent::PairingSas {
+                    peer: peer.to_string(),
+                    sas,
+                }),
+                Step::PeerConfirmed => out.push(NetEvent::PairingPeerConfirmed {
+                    peer: peer.to_string(),
+                }),
+                Step::Paired(paired) => {
+                    self.forget_ceremony(peer);
+                    out.push(NetEvent::PairingCompleted {
+                        peer: peer.to_string(),
+                        persona_name: paired.persona.name.clone(),
+                        persona_colour: paired.persona.colour,
+                        persona_version: paired.persona.version,
+                        l2_pub: paired.persona.l2_pub.0,
+                        l1_pub: paired.l1_pub.0,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// One wording for every ceremony failure the peer can cause.
+    ///
+    /// The distinctions are real — a substituted code, a bad proof, a message
+    /// out of order — and none of them is something the person holding the
+    /// phone can act on differently. Reporting them separately would also tell
+    /// a prober which of its guesses was closer, so the detail goes to the log
+    /// and the screen gets one sentence.
+    fn pairing_failed(peer: &str, why: &CeremonyError) -> NetEvent {
+        log::warn!("ceremony with {peer} failed: {why}");
+        NetEvent::PairingFailed {
+            peer: peer.to_string(),
+            why: "pairing did not complete".to_string(),
+        }
+    }
+
     pub fn send_chat(&self, peer: &str, text: &str, now: Instant) -> Result<(), String> {
         self.send_frame(peer, FrameKind::Chat, text.as_bytes().to_vec(), now)
     }
@@ -270,12 +675,13 @@ impl Net {
     /// is fine, because a refused rotation is retried on the next turn rather
     /// than reported.
     pub fn tick(&self, now: Instant) -> Vec<NetEvent> {
-        let closed = self.sweep_sessions(now);
+        let mut out = self.sweep_ceremonies(now);
+        out.extend(self.sweep_sessions(now));
         if let Err(why) = self.discovery.tick(now) {
             log::warn!("could not rotate the advertised id: {why}");
         }
         self.check_on_quiet_peers(now);
-        closed
+        out
     }
 
     /// Ask the rung about anyone it has not mentioned lately.
@@ -428,11 +834,23 @@ impl Net {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&peer);
+        // A ceremony cannot outlive the pipe it was running over: its Noise
+        // state is tied to a channel that no longer exists, so every later
+        // message would fail anyway. Reported rather than dropped quietly,
+        // because on this side a person is looking at a screen waiting for the
+        // other one to confirm.
+        let dropped_ceremony = self.forget_ceremony(&peer);
         let mut out = Vec::new();
         if dropped_ping {
             out.push(NetEvent::PingUndeliverable {
                 peer: peer.clone(),
                 why: "could not reach that device".into(),
+            });
+        }
+        if dropped_ceremony {
+            out.push(NetEvent::PairingFailed {
+                peer: peer.clone(),
+                why: "pairing did not complete".into(),
             });
         }
         if self.sessions.close(&peer) {
@@ -697,6 +1115,20 @@ impl Net {
         {
             let _ = self.send_frame(peer, FrameKind::Ping, Vec::new(), now);
         }
+        // In order. A ceremony's messages are a sequence, and Noise refuses one
+        // that arrives out of turn, so a queue flushed in any other order ends
+        // the ceremony rather than delivering it late.
+        let queued = self
+            .pending_ceremony
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(peer)
+            .unwrap_or_default();
+        for message in queued {
+            if let Err(why) = self.send_frame(peer, FrameKind::Ceremony, message, now) {
+                log::warn!("could not send a queued ceremony message to {peer}: {why}");
+            }
+        }
         vec![
             NetEvent::SessionOpened {
                 peer: peer.to_string(),
@@ -755,6 +1187,9 @@ impl Net {
                         peer: peer.to_string(),
                         text: String::from_utf8_lossy(&frame.payload).into_owned(),
                     });
+                }
+                FrameKind::Ceremony => {
+                    out.extend(self.on_ceremony_frame(peer, &frame.payload, now))
                 }
                 FrameKind::DropControl => {}
             }

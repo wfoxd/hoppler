@@ -15,8 +15,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rust_lib_hoppler::discovery::ROTATION_PERIOD;
-use rust_lib_hoppler::engine::net::{Net, NetEvent, PING_DEADLINE};
+use rust_lib_hoppler::engine::net::{Net, NetEvent, CEREMONY_DEADLINE, PING_DEADLINE};
 use rust_lib_hoppler::identity::Identity;
+use rust_lib_hoppler::pairing::invite::Invite;
+use rust_lib_hoppler::pairing::sas::Sas;
 use rust_lib_hoppler::session::table::IDLE_TIMEOUT;
 use rust_lib_hoppler::transport::loopback::LoopbackNet;
 use rust_lib_hoppler::transport::{Transport, TransportEvent};
@@ -1209,5 +1211,503 @@ fn the_clock_asks_about_a_peer_that_has_gone_quiet() {
         rung.asked().is_empty(),
         "probed the neighbourhood with Discovery off: {:?}",
         rung.asked()
+    );
+}
+
+// ── pairing (R0-F4) ─────────────────────────────────────────────────────────
+
+fn sas_in(events: &[NetEvent]) -> Option<Sas> {
+    events.iter().find_map(|e| match e {
+        NetEvent::PairingSas { sas, .. } => Some(*sas),
+        _ => None,
+    })
+}
+
+fn completion_in(events: &[NetEvent]) -> Option<([u8; 32], String)> {
+    events.iter().find_map(|e| match e {
+        NetEvent::PairingCompleted {
+            l1_pub,
+            persona_name,
+            ..
+        } => Some((*l1_pub, persona_name.clone())),
+        _ => None,
+    })
+}
+
+/// Bring two nodes to a live session, which every ceremony rides.
+fn paired_up(air: &LoopbackNet, now: Instant) -> (Node, Node) {
+    let alice = node(air, "alice", "Alice", now);
+    let bob = node(air, "bob", "Bob", now);
+    bob.net.discovery().set_enabled(true, now).unwrap();
+    alice.net.discovery().start_scanning().unwrap();
+    settle(&alice, &bob, now);
+    alice.net.reach(&bob.id).unwrap();
+    settle(&alice, &bob, now);
+    (alice, bob)
+}
+
+/// Bob shows a code, Alice scans it, both confirm, both end up paired.
+///
+/// The whole of R0-F4 over a real session: the ceremony's own Noise XX runs
+/// inside the session's Noise IK, its frames are routed by kind alongside Ping
+/// and Chat, and the Layer-1 keys that come out are the ones the two identities
+/// actually hold.
+#[test]
+fn two_people_show_scan_confirm_and_pair() {
+    let air = air();
+    let now = Instant::now();
+    let (alice, bob) = paired_up(&air, now);
+
+    // Bob puts a code on screen; Alice reads it.
+    let invite = Invite::fresh(
+        bob.identity
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .layer2_public(),
+        &bob.id,
+    );
+    bob.net.show_invite(invite.clone());
+    alice.net.begin_pairing(&bob.id, &invite, now).unwrap();
+    let (a_events, b_events) = settle(&alice, &bob, now);
+
+    // Both screens light up, and with the same thing on them.
+    let a_sas = sas_in(&a_events).expect("Alice saw no colours");
+    let b_sas = sas_in(&b_events).expect("Bob saw no colours");
+    assert_eq!(a_sas, b_sas, "the two screens disagreed");
+
+    // Nothing is disclosed and nothing completes on one confirmation.
+    alice.net.confirm_pairing(&bob.id, now).unwrap();
+    let (a_events, b_events) = settle(&alice, &bob, now);
+    assert!(completion_in(&a_events).is_none(), "paired on one confirm");
+    assert!(completion_in(&b_events).is_none(), "paired on one confirm");
+    assert!(b_events
+        .iter()
+        .any(|e| matches!(e, NetEvent::PairingPeerConfirmed { .. })));
+
+    // The second confirmation completes it, on both sides.
+    bob.net.confirm_pairing(&alice.id, now).unwrap();
+    let (a_events, b_events) = settle(&alice, &bob, now);
+
+    let (alice_learned, bobs_name) = completion_in(&a_events).expect("Alice did not pair");
+    let (bob_learned, alices_name) = completion_in(&b_events).expect("Bob did not pair");
+    assert_eq!(bobs_name, "Bob");
+    assert_eq!(alices_name, "Alice");
+    assert_eq!(
+        alice_learned,
+        bob.identity
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .layer1_public()
+            .0,
+        "Alice recorded the wrong Layer-1 key for Bob"
+    );
+    assert_eq!(
+        bob_learned,
+        alice
+            .identity
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .layer1_public()
+            .0
+    );
+    // And the ceremony is gone from both sides — nothing left holding keys.
+    assert!(!alice.net.ceremony_in_flight(&bob.id));
+    assert!(!bob.net.ceremony_in_flight(&alice.id));
+}
+
+/// A device that is not showing a code does not get pulled into a ceremony,
+/// and does not tell its owner about one either.
+///
+/// The person here has not asked to pair with anybody, so a screen saying
+/// "pairing failed" would be the first they had heard of it.
+#[test]
+fn a_ceremony_nobody_invited_is_ignored_in_silence() {
+    let air = air();
+    let now = Instant::now();
+    let (alice, bob) = paired_up(&air, now);
+
+    // A code with Bob's real key, but Bob is not showing anything.
+    let invite = Invite::fresh(
+        bob.identity
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .layer2_public(),
+        &bob.id,
+    );
+    alice.net.begin_pairing(&bob.id, &invite, now).unwrap();
+    let (a_events, b_events) = settle(&alice, &bob, now);
+
+    assert!(
+        !b_events.iter().any(|e| matches!(
+            e,
+            NetEvent::PairingSas { .. } | NetEvent::PairingFailed { .. }
+        )),
+        "an uninvited ceremony reached Bob's screen: {b_events:?}"
+    );
+    assert!(
+        sas_in(&a_events).is_none(),
+        "Alice was shown colours: {a_events:?}"
+    );
+    assert!(!bob.net.ceremony_in_flight(&alice.id));
+}
+
+/// Pairing works before a session exists, because that is when people do it.
+///
+/// `reach` returns on acceptance and a session is several round trips further
+/// on, so an unqueued first message means the first attempt at pairing always
+/// fails and the second works — the "I had to tap it twice" bug that Ping had.
+#[test]
+fn a_ceremony_started_before_a_session_still_happens() {
+    let air = air();
+    let now = Instant::now();
+    let alice = node(&air, "alice", "Alice", now);
+    let bob = node(&air, "bob", "Bob", now);
+    bob.net.discovery().set_enabled(true, now).unwrap();
+    alice.net.discovery().start_scanning().unwrap();
+    settle(&alice, &bob, now);
+
+    let invite = Invite::fresh(
+        bob.identity
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .layer2_public(),
+        &bob.id,
+    );
+    bob.net.show_invite(invite.clone());
+    // No session yet — nothing has been reached.
+    assert!(!alice.net.sessions().is_open(&bob.id));
+    alice.net.begin_pairing(&bob.id, &invite, now).unwrap();
+
+    let (a_events, b_events) = settle(&alice, &bob, now);
+    assert!(
+        sas_in(&a_events).is_some(),
+        "Alice saw no colours: {a_events:?}"
+    );
+    assert!(
+        sas_in(&b_events).is_some(),
+        "Bob saw no colours: {b_events:?}"
+    );
+}
+
+/// Showing a new code kills the old one. The nonce is what binds a ceremony,
+/// so a scanner working from a stale image must not pair — it is reading a
+/// screen that has moved on.
+#[test]
+fn a_code_that_is_no_longer_shown_no_longer_works() {
+    let air = air();
+    let now = Instant::now();
+    let (alice, bob) = paired_up(&air, now);
+
+    let bobs_key = bob
+        .identity
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .layer2_public();
+    let stale = Invite::fresh(bobs_key, &bob.id);
+    bob.net.show_invite(stale.clone());
+    bob.net.show_invite(Invite::fresh(bobs_key, &bob.id));
+
+    alice.net.begin_pairing(&bob.id, &stale, now).unwrap();
+    let (a_events, _) = settle(&alice, &bob, now);
+    assert!(
+        sas_in(&a_events).is_none(),
+        "a stale code produced colours: {a_events:?}"
+    );
+    assert!(
+        !alice.net.ceremony_in_flight(&bob.id),
+        "Alice kept a dead ceremony"
+    );
+
+    // Bob is left holding one, and cannot be told: Alice's side failed on a
+    // nonce she does not have, and there is nothing useful she could send. The
+    // deadline is what clears it — without which Bob would refuse the next
+    // attempt from the same person as "already pairing".
+    assert!(bob.net.ceremony_in_flight(&alice.id));
+    let later = now + CEREMONY_DEADLINE + Duration::from_secs(1);
+    let swept = bob.net.tick(later);
+    assert!(
+        swept
+            .iter()
+            .any(|e| matches!(e, NetEvent::PairingFailed { .. })),
+        "the abandoned ceremony was dropped without telling anyone: {swept:?}"
+    );
+    assert!(!bob.net.ceremony_in_flight(&alice.id));
+
+    // And the retry that was being blocked now works.
+    let fresh = Invite::fresh(bobs_key, &bob.id);
+    bob.net.show_invite(fresh.clone());
+    alice.net.begin_pairing(&bob.id, &fresh, later).unwrap();
+    let (a_events, b_events) = settle(&alice, &bob, later);
+    assert!(sas_in(&a_events).is_some(), "the retry produced no colours");
+    assert!(sas_in(&b_events).is_some());
+}
+
+/// A ceremony cannot outlive the pipe it runs over, and the person waiting on
+/// the other side's confirmation has to be told.
+#[test]
+fn losing_the_pipe_ends_the_ceremony_and_says_so() {
+    let air = air();
+    let now = Instant::now();
+    let (alice, bob) = paired_up(&air, now);
+
+    let invite = Invite::fresh(
+        bob.identity
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .layer2_public(),
+        &bob.id,
+    );
+    bob.net.show_invite(invite.clone());
+    alice.net.begin_pairing(&bob.id, &invite, now).unwrap();
+    settle(&alice, &bob, now);
+    assert!(alice.net.ceremony_in_flight(&bob.id));
+
+    alice.transport.disconnect(&bob.id).unwrap();
+    let (a_events, b_events) = settle(&alice, &bob, now);
+    for (who, events) in [("Alice", &a_events), ("Bob", &b_events)] {
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, NetEvent::PairingFailed { .. })),
+            "{who} was not told the ceremony ended: {events:?}"
+        );
+    }
+    assert!(!alice.net.ceremony_in_flight(&bob.id));
+    assert!(!bob.net.ceremony_in_flight(&alice.id));
+}
+
+/// Cancelling is local and silent, and leaves nothing behind on this side.
+#[test]
+fn cancelling_leaves_nothing_and_tells_nobody() {
+    let air = air();
+    let now = Instant::now();
+    let (alice, bob) = paired_up(&air, now);
+
+    let invite = Invite::fresh(
+        bob.identity
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .layer2_public(),
+        &bob.id,
+    );
+    bob.net.show_invite(invite.clone());
+    alice.net.begin_pairing(&bob.id, &invite, now).unwrap();
+    settle(&alice, &bob, now);
+
+    alice.net.cancel_pairing(&bob.id);
+    assert!(!alice.net.ceremony_in_flight(&bob.id));
+    let (_, b_events) = settle(&alice, &bob, now);
+    assert!(
+        !b_events
+            .iter()
+            .any(|e| matches!(e, NetEvent::PairingFailed { .. })),
+        "cancelling sent something to the peer: {b_events:?}"
+    );
+    // Confirming after cancelling is a caller error, not a silent no-op.
+    assert!(alice.net.confirm_pairing(&bob.id, now).is_err());
+}
+
+/// A ceremony that expires while its opening message is still queued must not
+/// leave the message behind.
+///
+/// The queue and the ceremony are two maps, and only one of them was being
+/// cleared on expiry. A session opening afterwards then flushed bytes for a
+/// ceremony this side no longer had — starting one on the peer that could never
+/// complete, long after the local state was swept.
+#[test]
+fn sweeping_a_ceremony_takes_its_queued_message_with_it() {
+    let air = air();
+    let now = Instant::now();
+    let alice = node(&air, "alice", "Alice", now);
+    let bob = node(&air, "bob", "Bob", now);
+    bob.net.discovery().set_enabled(true, now).unwrap();
+    alice.net.discovery().start_scanning().unwrap();
+    settle(&alice, &bob, now);
+
+    let invite = Invite::fresh(
+        bob.identity
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .layer2_public(),
+        &bob.id,
+    );
+    bob.net.show_invite(invite.clone());
+
+    // Queued, with no session yet — and deliberately not settled, so the
+    // opening message is still sitting in the queue when the clock runs out.
+    alice.net.begin_pairing(&bob.id, &invite, now).unwrap();
+    assert!(!alice.net.sessions().is_open(&bob.id));
+
+    let later = now + CEREMONY_DEADLINE + Duration::from_secs(1);
+    let swept = alice.net.tick(later);
+    assert!(
+        swept
+            .iter()
+            .any(|e| matches!(e, NetEvent::PairingFailed { .. })),
+        "the queued ceremony was not swept: {swept:?}"
+    );
+
+    // Now let the session open. Nothing may go out on its back.
+    let (_, b_events) = settle(&alice, &bob, later);
+    assert!(
+        !b_events
+            .iter()
+            .any(|e| matches!(e, NetEvent::PairingSas { .. })),
+        "a swept ceremony's message was flushed anyway: {b_events:?}"
+    );
+    assert!(!bob.net.ceremony_in_flight(&alice.id));
+    assert!(!alice.net.ceremony_in_flight(&bob.id));
+}
+
+/// Confirming reports what came of it. It used to return `Ok(())` whatever
+/// happened, so a confirmation whose bytes could not be sent was indis-
+/// tinguishable from one that worked.
+#[test]
+fn confirming_hands_back_its_events() {
+    let air = air();
+    let now = Instant::now();
+    let (alice, bob) = paired_up(&air, now);
+
+    let invite = Invite::fresh(
+        bob.identity
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .layer2_public(),
+        &bob.id,
+    );
+    bob.net.show_invite(invite.clone());
+    alice.net.begin_pairing(&bob.id, &invite, now).unwrap();
+    settle(&alice, &bob, now);
+
+    // Bob's device goes away entirely — no pipe-gone event reaches Alice, so
+    // as far as she knows the session is still there and the confirmation is
+    // hers to send. It is the send that fails.
+    let bob_id = bob.id.clone();
+    drop(bob);
+
+    let events = alice.net.confirm_pairing(&bob_id, now).unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, NetEvent::PairingFailed { .. })),
+        "a confirmation that could not be sent reported nothing: {events:?}"
+    );
+    // Reported *and* cleaned up, so the person can start again.
+    assert!(!alice.net.ceremony_in_flight(&bob_id));
+    assert!(alice.net.confirm_pairing(&bob_id, now).is_err());
+}
+
+/// A ceremony whose opening message cannot go out must not be left behind.
+///
+/// Otherwise the obvious response — try again — fails with "already pairing"
+/// until the deadline two minutes later, and the person is told they are
+/// already doing the thing that just refused to start.
+#[test]
+fn a_ceremony_that_cannot_start_does_not_block_the_retry() {
+    let air = air();
+    let now = Instant::now();
+    let alice = node(&air, "alice", "Alice", now);
+    let invite = Invite::fresh(
+        alice
+            .identity
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .layer2_public(),
+        "ghost",
+    );
+
+    assert!(alice.net.begin_pairing("ghost", &invite, now).is_err());
+    assert!(
+        !alice.net.ceremony_in_flight("ghost"),
+        "a ceremony that never started was left in flight"
+    );
+}
+
+/// A second attempt at pairing with the same peer must not replace the first.
+///
+/// The single-threaded half of the check-then-insert fix. The race itself —
+/// two callers passing the check before either inserts — is closed by doing
+/// both under one hold of the map, which no deterministic test can demonstrate;
+/// what this pins is the behaviour that check exists to produce.
+#[test]
+fn a_second_attempt_at_the_same_peer_does_not_replace_the_first() {
+    let air = air();
+    let now = Instant::now();
+    let (alice, bob) = paired_up(&air, now);
+
+    let bobs_key = bob
+        .identity
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .layer2_public();
+    let first = Invite::fresh(bobs_key, &bob.id);
+    bob.net.show_invite(first.clone());
+    alice.net.begin_pairing(&bob.id, &first, now).unwrap();
+
+    // A second code from the same person, scanned before the first finished.
+    let second = Invite::fresh(bobs_key, &bob.id);
+    assert!(
+        alice.net.begin_pairing(&bob.id, &second, now).is_err(),
+        "a second ceremony replaced the one already running"
+    );
+
+    // The original is still the one running, and still completes.
+    let (a_events, b_events) = settle(&alice, &bob, now);
+    assert!(sas_in(&a_events).is_some(), "the first ceremony was lost");
+    assert_eq!(sas_in(&a_events), sas_in(&b_events));
+}
+
+/// A ceremony that is being used is not swept out from under the two people
+/// using it. Traffic pushes the deadline out; the sweep only takes what has
+/// genuinely gone quiet.
+#[test]
+fn traffic_keeps_a_ceremony_alive_past_the_original_deadline() {
+    let air = air();
+    let now = Instant::now();
+    let (alice, bob) = paired_up(&air, now);
+
+    let invite = Invite::fresh(
+        bob.identity
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .layer2_public(),
+        &bob.id,
+    );
+    bob.net.show_invite(invite.clone());
+    alice.net.begin_pairing(&bob.id, &invite, now).unwrap();
+
+    // Progress most of the way through the window, then exchange messages.
+    let late = now + CEREMONY_DEADLINE - Duration::from_secs(1);
+    settle(&alice, &bob, late);
+
+    // Past the deadline the ceremony *started* with, but not past the one its
+    // last message set.
+    let just_after_the_original = now + CEREMONY_DEADLINE + Duration::from_secs(1);
+    let swept = alice.net.tick(just_after_the_original);
+    assert!(
+        !swept
+            .iter()
+            .any(|e| matches!(e, NetEvent::PairingFailed { .. })),
+        "a ceremony in use was swept: {swept:?}"
+    );
+    assert!(alice.net.ceremony_in_flight(&bob.id));
+
+    // And it still finishes.
+    alice
+        .net
+        .confirm_pairing(&bob.id, just_after_the_original)
+        .unwrap();
+    settle(&alice, &bob, just_after_the_original);
+    let confirmed = bob
+        .net
+        .confirm_pairing(&alice.id, just_after_the_original)
+        .unwrap();
+    assert!(confirmed
+        .iter()
+        .all(|e| !matches!(e, NetEvent::PairingFailed { .. })));
+    let (a_events, _) = settle(&alice, &bob, just_after_the_original);
+    assert!(
+        completion_in(&a_events).is_some(),
+        "the ceremony did not finish: {a_events:?}"
     );
 }

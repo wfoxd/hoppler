@@ -613,6 +613,27 @@ fn on_net_event(net: &Arc<net::Net>, event: net::NetEvent) {
                 reason: why,
             });
         }
+        // Not wired to Dart yet, and deliberately not faked into an event that
+        // looks like a feature.
+        //
+        // These cannot fire in the app as it stands: a ceremony only starts
+        // from `Net::begin_pairing` or a code on screen, and nothing outside
+        // tests calls either. Persisting the pairing and putting it on the
+        // event stream is the next slice; writing a plausible-looking `emit`
+        // here first would mean a UI that could show a pairing the store had
+        // never heard of.
+        net::NetEvent::PairingSas { peer, sas } => {
+            log::info!("ceremony with {peer} reached the SAS: {}", sas.spoken());
+        }
+        net::NetEvent::PairingPeerConfirmed { peer } => {
+            log::info!("{peer} confirmed the pairing colours");
+        }
+        net::NetEvent::PairingCompleted { peer, .. } => {
+            log::info!("ceremony with {peer} completed (not yet persisted)");
+        }
+        net::NetEvent::PairingFailed { peer, why } => {
+            log::info!("ceremony with {peer} ended: {why}");
+        }
         net::NetEvent::ChatReceived { peer, text } => {
             let _ = net;
             if let Ok(Some(event)) = store_incoming_chat(&peer, &text) {

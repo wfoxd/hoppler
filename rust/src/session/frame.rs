@@ -42,6 +42,18 @@ pub enum FrameKind {
     /// other with the same frame is a loop with no idle state, and a receiver
     /// cannot tell the nudge from the answer. A Pong is never answered.
     Pong = 4,
+    /// R0-F4. One message of a pairing ceremony
+    /// ([`crate::pairing::ceremony`]).
+    ///
+    /// The ceremony runs its own Noise XX handshake *inside* this session,
+    /// which means its bytes are encrypted twice. That is deliberate and it is
+    /// cheap: the ceremony's channel is what the invite's nonce binds and what
+    /// the SAS is derived from, so it cannot be replaced by the session's own
+    /// encryption without losing both. Riding the session rather than opening a
+    /// second pipe is what lets pairing inherit dialling, reassembly, idle
+    /// sweeps and the T08 contract already built, instead of a parallel
+    /// lifecycle that would need all of them again.
+    Ceremony = 5,
 }
 
 impl FrameKind {
@@ -51,6 +63,7 @@ impl FrameKind {
             2 => Some(FrameKind::Chat),
             3 => Some(FrameKind::DropControl),
             4 => Some(FrameKind::Pong),
+            5 => Some(FrameKind::Ceremony),
             _ => None,
         }
     }
