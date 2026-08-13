@@ -23,11 +23,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::api::types::{ChatMessageDto, CoreEvent, NearbyDevice, PersonaDto, ThreadSummary};
+use crate::api::types::{
+    ChatMessageDto, CoreEvent, NearbyDevice, PersonaDto, SasColourDto, ThreadSummary,
+};
 use crate::crypto::rng;
 use crate::frb_generated::StreamSink;
 use crate::identity::keystore::SoftwareKeystore;
-use crate::identity::{Identity, Persona};
+use crate::identity::{Identity, Persona, VerifiedPersona};
+use crate::pairing::invite::Invite;
 use crate::store::{
     Direction, MessageState, NewContact, NewMessage, NewTransfer, Store, StoreError, TransferState,
 };
@@ -348,11 +351,12 @@ pub fn nearby_devices() -> Result<Vec<NearbyDevice>, String> {
                 Some(p) => (p.name.clone(), p.colour),
                 None => (String::new(), 0),
             };
+            let paired = is_paired(&s.peer, s.persona.as_ref());
             NearbyDevice {
                 device_id: s.peer,
                 name,
                 colour,
-                paired: false,
+                paired,
             }
         })
         .collect())
@@ -521,6 +525,119 @@ pub fn list_threads() -> Result<Vec<ThreadSummary>, String> {
     })
 }
 
+// ── pairing (R0-F4) ───────────────────────────────────────────────────────────
+
+/// Mint a code to show, and start showing it. Returns the text for the QR.
+///
+/// A fresh nonce every call, so a code that has been on screen and dismissed
+/// cannot be reused from a photograph. That is also why this both mints *and*
+/// shows: a caller that could do one without the other would eventually show a
+/// code the device was not bound to, and the ceremony would fail with nothing
+/// on either screen to explain it.
+///
+/// The hint inside is the rung id this device is advertising as right now. It
+/// rotates every twelve minutes (R0-F2), so a photographed code goes stale —
+/// [`begin_pairing`] falls back to Discovery rather than failing.
+pub fn pairing_invite() -> Result<String, String> {
+    let net = require_net()?;
+    let l2_pub = with_core(|core| {
+        Ok(core
+            .identity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .layer2_public())
+    })?;
+    let invite = Invite::fresh(l2_pub, net.discovery().local_id());
+    let uri = invite.to_uri();
+    net.show_invite(invite);
+    Ok(uri)
+}
+
+/// Take the code off the screen.
+///
+/// Does not touch a ceremony already under way. Putting the phone down after
+/// someone has scanned is not withdrawing consent to the ceremony they are in
+/// — and the person on the other side is looking at colours, waiting.
+pub fn stop_showing_invite() -> Result<(), String> {
+    require_net()?.stop_showing();
+    Ok(())
+}
+
+/// Begin pairing from a code the camera just read.
+///
+/// Returns the device id the ceremony is with, which is how the UI follows the
+/// events that come back.
+pub fn begin_pairing(code: String) -> Result<String, String> {
+    let net = require_net()?;
+    let invite = Invite::parse(&code).map_err(|e| e.to_string())?;
+    let peer = resolve_invite(&net, &invite)
+        .ok_or_else(|| "that code is for a device that is not nearby".to_string())?;
+    net.begin_pairing(&peer, &invite, std::time::Instant::now())?;
+    Ok(peer)
+}
+
+/// Which device a code belongs to.
+///
+/// The hint first, because it is right whenever the code is fresh and costs
+/// nothing to try. Then Discovery, matched on the Layer-2 key the code names —
+/// which is what makes a code that has been on screen across a rotation still
+/// work. Without the fallback a perfectly good code fails after twelve minutes
+/// for a reason nobody holding the phone could guess.
+///
+/// The hint is never trusted beyond being an address: whether the device there
+/// is the one on the code is settled by the ceremony's own check, not here.
+fn resolve_invite(net: &net::Net, invite: &Invite) -> Option<String> {
+    let sightings = net.discovery().sightings();
+    if !invite.ble_hint.is_empty() && sightings.iter().any(|s| s.peer == invite.ble_hint) {
+        return Some(invite.ble_hint.clone());
+    }
+    sightings
+        .into_iter()
+        .find(|s| {
+            s.persona
+                .as_ref()
+                .is_some_and(|p| p.l2_pub == invite.l2_pub)
+        })
+        .map(|s| s.peer)
+}
+
+/// This device's human confirmed the colours.
+pub fn confirm_pairing(device_id: String) -> Result<(), String> {
+    let net = require_net()?;
+    for event in net.confirm_pairing(&device_id, std::time::Instant::now())? {
+        on_net_event(&net, event);
+    }
+    Ok(())
+}
+
+/// Abandon a ceremony. Nothing was written, so nothing is undone.
+pub fn cancel_pairing(device_id: String) -> Result<(), String> {
+    require_net()?.cancel_pairing(&device_id);
+    Ok(())
+}
+
+/// Write down a completed ceremony: the contact, its real identity, the thread.
+///
+/// The contact may already exist under a device id or a session pseudonym —
+/// people chat and Ping before they pair (R0-F3, R0-F5) — so this adopts that
+/// row rather than opening a second one, and only now fills in the Layer-2 key
+/// and the persona, which the ceremony is the first thing to actually prove.
+fn record_pairing(
+    device_id: &str,
+    name: &str,
+    colour: u32,
+    version: u32,
+    l2_pub: &[u8; 32],
+    l1_pub: &[u8; 32],
+) -> Result<i64, String> {
+    with_core_mut(|core| {
+        let now = now_millis();
+        let contact = ensure_contact(core, device_id, now)?;
+        core.store
+            .record_pairing(contact, l2_pub, name, colour, version, l1_pub, now)
+    })
+}
+
 // ── transfers ─────────────────────────────────────────────────────────────────
 
 /// Offer a Drop: records a transfer row linked to the device's thread and
@@ -613,26 +730,72 @@ fn on_net_event(net: &Arc<net::Net>, event: net::NetEvent) {
                 reason: why,
             });
         }
-        // Not wired to Dart yet, and deliberately not faked into an event that
-        // looks like a feature.
-        //
-        // These cannot fire in the app as it stands: a ceremony only starts
-        // from `Net::begin_pairing` or a code on screen, and nothing outside
-        // tests calls either. Persisting the pairing and putting it on the
-        // event stream is the next slice; writing a plausible-looking `emit`
-        // here first would mean a UI that could show a pairing the store had
-        // never heard of.
         net::NetEvent::PairingSas { peer, sas } => {
-            log::info!("ceremony with {peer} reached the SAS: {}", sas.spoken());
+            // Not logged with its contents. The SAS is the one value a relaying
+            // attacker is trying to guess and the only secret the two humans
+            // hold that the protocol does not, so writing it to a log — which
+            // outlives the ceremony and leaves the device in a diagnostics
+            // export — is the one place it must not go.
+            log::info!("ceremony with {peer} reached the colours");
+            emit(CoreEvent::PairingSas {
+                device_id: peer,
+                colours: sas
+                    .colours
+                    .iter()
+                    .map(|c| SasColourDto {
+                        name: c.name.to_string(),
+                        rgb: c.rgb,
+                    })
+                    .collect(),
+                word: sas.word.to_string(),
+            });
         }
         net::NetEvent::PairingPeerConfirmed { peer } => {
-            log::info!("{peer} confirmed the pairing colours");
+            emit(CoreEvent::PairingPeerConfirmed { device_id: peer });
         }
-        net::NetEvent::PairingCompleted { peer, .. } => {
-            log::info!("ceremony with {peer} completed (not yet persisted)");
+        net::NetEvent::PairingCompleted {
+            peer,
+            persona_name,
+            persona_colour,
+            persona_version,
+            l2_pub,
+            l1_pub,
+        } => {
+            // Written down before it is announced. An event that arrives ahead
+            // of the row sends the UI to a thread that does not exist yet, and
+            // R0-F4 makes the thread part of what pairing *is* rather than a
+            // consequence of it.
+            match record_pairing(
+                &peer,
+                &persona_name,
+                persona_colour,
+                persona_version,
+                &l2_pub,
+                &l1_pub,
+            ) {
+                Ok(thread_id) => emit(CoreEvent::PairingCompleted {
+                    device_id: peer,
+                    thread_id,
+                    name: persona_name,
+                    colour: persona_colour,
+                }),
+                Err(why) => {
+                    // The ceremony succeeded and the store did not. Reported as
+                    // a failed pairing because that is what it is from here:
+                    // there is no thread to open and nothing to come back to.
+                    log::error!("could not record the pairing with {peer}: {why}");
+                    emit(CoreEvent::PairingFailed {
+                        device_id: peer,
+                        reason: "pairing could not be saved".into(),
+                    });
+                }
+            }
         }
         net::NetEvent::PairingFailed { peer, why } => {
-            log::info!("ceremony with {peer} ended: {why}");
+            emit(CoreEvent::PairingFailed {
+                device_id: peer,
+                reason: why,
+            });
         }
         net::NetEvent::ChatReceived { peer, text } => {
             let _ = net;
@@ -681,6 +844,53 @@ fn with_core_mut<T>(f: impl FnOnce(&mut Core) -> Result<T, StoreError>) -> Resul
         .as_mut()
         .ok_or_else(|| "core not initialised".to_string())?;
     f(core).map_err(stringify)
+}
+
+/// Whether a completed ceremony stands behind this device (R0-F4).
+///
+/// Was hardcoded `false` until there was a ceremony to answer it — the honest
+/// value while pairing did not exist, and a lie the moment it did.
+///
+/// Two ways to answer, and they are not equally good.
+///
+/// **With a live session** the peer's pseudonym has been proved by a handshake,
+/// so the contact it resolves to is the right one and the answer is as sound as
+/// anything here gets.
+///
+/// **Without one** all that exists is the sighting, and the first version of
+/// this asked the session anyway. That is wrong in the case that matters most:
+/// after pairing, walking away and coming back, there is no session until
+/// something dials — so a paired friend's tile read "not paired", which is
+/// precisely the state pairing exists to survive. The fallback matches the
+/// Layer-2 key in the sighting's persona against paired contacts.
+///
+/// The limit, plainly: **a persona record is public and replayable**, so a
+/// device broadcasting someone else's record gets their badge until a session
+/// disproves it. That is the same evidence the name and colour on the tile
+/// already come from — an unpaired tile is unauthenticated all the way through,
+/// and this does not make it more so. It does mean nothing may *act* on this
+/// flag; R0-F10's rule stands, that decisions key on the proved pseudonym.
+///
+/// A read failure reports "not paired": the alternative is propagating a store
+/// error out of a list refresh, and a tile missing a badge beats no list.
+fn is_paired(device_id: &str, sighting: Option<&VerifiedPersona>) -> bool {
+    with_core(|core| {
+        if let Some(contact) = contact_id_for_device(core, device_id)? {
+            if core.store.pairing_for_contact(contact)?.is_some() {
+                return Ok(true);
+            }
+        }
+        // Only consulted when a session has not already answered, so a proved
+        // identity always wins over a claimed one.
+        let Some(persona) = sighting else {
+            return Ok(false);
+        };
+        Ok(core
+            .store
+            .paired_contact_by_l2(&persona.l2_pub.0)?
+            .is_some())
+    })
+    .unwrap_or(false)
 }
 
 /// The peer's durable identity, if a session has authenticated one.

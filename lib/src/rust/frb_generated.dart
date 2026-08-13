@@ -8,6 +8,7 @@ import 'api/discovery.dart';
 import 'api/events.dart';
 import 'api/identity.dart';
 import 'api/messaging.dart';
+import 'api/pairing.dart';
 import 'api/platform.dart';
 import 'api/transfers.dart';
 import 'api/types.dart';
@@ -73,7 +74,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.12.0';
 
   @override
-  int get rustContentHash => -606368833;
+  int get rustContentHash => -1616484669;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -86,6 +87,12 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
 
 abstract class RustLibApi extends BaseApi {
   String crateApiCoreApiVersion();
+
+  Future<String> crateApiPairingBeginPairing({required String code});
+
+  Future<void> crateApiPairingCancelPairing({required String deviceId});
+
+  Future<void> crateApiPairingConfirmPairing({required String deviceId});
 
   Stream<CoreEvent> crateApiEventsCoreEventStream();
 
@@ -110,6 +117,8 @@ abstract class RustLibApi extends BaseApi {
     required BigInt size,
   });
 
+  Future<String> crateApiPairingPairingInvite();
+
   Future<void> crateApiMessagingPing({required String deviceId});
 
   Stream<HostCommand> crateApiPlatformPlatformCommandStream();
@@ -122,6 +131,8 @@ abstract class RustLibApi extends BaseApi {
   });
 
   Future<void> crateApiDiscoverySetDiscovery({required bool enabled});
+
+  Future<void> crateApiPairingStopShowingInvite();
 
   Future<PlatformInt64?> crateApiMessagingThreadForDevice({
     required String deviceId,
@@ -168,6 +179,90 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       const TaskConstMeta(debugName: "api_version", argNames: []);
 
   @override
+  Future<String> crateApiPairingBeginPairing({required String code}) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(code, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 2,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_String,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiPairingBeginPairingConstMeta,
+        argValues: [code],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiPairingBeginPairingConstMeta =>
+      const TaskConstMeta(debugName: "begin_pairing", argNames: ["code"]);
+
+  @override
+  Future<void> crateApiPairingCancelPairing({required String deviceId}) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(deviceId, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 3,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiPairingCancelPairingConstMeta,
+        argValues: [deviceId],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiPairingCancelPairingConstMeta =>
+      const TaskConstMeta(debugName: "cancel_pairing", argNames: ["deviceId"]);
+
+  @override
+  Future<void> crateApiPairingConfirmPairing({required String deviceId}) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(deviceId, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 4,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiPairingConfirmPairingConstMeta,
+        argValues: [deviceId],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiPairingConfirmPairingConstMeta =>
+      const TaskConstMeta(debugName: "confirm_pairing", argNames: ["deviceId"]);
+
+  @override
   Stream<CoreEvent> crateApiEventsCoreEventStream() {
     final sink = RustStreamSink<CoreEvent>();
     unawaited(
@@ -179,7 +274,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
             pdeCallFfi(
               generalizedFrbRustBinding,
               serializer,
-              funcId: 2,
+              funcId: 5,
               port: port_,
             );
           },
@@ -213,7 +308,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 3,
+            funcId: 6,
             port: port_,
           );
         },
@@ -239,7 +334,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       SyncTask(
         callFfi: () {
           final serializer = SseSerializer(generalizedFrbRustBinding);
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 4)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 7)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_String,
@@ -264,7 +359,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 5,
+            funcId: 8,
             port: port_,
           );
         },
@@ -291,7 +386,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 6,
+            funcId: 9,
             port: port_,
           );
         },
@@ -318,7 +413,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 7,
+            funcId: 10,
             port: port_,
           );
         },
@@ -345,7 +440,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 8,
+            funcId: 11,
             port: port_,
           );
         },
@@ -379,7 +474,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 9,
+            funcId: 12,
             port: port_,
           );
         },
@@ -400,6 +495,33 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   );
 
   @override
+  Future<String> crateApiPairingPairingInvite() {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 13,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_String,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiPairingPairingInviteConstMeta,
+        argValues: [],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiPairingPairingInviteConstMeta =>
+      const TaskConstMeta(debugName: "pairing_invite", argNames: []);
+
+  @override
   Future<void> crateApiMessagingPing({required String deviceId}) {
     return handler.executeNormal(
       NormalTask(
@@ -409,7 +531,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 10,
+            funcId: 14,
             port: port_,
           );
         },
@@ -439,7 +561,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
             pdeCallFfi(
               generalizedFrbRustBinding,
               serializer,
-              funcId: 11,
+              funcId: 15,
               port: port_,
             );
           },
@@ -472,7 +594,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 12,
+            funcId: 16,
             port: port_,
           );
         },
@@ -504,7 +626,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 13,
+            funcId: 17,
             port: port_,
           );
         },
@@ -534,7 +656,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 14,
+            funcId: 18,
             port: port_,
           );
         },
@@ -553,6 +675,33 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       const TaskConstMeta(debugName: "set_discovery", argNames: ["enabled"]);
 
   @override
+  Future<void> crateApiPairingStopShowingInvite() {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 19,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiPairingStopShowingInviteConstMeta,
+        argValues: [],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiPairingStopShowingInviteConstMeta =>
+      const TaskConstMeta(debugName: "stop_showing_invite", argNames: []);
+
+  @override
   Future<PlatformInt64?> crateApiMessagingThreadForDevice({
     required String deviceId,
   }) {
@@ -564,7 +713,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 15,
+            funcId: 20,
             port: port_,
           );
         },
@@ -597,7 +746,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 16,
+            funcId: 21,
             port: port_,
           );
         },
@@ -629,7 +778,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 17,
+            funcId: 22,
             port: port_,
           );
         },
@@ -747,6 +896,28 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           success: dco_decode_bool(raw[2]),
         );
       case 7:
+        return CoreEvent_PairingSas(
+          deviceId: dco_decode_String(raw[1]),
+          colours: dco_decode_list_sas_colour_dto(raw[2]),
+          word: dco_decode_String(raw[3]),
+        );
+      case 8:
+        return CoreEvent_PairingPeerConfirmed(
+          deviceId: dco_decode_String(raw[1]),
+        );
+      case 9:
+        return CoreEvent_PairingCompleted(
+          deviceId: dco_decode_String(raw[1]),
+          threadId: dco_decode_i_64(raw[2]),
+          name: dco_decode_String(raw[3]),
+          colour: dco_decode_u_32(raw[4]),
+        );
+      case 10:
+        return CoreEvent_PairingFailed(
+          deviceId: dco_decode_String(raw[1]),
+          reason: dco_decode_String(raw[2]),
+        );
+      case 11:
         return CoreEvent_RadioChanged(
           available: dco_decode_bool(raw[1]),
           reason: dco_decode_opt_String(raw[2]),
@@ -859,6 +1030,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  List<SasColourDto> dco_decode_list_sas_colour_dto(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return (raw as List<dynamic>).map(dco_decode_sas_colour_dto).toList();
+  }
+
+  @protected
   List<ThreadSummary> dco_decode_list_thread_summary(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return (raw as List<dynamic>).map(dco_decode_thread_summary).toList();
@@ -907,6 +1084,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   RadioChoice dco_decode_radio_choice(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return RadioChoice.values[raw as int];
+  }
+
+  @protected
+  SasColourDto dco_decode_sas_colour_dto(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 2)
+      throw Exception('unexpected arr length: expect 2 but see ${arr.length}');
+    return SasColourDto(
+      name: dco_decode_String(arr[0]),
+      rgb: dco_decode_u_32(arr[1]),
+    );
   }
 
   @protected
@@ -1057,6 +1246,36 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           success: var_success,
         );
       case 7:
+        var var_deviceId = sse_decode_String(deserializer);
+        var var_colours = sse_decode_list_sas_colour_dto(deserializer);
+        var var_word = sse_decode_String(deserializer);
+        return CoreEvent_PairingSas(
+          deviceId: var_deviceId,
+          colours: var_colours,
+          word: var_word,
+        );
+      case 8:
+        var var_deviceId = sse_decode_String(deserializer);
+        return CoreEvent_PairingPeerConfirmed(deviceId: var_deviceId);
+      case 9:
+        var var_deviceId = sse_decode_String(deserializer);
+        var var_threadId = sse_decode_i_64(deserializer);
+        var var_name = sse_decode_String(deserializer);
+        var var_colour = sse_decode_u_32(deserializer);
+        return CoreEvent_PairingCompleted(
+          deviceId: var_deviceId,
+          threadId: var_threadId,
+          name: var_name,
+          colour: var_colour,
+        );
+      case 10:
+        var var_deviceId = sse_decode_String(deserializer);
+        var var_reason = sse_decode_String(deserializer);
+        return CoreEvent_PairingFailed(
+          deviceId: var_deviceId,
+          reason: var_reason,
+        );
+      case 11:
         var var_available = sse_decode_bool(deserializer);
         var var_reason = sse_decode_opt_String(deserializer);
         return CoreEvent_RadioChanged(
@@ -1194,6 +1413,20 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  List<SasColourDto> sse_decode_list_sas_colour_dto(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    var len_ = sse_decode_i_32(deserializer);
+    var ans_ = <SasColourDto>[];
+    for (var idx_ = 0; idx_ < len_; ++idx_) {
+      ans_.add(sse_decode_sas_colour_dto(deserializer));
+    }
+    return ans_;
+  }
+
+  @protected
   List<ThreadSummary> sse_decode_list_thread_summary(
     SseDeserializer deserializer,
   ) {
@@ -1258,6 +1491,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var inner = sse_decode_i_32(deserializer);
     return RadioChoice.values[inner];
+  }
+
+  @protected
+  SasColourDto sse_decode_sas_colour_dto(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_name = sse_decode_String(deserializer);
+    var var_rgb = sse_decode_u_32(deserializer);
+    return SasColourDto(name: var_name, rgb: var_rgb);
   }
 
   @protected
@@ -1425,11 +1666,41 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         sse_encode_i_32(6, serializer);
         sse_encode_String(transferId, serializer);
         sse_encode_bool(success, serializer);
+      case CoreEvent_PairingSas(
+        deviceId: final deviceId,
+        colours: final colours,
+        word: final word,
+      ):
+        sse_encode_i_32(7, serializer);
+        sse_encode_String(deviceId, serializer);
+        sse_encode_list_sas_colour_dto(colours, serializer);
+        sse_encode_String(word, serializer);
+      case CoreEvent_PairingPeerConfirmed(deviceId: final deviceId):
+        sse_encode_i_32(8, serializer);
+        sse_encode_String(deviceId, serializer);
+      case CoreEvent_PairingCompleted(
+        deviceId: final deviceId,
+        threadId: final threadId,
+        name: final name,
+        colour: final colour,
+      ):
+        sse_encode_i_32(9, serializer);
+        sse_encode_String(deviceId, serializer);
+        sse_encode_i_64(threadId, serializer);
+        sse_encode_String(name, serializer);
+        sse_encode_u_32(colour, serializer);
+      case CoreEvent_PairingFailed(
+        deviceId: final deviceId,
+        reason: final reason,
+      ):
+        sse_encode_i_32(10, serializer);
+        sse_encode_String(deviceId, serializer);
+        sse_encode_String(reason, serializer);
       case CoreEvent_RadioChanged(
         available: final available,
         reason: final reason,
       ):
-        sse_encode_i_32(7, serializer);
+        sse_encode_i_32(11, serializer);
         sse_encode_bool(available, serializer);
         sse_encode_opt_String(reason, serializer);
     }
@@ -1552,6 +1823,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_list_sas_colour_dto(
+    List<SasColourDto> self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.length, serializer);
+    for (final item in self) {
+      sse_encode_sas_colour_dto(item, serializer);
+    }
+  }
+
+  @protected
   void sse_encode_list_thread_summary(
     List<ThreadSummary> self,
     SseSerializer serializer,
@@ -1607,6 +1890,13 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   void sse_encode_radio_choice(RadioChoice self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_i_32(self.index, serializer);
+  }
+
+  @protected
+  void sse_encode_sas_colour_dto(SasColourDto self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_String(self.name, serializer);
+    sse_encode_u_32(self.rgb, serializer);
   }
 
   @protected

@@ -19,6 +19,17 @@ pub struct NearbyDevice {
     pub paired: bool,
 }
 
+/// One colour of a pairing SAS: what to paint, and what to call it.
+///
+/// Both, because a swatch cannot be compared over a phone call and cannot be
+/// compared at all by a colour-blind person — and this is the step that decides
+/// whether their pairing is safe.
+pub struct SasColourDto {
+    pub name: String,
+    /// Packed 0xRRGGBB.
+    pub rgb: u32,
+}
+
 /// A conversation, for the UI's thread list.
 pub struct ThreadSummary {
     pub thread_id: i64,
@@ -75,6 +86,52 @@ pub enum CoreEvent {
     },
     /// A transfer finished (or failed).
     TransferCompleted { transfer_id: String, success: bool },
+    /// A pairing ceremony reached the point where two people compare colours.
+    ///
+    /// Nothing has been disclosed and nothing is written down. The only thing
+    /// that may happen next is a person looking at a screen and deciding.
+    ///
+    /// The colours are a list rather than a fixed pair on purpose. How many
+    /// there are is a security parameter — each one is four bits of what an
+    /// active relay has to guess — and that number is still open. A UI written
+    /// against a list survives the decision; one written against `first` and
+    /// `second` does not.
+    ///
+    /// Order carries information: "teal then amber" is not "amber then teal",
+    /// so it must be rendered as given and never sorted.
+    ///
+    /// Carried directly on the event rather than wrapped in a `Sas` struct,
+    /// which is not tidiness — it is the only version with working equality in
+    /// Dart. The generated enum variants compare list fields with
+    /// `DeepCollectionEquality`, but a nested plain struct is compared with its
+    /// own `==`, and the generator gives those reference equality on lists. So
+    /// two identical SAS values would have compared unequal, silently, for as
+    /// long as anyone cared to look.
+    PairingSas {
+        device_id: String,
+        colours: Vec<SasColourDto>,
+        word: String,
+    },
+    /// The other person confirmed.
+    ///
+    /// A cue, not a result: on its own it means nothing has crossed. Showing it
+    /// as "paired" would be a lie the protocol is specifically built to avoid.
+    PairingPeerConfirmed { device_id: String },
+    /// Both people confirmed, both identities checked out, and the thread
+    /// exists. This is a pairing (R0-F4).
+    PairingCompleted {
+        device_id: String,
+        thread_id: i64,
+        name: String,
+        colour: u32,
+    },
+    /// A ceremony ended without pairing.
+    ///
+    /// One wording for every cause. A substituted code, a bad proof, a message
+    /// out of order and a pipe that died are different things internally and
+    /// the same thing to the person holding the phone — and telling them apart
+    /// on screen would also tell a prober which of its guesses was closer.
+    PairingFailed { device_id: String, reason: String },
     /// The radio became usable or unusable.
     ///
     /// A device list cannot carry this on its own: an empty list is what both

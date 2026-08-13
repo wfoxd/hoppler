@@ -103,6 +103,60 @@ sealed class CoreEvent with _$CoreEvent {
     required bool success,
   }) = CoreEvent_TransferCompleted;
 
+  /// A pairing ceremony reached the point where two people compare colours.
+  ///
+  /// Nothing has been disclosed and nothing is written down. The only thing
+  /// that may happen next is a person looking at a screen and deciding.
+  ///
+  /// The colours are a list rather than a fixed pair on purpose. How many
+  /// there are is a security parameter — each one is four bits of what an
+  /// active relay has to guess — and that number is still open. A UI written
+  /// against a list survives the decision; one written against `first` and
+  /// `second` does not.
+  ///
+  /// Order carries information: "teal then amber" is not "amber then teal",
+  /// so it must be rendered as given and never sorted.
+  ///
+  /// Carried directly on the event rather than wrapped in a `Sas` struct,
+  /// which is not tidiness — it is the only version with working equality in
+  /// Dart. The generated enum variants compare list fields with
+  /// `DeepCollectionEquality`, but a nested plain struct is compared with its
+  /// own `==`, and the generator gives those reference equality on lists. So
+  /// two identical SAS values would have compared unequal, silently, for as
+  /// long as anyone cared to look.
+  const factory CoreEvent.pairingSas({
+    required String deviceId,
+    required List<SasColourDto> colours,
+    required String word,
+  }) = CoreEvent_PairingSas;
+
+  /// The other person confirmed.
+  ///
+  /// A cue, not a result: on its own it means nothing has crossed. Showing it
+  /// as "paired" would be a lie the protocol is specifically built to avoid.
+  const factory CoreEvent.pairingPeerConfirmed({required String deviceId}) =
+      CoreEvent_PairingPeerConfirmed;
+
+  /// Both people confirmed, both identities checked out, and the thread
+  /// exists. This is a pairing (R0-F4).
+  const factory CoreEvent.pairingCompleted({
+    required String deviceId,
+    required PlatformInt64 threadId,
+    required String name,
+    required int colour,
+  }) = CoreEvent_PairingCompleted;
+
+  /// A ceremony ended without pairing.
+  ///
+  /// One wording for every cause. A substituted code, a bad proof, a message
+  /// out of order and a pipe that died are different things internally and
+  /// the same thing to the person holding the phone — and telling them apart
+  /// on screen would also tell a prober which of its guesses was closer.
+  const factory CoreEvent.pairingFailed({
+    required String deviceId,
+    required String reason,
+  }) = CoreEvent_PairingFailed;
+
   /// The radio became usable or unusable.
   ///
   /// A device list cannot carry this on its own: an empty list is what both
@@ -180,6 +234,31 @@ class PersonaDto {
           name == other.name &&
           colour == other.colour &&
           version == other.version;
+}
+
+/// One colour of a pairing SAS: what to paint, and what to call it.
+///
+/// Both, because a swatch cannot be compared over a phone call and cannot be
+/// compared at all by a colour-blind person — and this is the step that decides
+/// whether their pairing is safe.
+class SasColourDto {
+  final String name;
+
+  /// Packed 0xRRGGBB.
+  final int rgb;
+
+  const SasColourDto({required this.name, required this.rgb});
+
+  @override
+  int get hashCode => name.hashCode ^ rgb.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is SasColourDto &&
+          runtimeType == other.runtimeType &&
+          name == other.name &&
+          rgb == other.rgb;
 }
 
 /// A conversation, for the UI's thread list.

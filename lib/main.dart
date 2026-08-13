@@ -113,6 +113,24 @@ class _HomePageState extends State<HomePage> {
         case CoreEvent_TransferCompleted(:final success):
           _transfer = null;
           _log.insert(0, success ? 'Drop complete' : 'Drop failed');
+        // The pairing screens are the next piece of work; until then these
+        // land in the log, which is honest — a person can read the colours and
+        // see what happened, but there is nothing here to start a ceremony with
+        // or to confirm one, so pairing is not yet reachable from the UI.
+        //
+        // Deliberately not folded into a `default:`. This switch is exhaustive
+        // on purpose: a new core event should fail to compile here rather than
+        // be silently dropped, which is the only reason these four are being
+        // written at all.
+        case CoreEvent_PairingSas(:final deviceId, :final colours, :final word):
+          final names = colours.map((c) => c.name).join(' · ');
+          _log.insert(0, 'Pairing ${_nameFor(deviceId)}: $names · $word');
+        case CoreEvent_PairingPeerConfirmed(:final deviceId):
+          _log.insert(0, '${_nameFor(deviceId)} confirmed — waiting for you');
+        case CoreEvent_PairingCompleted(:final name):
+          _log.insert(0, 'Paired with $name');
+        case CoreEvent_PairingFailed(:final reason):
+          _log.insert(0, 'Pairing failed: $reason');
         case CoreEvent_RadioChanged(:final available, :final reason):
           _radioReason = radioReasonFrom(available: available, reason: reason);
       }

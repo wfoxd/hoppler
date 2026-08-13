@@ -11,6 +11,7 @@ import 'api/discovery.dart';
 import 'api/events.dart';
 import 'api/identity.dart';
 import 'api/messaging.dart';
+import 'api/pairing.dart';
 import 'api/platform.dart';
 import 'api/transfers.dart';
 import 'api/types.dart';
@@ -78,6 +79,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   Uint8List dco_decode_list_prim_u_8_strict(dynamic raw);
 
   @protected
+  List<SasColourDto> dco_decode_list_sas_colour_dto(dynamic raw);
+
+  @protected
   List<ThreadSummary> dco_decode_list_thread_summary(dynamic raw);
 
   @protected
@@ -94,6 +98,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   RadioChoice dco_decode_radio_choice(dynamic raw);
+
+  @protected
+  SasColourDto dco_decode_sas_colour_dto(dynamic raw);
 
   @protected
   ThreadSummary dco_decode_thread_summary(dynamic raw);
@@ -167,6 +174,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   Uint8List sse_decode_list_prim_u_8_strict(SseDeserializer deserializer);
 
   @protected
+  List<SasColourDto> sse_decode_list_sas_colour_dto(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   List<ThreadSummary> sse_decode_list_thread_summary(
     SseDeserializer deserializer,
   );
@@ -185,6 +197,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   RadioChoice sse_decode_radio_choice(SseDeserializer deserializer);
+
+  @protected
+  SasColourDto sse_decode_sas_colour_dto(SseDeserializer deserializer);
 
   @protected
   ThreadSummary sse_decode_thread_summary(SseDeserializer deserializer);
@@ -277,6 +292,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_list_sas_colour_dto(
+    List<SasColourDto> self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_list_thread_summary(
     List<ThreadSummary> self,
     SseSerializer serializer,
@@ -299,6 +320,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_radio_choice(RadioChoice self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_sas_colour_dto(SasColourDto self, SseSerializer serializer);
 
   @protected
   void sse_encode_thread_summary(ThreadSummary self, SseSerializer serializer);
