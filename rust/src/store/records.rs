@@ -372,20 +372,6 @@ impl Store {
         Ok(changed > 0)
     }
 
-    /// Set a contact's Layer-2 key.
-    ///
-    /// Contacts created before a ceremony carry a placeholder, because until
-    /// one runs there is nothing that proves a Layer-2 key belongs to the
-    /// person on the other end — a persona record is public and replayable. The
-    /// ceremony is where that stops being true, so it is the only caller.
-    pub fn set_contact_l2(&self, id: i64, l2_pub: &[u8; 32]) -> Result<bool, StoreError> {
-        let changed = self.conn.execute(
-            "UPDATE contacts SET l2_pub = ?1 WHERE id = ?2",
-            params![&l2_pub[..], id],
-        )?;
-        Ok(changed > 0)
-    }
-
     pub fn list_contacts(&self) -> Result<Vec<Contact>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, pseudonym, l2_pub, name, colour, persona_version, first_seen
@@ -419,23 +405,84 @@ impl Store {
         l1_pub: &[u8; 32],
         paired_at: i64,
     ) -> Result<i64, StoreError> {
-        if self.contact_by_id(contact_id)?.is_none() {
-            return Err(StoreError::Db(format!(
-                "cannot pair: no such contact {contact_id}"
-            )));
-        }
+        self.require_contact(contact_id)?;
         let tx = self.conn.unchecked_transaction()?;
+        let thread = self.write_pairing(contact_id, l1_pub, paired_at)?;
+        tx.commit()?;
+        Ok(thread)
+    }
+
+    /// Everything a completed ceremony writes, in **one** transaction: the
+    /// identity it proved, the persona it carried, the pairing, and the thread.
+    ///
+    /// One call because it is one fact. Done as four — update the Layer-2 key,
+    /// update the persona, insert the pairing, open the thread — a failure
+    /// partway leaves a contact wearing a name and a Layer-2 key that came from
+    /// a ceremony which did not finish. Nothing downstream reads that as
+    /// paired, since every paired lookup joins `pairings`, so it is not
+    /// dangerous; it is simply a row asserting something that never happened,
+    /// which is the class of thing this schema was just rewritten to stop.
+    ///
+    /// The **contact row itself** is deliberately outside: it may have existed
+    /// for weeks, because people chat and Ping long before they pair (R0-F3,
+    /// R0-F5), and a contact with no pairing is an ordinary thing to have
+    /// rather than wreckage.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_pairing(
+        &self,
+        contact_id: i64,
+        l2_pub: &[u8; 32],
+        name: &str,
+        colour: u32,
+        persona_version: u32,
+        l1_pub: &[u8; 32],
+        paired_at: i64,
+    ) -> Result<i64, StoreError> {
+        self.require_contact(contact_id)?;
+        let tx = self.conn.unchecked_transaction()?;
+        self.conn.execute(
+            "UPDATE contacts SET l2_pub = ?1, name = ?2, colour = ?3, persona_version = ?4
+             WHERE id = ?5",
+            params![
+                &l2_pub[..],
+                name,
+                colour as i64,
+                persona_version as i64,
+                contact_id
+            ],
+        )?;
+        let thread = self.write_pairing(contact_id, l1_pub, paired_at)?;
+        tx.commit()?;
+        Ok(thread)
+    }
+
+    /// The pairing row and its thread. Assumes a transaction is already open —
+    /// SQLite has no nested transactions, so this cannot open its own and both
+    /// callers above must supply one.
+    fn write_pairing(
+        &self,
+        contact_id: i64,
+        l1_pub: &[u8; 32],
+        paired_at: i64,
+    ) -> Result<i64, StoreError> {
         self.conn.execute(
             "INSERT INTO pairings (contact_id, l1_pub, paired_at) VALUES (?1, ?2, ?3)
              ON CONFLICT(contact_id) DO UPDATE SET l1_pub = ?2, paired_at = ?3",
             params![contact_id, &l1_pub[..], paired_at],
         )?;
-        let thread = match self.thread_for_contact(contact_id)? {
-            Some(t) => t,
-            None => self.create_thread(contact_id, paired_at)?,
-        };
-        tx.commit()?;
-        Ok(thread)
+        match self.thread_for_contact(contact_id)? {
+            Some(t) => Ok(t),
+            None => self.create_thread(contact_id, paired_at),
+        }
+    }
+
+    fn require_contact(&self, contact_id: i64) -> Result<(), StoreError> {
+        if self.contact_by_id(contact_id)?.is_none() {
+            return Err(StoreError::Db(format!(
+                "cannot pair: no such contact {contact_id}"
+            )));
+        }
+        Ok(())
     }
 
     pub fn pairing_for_contact(&self, contact_id: i64) -> Result<Option<Pairing>, StoreError> {
@@ -966,6 +1013,65 @@ mod tests {
             stranger
         );
         assert_eq!(s.contact_by_l1(&[1u8; 32]).unwrap().unwrap().id, other);
+    }
+
+    /// A pairing that fails partway leaves nothing behind.
+    ///
+    /// The four writes a ceremony produces are one fact, so they are one
+    /// transaction. Without that, a failure after the persona update leaves a
+    /// contact wearing a name and a Layer-2 key that came from a ceremony which
+    /// did not finish — not dangerous, since every paired lookup joins
+    /// `pairings`, but a row asserting something that never happened, which is
+    /// what this schema was rewritten to stop.
+    ///
+    /// Forced through the one constraint that can fail late: a Layer-1 key
+    /// another contact already holds.
+    #[test]
+    fn a_pairing_that_fails_leaves_the_contact_untouched() {
+        let (s, _d) = store();
+        let taken = s.add_contact(&a_contact()).unwrap();
+        s.pair_contact(taken, &[9u8; 32], 1000).unwrap();
+
+        let other = s
+            .add_contact(&NewContact {
+                pseudonym: [2u8; 32],
+                l2_pub: [0u8; 32],
+                name: "Unknown".into(),
+                ..a_contact()
+            })
+            .unwrap();
+
+        assert!(s
+            .record_pairing(other, &[7u8; 32], "Ada", 0x00_ff_00, 4, &[9u8; 32], 2000)
+            .is_err());
+
+        let after = s.contact_by_id(other).unwrap().unwrap();
+        assert_eq!(after.name, "Unknown", "the name survived a failed pairing");
+        assert_eq!(
+            after.l2_pub, [0u8; 32],
+            "the Layer-2 key was written anyway"
+        );
+        assert!(s.pairing_for_contact(other).unwrap().is_none());
+        assert!(s.thread_for_contact(other).unwrap().is_none());
+    }
+
+    /// The happy path writes all four things.
+    #[test]
+    fn recording_a_pairing_writes_identity_persona_pairing_and_thread() {
+        let (s, _d) = store();
+        let id = s.add_contact(&a_contact()).unwrap();
+        let thread = s
+            .record_pairing(id, &[7u8; 32], "Ada", 0x00_ff_00, 4, &[9u8; 32], 2000)
+            .unwrap();
+
+        let c = s.contact_by_id(id).unwrap().unwrap();
+        assert_eq!(c.name, "Ada");
+        assert_eq!(c.colour, 0x00_ff_00);
+        assert_eq!(c.persona_version, 4);
+        assert_eq!(c.l2_pub, [7u8; 32]);
+        assert_eq!(s.contact_by_l1(&[9u8; 32]).unwrap().unwrap().id, id);
+        assert_eq!(s.thread_for_contact(id).unwrap(), Some(thread));
+        assert_eq!(s.paired_contact_by_l2(&[7u8; 32]).unwrap().unwrap().id, id);
     }
 
     /// One Layer-1 key, one person.

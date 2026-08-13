@@ -633,10 +633,8 @@ fn record_pairing(
     with_core_mut(|core| {
         let now = now_millis();
         let contact = ensure_contact(core, device_id, now)?;
-        core.store.set_contact_l2(contact, l2_pub)?;
         core.store
-            .update_contact_persona(contact, name, colour, version)?;
-        core.store.pair_contact(contact, l1_pub, now)
+            .record_pairing(contact, l2_pub, name, colour, version, l1_pub, now)
     })
 }
 
