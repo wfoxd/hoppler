@@ -844,12 +844,6 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
-  SasDto dco_decode_box_autoadd_sas_dto(dynamic raw) {
-    // Codec=Dco (DartCObject based), see doc to use other codecs
-    return dco_decode_sas_dto(raw);
-  }
-
-  @protected
   ChatMessageDto dco_decode_chat_message_dto(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
@@ -904,7 +898,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       case 7:
         return CoreEvent_PairingSas(
           deviceId: dco_decode_String(raw[1]),
-          sas: dco_decode_box_autoadd_sas_dto(raw[2]),
+          colours: dco_decode_list_sas_colour_dto(raw[2]),
+          word: dco_decode_String(raw[3]),
         );
       case 8:
         return CoreEvent_PairingPeerConfirmed(
@@ -1104,18 +1099,6 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
-  SasDto dco_decode_sas_dto(dynamic raw) {
-    // Codec=Dco (DartCObject based), see doc to use other codecs
-    final arr = raw as List<dynamic>;
-    if (arr.length != 2)
-      throw Exception('unexpected arr length: expect 2 but see ${arr.length}');
-    return SasDto(
-      colours: dco_decode_list_sas_colour_dto(arr[0]),
-      word: dco_decode_String(arr[1]),
-    );
-  }
-
-  @protected
   ThreadSummary dco_decode_thread_summary(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
@@ -1201,12 +1184,6 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
-  SasDto sse_decode_box_autoadd_sas_dto(SseDeserializer deserializer) {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    return (sse_decode_sas_dto(deserializer));
-  }
-
-  @protected
   ChatMessageDto sse_decode_chat_message_dto(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var var_msgId = sse_decode_String(deserializer);
@@ -1270,8 +1247,13 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         );
       case 7:
         var var_deviceId = sse_decode_String(deserializer);
-        var var_sas = sse_decode_box_autoadd_sas_dto(deserializer);
-        return CoreEvent_PairingSas(deviceId: var_deviceId, sas: var_sas);
+        var var_colours = sse_decode_list_sas_colour_dto(deserializer);
+        var var_word = sse_decode_String(deserializer);
+        return CoreEvent_PairingSas(
+          deviceId: var_deviceId,
+          colours: var_colours,
+          word: var_word,
+        );
       case 8:
         var var_deviceId = sse_decode_String(deserializer);
         return CoreEvent_PairingPeerConfirmed(deviceId: var_deviceId);
@@ -1520,14 +1502,6 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
-  SasDto sse_decode_sas_dto(SseDeserializer deserializer) {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    var var_colours = sse_decode_list_sas_colour_dto(deserializer);
-    var var_word = sse_decode_String(deserializer);
-    return SasDto(colours: var_colours, word: var_word);
-  }
-
-  @protected
   ThreadSummary sse_decode_thread_summary(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var var_threadId = sse_decode_i_64(deserializer);
@@ -1637,12 +1611,6 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
-  void sse_encode_box_autoadd_sas_dto(SasDto self, SseSerializer serializer) {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    sse_encode_sas_dto(self, serializer);
-  }
-
-  @protected
   void sse_encode_chat_message_dto(
     ChatMessageDto self,
     SseSerializer serializer,
@@ -1698,10 +1666,15 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         sse_encode_i_32(6, serializer);
         sse_encode_String(transferId, serializer);
         sse_encode_bool(success, serializer);
-      case CoreEvent_PairingSas(deviceId: final deviceId, sas: final sas):
+      case CoreEvent_PairingSas(
+        deviceId: final deviceId,
+        colours: final colours,
+        word: final word,
+      ):
         sse_encode_i_32(7, serializer);
         sse_encode_String(deviceId, serializer);
-        sse_encode_box_autoadd_sas_dto(sas, serializer);
+        sse_encode_list_sas_colour_dto(colours, serializer);
+        sse_encode_String(word, serializer);
       case CoreEvent_PairingPeerConfirmed(deviceId: final deviceId):
         sse_encode_i_32(8, serializer);
         sse_encode_String(deviceId, serializer);
@@ -1924,13 +1897,6 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_String(self.name, serializer);
     sse_encode_u_32(self.rgb, serializer);
-  }
-
-  @protected
-  void sse_encode_sas_dto(SasDto self, SseSerializer serializer) {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    sse_encode_list_sas_colour_dto(self.colours, serializer);
-    sse_encode_String(self.word, serializer);
   }
 
   @protected

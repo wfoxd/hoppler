@@ -50,9 +50,6 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   PlatformInt64 dco_decode_box_autoadd_i_64(dynamic raw);
 
   @protected
-  SasDto dco_decode_box_autoadd_sas_dto(dynamic raw);
-
-  @protected
   ChatMessageDto dco_decode_chat_message_dto(dynamic raw);
 
   @protected
@@ -104,9 +101,6 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   SasColourDto dco_decode_sas_colour_dto(dynamic raw);
 
   @protected
-  SasDto dco_decode_sas_dto(dynamic raw);
-
-  @protected
   ThreadSummary dco_decode_thread_summary(dynamic raw);
 
   @protected
@@ -145,9 +139,6 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   PlatformInt64 sse_decode_box_autoadd_i_64(SseDeserializer deserializer);
-
-  @protected
-  SasDto sse_decode_box_autoadd_sas_dto(SseDeserializer deserializer);
 
   @protected
   ChatMessageDto sse_decode_chat_message_dto(SseDeserializer deserializer);
@@ -209,9 +200,6 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   SasColourDto sse_decode_sas_colour_dto(SseDeserializer deserializer);
 
   @protected
-  SasDto sse_decode_sas_dto(SseDeserializer deserializer);
-
-  @protected
   ThreadSummary sse_decode_thread_summary(SseDeserializer deserializer);
 
   @protected
@@ -261,9 +249,6 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
     PlatformInt64 self,
     SseSerializer serializer,
   );
-
-  @protected
-  void sse_encode_box_autoadd_sas_dto(SasDto self, SseSerializer serializer);
 
   @protected
   void sse_encode_chat_message_dto(
@@ -336,9 +321,6 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_sas_colour_dto(SasColourDto self, SseSerializer serializer);
-
-  @protected
-  void sse_encode_sas_dto(SasDto self, SseSerializer serializer);
 
   @protected
   void sse_encode_thread_summary(ThreadSummary self, SseSerializer serializer);

@@ -122,9 +122,9 @@ class _HomePageState extends State<HomePage> {
         // on purpose: a new core event should fail to compile here rather than
         // be silently dropped, which is the only reason these four are being
         // written at all.
-        case CoreEvent_PairingSas(:final deviceId, :final sas):
-          final colours = sas.colours.map((c) => c.name).join(' · ');
-          _log.insert(0, 'Pairing ${_nameFor(deviceId)}: $colours · ${sas.word}');
+        case CoreEvent_PairingSas(:final deviceId, :final colours, :final word):
+          final names = colours.map((c) => c.name).join(' · ');
+          _log.insert(0, 'Pairing ${_nameFor(deviceId)}: $names · $word');
         case CoreEvent_PairingPeerConfirmed(:final deviceId):
           _log.insert(0, '${_nameFor(deviceId)} confirmed — waiting for you');
         case CoreEvent_PairingCompleted(:final name):

@@ -24,12 +24,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::api::types::{
-    ChatMessageDto, CoreEvent, NearbyDevice, PersonaDto, SasColourDto, SasDto, ThreadSummary,
+    ChatMessageDto, CoreEvent, NearbyDevice, PersonaDto, SasColourDto, ThreadSummary,
 };
 use crate::crypto::rng;
 use crate::frb_generated::StreamSink;
 use crate::identity::keystore::SoftwareKeystore;
-use crate::identity::{Identity, Persona};
+use crate::identity::{Identity, Persona, VerifiedPersona};
 use crate::pairing::invite::Invite;
 use crate::store::{
     Direction, MessageState, NewContact, NewMessage, NewTransfer, Store, StoreError, TransferState,
@@ -351,7 +351,7 @@ pub fn nearby_devices() -> Result<Vec<NearbyDevice>, String> {
                 Some(p) => (p.name.clone(), p.colour),
                 None => (String::new(), 0),
             };
-            let paired = is_paired(&s.peer);
+            let paired = is_paired(&s.peer, s.persona.as_ref());
             NearbyDevice {
                 device_id: s.peer,
                 name,
@@ -640,20 +640,6 @@ fn record_pairing(
     })
 }
 
-fn sas_dto(sas: &crate::pairing::sas::Sas) -> SasDto {
-    SasDto {
-        colours: sas
-            .colours
-            .iter()
-            .map(|c| SasColourDto {
-                name: c.name.to_string(),
-                rgb: c.rgb,
-            })
-            .collect(),
-        word: sas.word.to_string(),
-    }
-}
-
 // ── transfers ─────────────────────────────────────────────────────────────────
 
 /// Offer a Drop: records a transfer row linked to the device's thread and
@@ -755,7 +741,15 @@ fn on_net_event(net: &Arc<net::Net>, event: net::NetEvent) {
             log::info!("ceremony with {peer} reached the colours");
             emit(CoreEvent::PairingSas {
                 device_id: peer,
-                sas: sas_dto(&sas),
+                colours: sas
+                    .colours
+                    .iter()
+                    .map(|c| SasColourDto {
+                        name: c.name.to_string(),
+                        rgb: c.rgb,
+                    })
+                    .collect(),
+                word: sas.word.to_string(),
             });
         }
         net::NetEvent::PairingPeerConfirmed { peer } => {
@@ -856,20 +850,47 @@ fn with_core_mut<T>(f: impl FnOnce(&mut Core) -> Result<T, StoreError>) -> Resul
 
 /// Whether a completed ceremony stands behind this device (R0-F4).
 ///
-/// Was hardcoded `false` until there was a ceremony to answer it — which is the
-/// honest value while pairing does not exist, and a lie the moment it does.
-/// Answered off the store rather than the session, because a pairing outlives
-/// both the session and the rotating id: that is the whole point of it.
+/// Was hardcoded `false` until there was a ceremony to answer it — the honest
+/// value while pairing did not exist, and a lie the moment it did.
 ///
-/// A read failure reports "not paired". The alternative is propagating a store
-/// error out of a list refresh and showing nothing at all, and the tile that
-/// results is merely missing a badge.
-fn is_paired(device_id: &str) -> bool {
+/// Two ways to answer, and they are not equally good.
+///
+/// **With a live session** the peer's pseudonym has been proved by a handshake,
+/// so the contact it resolves to is the right one and the answer is as sound as
+/// anything here gets.
+///
+/// **Without one** all that exists is the sighting, and the first version of
+/// this asked the session anyway. That is wrong in the case that matters most:
+/// after pairing, walking away and coming back, there is no session until
+/// something dials — so a paired friend's tile read "not paired", which is
+/// precisely the state pairing exists to survive. The fallback matches the
+/// Layer-2 key in the sighting's persona against paired contacts.
+///
+/// The limit, plainly: **a persona record is public and replayable**, so a
+/// device broadcasting someone else's record gets their badge until a session
+/// disproves it. That is the same evidence the name and colour on the tile
+/// already come from — an unpaired tile is unauthenticated all the way through,
+/// and this does not make it more so. It does mean nothing may *act* on this
+/// flag; R0-F10's rule stands, that decisions key on the proved pseudonym.
+///
+/// A read failure reports "not paired": the alternative is propagating a store
+/// error out of a list refresh, and a tile missing a badge beats no list.
+fn is_paired(device_id: &str, sighting: Option<&VerifiedPersona>) -> bool {
     with_core(|core| {
-        let Some(contact) = contact_id_for_device(core, device_id)? else {
+        if let Some(contact) = contact_id_for_device(core, device_id)? {
+            if core.store.pairing_for_contact(contact)?.is_some() {
+                return Ok(true);
+            }
+        }
+        // Only consulted when a session has not already answered, so a proved
+        // identity always wins over a claimed one.
+        let Some(persona) = sighting else {
             return Ok(false);
         };
-        Ok(core.store.pairing_for_contact(contact)?.is_some())
+        Ok(core
+            .store
+            .paired_contact_by_l2(&persona.l2_pub.0)?
+            .is_some())
     })
     .unwrap_or(false)
 }

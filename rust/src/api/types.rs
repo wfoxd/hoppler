@@ -30,20 +30,6 @@ pub struct SasColourDto {
     pub rgb: u32,
 }
 
-/// What both people compare during a pairing ceremony (R0-F4).
-///
-/// The colours are a list rather than a fixed pair on purpose. How many there
-/// are is a security parameter — each one is four bits of what an active relay
-/// has to guess — and it is still open. A UI written against a list survives
-/// that decision; one written against `first` and `second` does not.
-///
-/// Order carries information: "teal then amber" is not "amber then teal", so
-/// the list must be rendered as given and never sorted.
-pub struct SasDto {
-    pub colours: Vec<SasColourDto>,
-    pub word: String,
-}
-
 /// A conversation, for the UI's thread list.
 pub struct ThreadSummary {
     pub thread_id: i64,
@@ -104,7 +90,28 @@ pub enum CoreEvent {
     ///
     /// Nothing has been disclosed and nothing is written down. The only thing
     /// that may happen next is a person looking at a screen and deciding.
-    PairingSas { device_id: String, sas: SasDto },
+    ///
+    /// The colours are a list rather than a fixed pair on purpose. How many
+    /// there are is a security parameter — each one is four bits of what an
+    /// active relay has to guess — and that number is still open. A UI written
+    /// against a list survives the decision; one written against `first` and
+    /// `second` does not.
+    ///
+    /// Order carries information: "teal then amber" is not "amber then teal",
+    /// so it must be rendered as given and never sorted.
+    ///
+    /// Carried directly on the event rather than wrapped in a `Sas` struct,
+    /// which is not tidiness — it is the only version with working equality in
+    /// Dart. The generated enum variants compare list fields with
+    /// `DeepCollectionEquality`, but a nested plain struct is compared with its
+    /// own `==`, and the generator gives those reference equality on lists. So
+    /// two identical SAS values would have compared unequal, silently, for as
+    /// long as anyone cared to look.
+    PairingSas {
+        device_id: String,
+        colours: Vec<SasColourDto>,
+        word: String,
+    },
     /// The other person confirmed.
     ///
     /// A cue, not a result: on its own it means nothing has crossed. Showing it

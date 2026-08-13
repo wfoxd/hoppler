@@ -469,6 +469,30 @@ impl Store {
         }
     }
 
+    /// The **paired** contact holding this Layer-2 key, if there is one.
+    ///
+    /// Joined against `pairings` rather than reading `contacts` alone, and that
+    /// is not an optimisation: an unpaired contact carries a placeholder
+    /// Layer-2 key, so a bare lookup on the column would match every one of
+    /// them at once for the placeholder value. Only a ceremony writes a real
+    /// key there, which is exactly the set this is asking about.
+    pub fn paired_contact_by_l2(&self, l2_pub: &[u8; 32]) -> Result<Option<Contact>, StoreError> {
+        let id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT c.id FROM contacts c
+                 JOIN pairings p ON p.contact_id = c.id
+                 WHERE c.l2_pub = ?1",
+                params![&l2_pub[..]],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match id {
+            Some(id) => self.contact_by_id(id),
+            None => Ok(None),
+        }
+    }
+
     /// Undo a pairing, leaving the contact and its history in place.
     ///
     /// R0-F10's "blocking a paired person revokes the pairing" needs this, and
@@ -971,6 +995,56 @@ mod tests {
         assert!(s.pairing_for_contact(second).unwrap().is_none());
         assert!(s.thread_for_contact(second).unwrap().is_none());
         assert_eq!(s.contact_by_l1(&[9u8; 32]).unwrap().unwrap().id, first);
+    }
+
+    /// Looking someone up by their Layer-2 key must find only people we have
+    /// actually paired with.
+    ///
+    /// The trap this exists to avoid: an unpaired contact carries a
+    /// **placeholder** Layer-2 key, because until a ceremony runs nothing
+    /// proves one belongs to the person on the other end. A lookup on the
+    /// column alone therefore matches every unpaired contact at once for the
+    /// placeholder value, and would hand back a stranger as a paired friend.
+    #[test]
+    fn a_layer_2_lookup_finds_only_paired_contacts() {
+        let (s, _d) = store();
+        // Two strangers, both carrying the placeholder key.
+        let stranger = s
+            .add_contact(&NewContact {
+                pseudonym: [1u8; 32],
+                l2_pub: [0u8; 32],
+                ..a_contact()
+            })
+            .unwrap();
+        s.add_contact(&NewContact {
+            pseudonym: [2u8; 32],
+            l2_pub: [0u8; 32],
+            ..a_contact()
+        })
+        .unwrap();
+        // And a friend, whose key a ceremony actually established.
+        let friend = s
+            .add_contact(&NewContact {
+                pseudonym: [3u8; 32],
+                l2_pub: [5u8; 32],
+                ..a_contact()
+            })
+            .unwrap();
+        s.pair_contact(friend, &[9u8; 32], 2000).unwrap();
+
+        assert!(
+            s.paired_contact_by_l2(&[0u8; 32]).unwrap().is_none(),
+            "the placeholder key matched a stranger"
+        );
+        assert_eq!(
+            s.paired_contact_by_l2(&[5u8; 32]).unwrap().unwrap().id,
+            friend
+        );
+        let _ = stranger;
+
+        // And a revoked pairing stops answering (R0-F10).
+        s.unpair_contact(friend).unwrap();
+        assert!(s.paired_contact_by_l2(&[5u8; 32]).unwrap().is_none());
     }
 
     /// Blocking a paired person revokes the pairing (R0-F10) — and does not

@@ -107,9 +107,27 @@ sealed class CoreEvent with _$CoreEvent {
   ///
   /// Nothing has been disclosed and nothing is written down. The only thing
   /// that may happen next is a person looking at a screen and deciding.
+  ///
+  /// The colours are a list rather than a fixed pair on purpose. How many
+  /// there are is a security parameter — each one is four bits of what an
+  /// active relay has to guess — and that number is still open. A UI written
+  /// against a list survives the decision; one written against `first` and
+  /// `second` does not.
+  ///
+  /// Order carries information: "teal then amber" is not "amber then teal",
+  /// so it must be rendered as given and never sorted.
+  ///
+  /// Carried directly on the event rather than wrapped in a `Sas` struct,
+  /// which is not tidiness — it is the only version with working equality in
+  /// Dart. The generated enum variants compare list fields with
+  /// `DeepCollectionEquality`, but a nested plain struct is compared with its
+  /// own `==`, and the generator gives those reference equality on lists. So
+  /// two identical SAS values would have compared unequal, silently, for as
+  /// long as anyone cared to look.
   const factory CoreEvent.pairingSas({
     required String deviceId,
-    required SasDto sas,
+    required List<SasColourDto> colours,
+    required String word,
   }) = CoreEvent_PairingSas;
 
   /// The other person confirmed.
@@ -241,33 +259,6 @@ class SasColourDto {
           runtimeType == other.runtimeType &&
           name == other.name &&
           rgb == other.rgb;
-}
-
-/// What both people compare during a pairing ceremony (R0-F4).
-///
-/// The colours are a list rather than a fixed pair on purpose. How many there
-/// are is a security parameter — each one is four bits of what an active relay
-/// has to guess — and it is still open. A UI written against a list survives
-/// that decision; one written against `first` and `second` does not.
-///
-/// Order carries information: "teal then amber" is not "amber then teal", so
-/// the list must be rendered as given and never sorted.
-class SasDto {
-  final List<SasColourDto> colours;
-  final String word;
-
-  const SasDto({required this.colours, required this.word});
-
-  @override
-  int get hashCode => colours.hashCode ^ word.hashCode;
-
-  @override
-  bool operator ==(Object other) =>
-      identical(this, other) ||
-      other is SasDto &&
-          runtimeType == other.runtimeType &&
-          colours == other.colours &&
-          word == other.word;
 }
 
 /// A conversation, for the UI's thread list.

@@ -530,6 +530,7 @@ fn a_session_reconciles_a_contact_written_before_it() {
 /// cannot be reached without a genuine ceremony reaching it.
 struct FullPeer {
     net: rust_lib_hoppler::engine::net::Net,
+    transport: Arc<dyn Transport>,
     rx: Receiver<TransportEvent>,
     identity: Arc<Mutex<Identity>>,
     id: String,
@@ -543,10 +544,15 @@ fn full_peer(air: &LoopbackNet, id: &str, name: &str) -> FullPeer {
     });
     let transport: Arc<dyn Transport> = Arc::new(air.join(id, sink));
     let identity = Arc::new(Mutex::new(Identity::generate(name, 0x00_44_88)));
-    let net =
-        rust_lib_hoppler::engine::net::Net::new(transport, identity.clone(), id, Instant::now());
+    let net = rust_lib_hoppler::engine::net::Net::new(
+        transport.clone(),
+        identity.clone(),
+        id,
+        Instant::now(),
+    );
     FullPeer {
         net,
+        transport,
         rx,
         identity,
         id: id.to_string(),
@@ -645,6 +651,78 @@ fn a_confirmed_ceremony_leaves_a_thread_behind() {
             .iter()
             .any(|d| d.device_id == peer.id && d.paired)
     });
+}
+
+/// A pairing outlives the session that made it.
+///
+/// The case that matters most and the one the first version got wrong: pair,
+/// walk away, come back. There is no session until something dials, so a check
+/// that asks the session reports a paired friend as not paired — precisely the
+/// state pairing exists to survive.
+#[test]
+fn a_paired_friend_still_reads_as_paired_with_no_session() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = fresh();
+    let peer = full_peer(&h.air, "peer", "Ada");
+
+    set_discovery(true).unwrap();
+    peer.net
+        .discovery()
+        .set_enabled(true, Instant::now())
+        .unwrap();
+    peer.net.discovery().start_scanning().unwrap();
+    until("the engine to see the peer", || {
+        pump(&peer);
+        nearby_devices()
+            .unwrap()
+            .iter()
+            .any(|d| d.device_id == peer.id)
+    });
+
+    let invite = Invite::fresh(
+        peer.identity
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .layer2_public(),
+        &peer.id,
+    );
+    peer.net.show_invite(invite.clone());
+    let device_id = begin_pairing(invite.to_uri()).unwrap();
+    let mut seen = Vec::new();
+    until("both sides to reach the colours", || {
+        seen.extend(pump(&peer));
+        seen.iter().any(|e| {
+            matches!(
+                e,
+                rust_lib_hoppler::engine::net::NetEvent::PairingSas { .. }
+            )
+        })
+    });
+    confirm_pairing(device_id.clone()).unwrap();
+    peer.net.confirm_pairing("core", Instant::now()).unwrap();
+    until("the pairing to be written down", || {
+        pump(&peer);
+        list_threads().unwrap().len() == 1
+    });
+
+    // Now lose the session, as walking out of range would. Hanging up at the
+    // peer's transport is what reaches the engine — closing the peer's own
+    // session table would leave the engine's untouched, which is how this test
+    // failed first: it asserted a state it had not actually produced.
+    peer.transport.disconnect("core").unwrap();
+    until("the engine to notice the session go", || {
+        pump(&peer);
+        !has_session(&device_id)
+    });
+
+    // The badge must survive it.
+    assert!(
+        nearby_devices()
+            .unwrap()
+            .iter()
+            .any(|d| d.device_id == device_id && d.paired),
+        "a paired friend read as unpaired once the session was gone"
+    );
 }
 
 /// A code names a device. If that device is nowhere to be seen, say so rather

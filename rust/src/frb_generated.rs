@@ -906,10 +906,13 @@ impl SseDecode for crate::api::types::CoreEvent {
             }
             7 => {
                 let mut var_deviceId = <String>::sse_decode(deserializer);
-                let mut var_sas = <crate::api::types::SasDto>::sse_decode(deserializer);
+                let mut var_colours =
+                    <Vec<crate::api::types::SasColourDto>>::sse_decode(deserializer);
+                let mut var_word = <String>::sse_decode(deserializer);
                 return crate::api::types::CoreEvent::PairingSas {
                     device_id: var_deviceId,
-                    sas: var_sas,
+                    colours: var_colours,
+                    word: var_word,
                 };
             }
             8 => {
@@ -1221,18 +1224,6 @@ impl SseDecode for crate::api::types::SasColourDto {
     }
 }
 
-impl SseDecode for crate::api::types::SasDto {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
-        let mut var_colours = <Vec<crate::api::types::SasColourDto>>::sse_decode(deserializer);
-        let mut var_word = <String>::sse_decode(deserializer);
-        return crate::api::types::SasDto {
-            colours: var_colours,
-            word: var_word,
-        };
-    }
-}
-
 impl SseDecode for crate::api::types::ThreadSummary {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -1408,10 +1399,15 @@ impl flutter_rust_bridge::IntoDart for crate::api::types::CoreEvent {
                 success.into_into_dart().into_dart(),
             ]
             .into_dart(),
-            crate::api::types::CoreEvent::PairingSas { device_id, sas } => [
+            crate::api::types::CoreEvent::PairingSas {
+                device_id,
+                colours,
+                word,
+            } => [
                 7.into_dart(),
                 device_id.into_into_dart().into_dart(),
-                sas.into_into_dart().into_dart(),
+                colours.into_into_dart().into_dart(),
+                word.into_into_dart().into_dart(),
             ]
             .into_dart(),
             crate::api::types::CoreEvent::PairingPeerConfirmed { device_id } => {
@@ -1641,22 +1637,6 @@ impl flutter_rust_bridge::IntoIntoDart<crate::api::types::SasColourDto>
     }
 }
 // Codec=Dco (DartCObject based), see doc to use other codecs
-impl flutter_rust_bridge::IntoDart for crate::api::types::SasDto {
-    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
-        [
-            self.colours.into_into_dart().into_dart(),
-            self.word.into_into_dart().into_dart(),
-        ]
-        .into_dart()
-    }
-}
-impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::api::types::SasDto {}
-impl flutter_rust_bridge::IntoIntoDart<crate::api::types::SasDto> for crate::api::types::SasDto {
-    fn into_into_dart(self) -> crate::api::types::SasDto {
-        self
-    }
-}
-// Codec=Dco (DartCObject based), see doc to use other codecs
 impl flutter_rust_bridge::IntoDart for crate::api::types::ThreadSummary {
     fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
         [
@@ -1779,10 +1759,15 @@ impl SseEncode for crate::api::types::CoreEvent {
                 <String>::sse_encode(transfer_id, serializer);
                 <bool>::sse_encode(success, serializer);
             }
-            crate::api::types::CoreEvent::PairingSas { device_id, sas } => {
+            crate::api::types::CoreEvent::PairingSas {
+                device_id,
+                colours,
+                word,
+            } => {
                 <i32>::sse_encode(7, serializer);
                 <String>::sse_encode(device_id, serializer);
-                <crate::api::types::SasDto>::sse_encode(sas, serializer);
+                <Vec<crate::api::types::SasColourDto>>::sse_encode(colours, serializer);
+                <String>::sse_encode(word, serializer);
             }
             crate::api::types::CoreEvent::PairingPeerConfirmed { device_id } => {
                 <i32>::sse_encode(8, serializer);
@@ -2033,14 +2018,6 @@ impl SseEncode for crate::api::types::SasColourDto {
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
         <String>::sse_encode(self.name, serializer);
         <u32>::sse_encode(self.rgb, serializer);
-    }
-}
-
-impl SseEncode for crate::api::types::SasDto {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
-        <Vec<crate::api::types::SasColourDto>>::sse_encode(self.colours, serializer);
-        <String>::sse_encode(self.word, serializer);
     }
 }
 
