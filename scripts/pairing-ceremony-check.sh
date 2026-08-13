@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# R0-F4 acceptance on two phones (T11): does the ceremony complete, in time,
-# with the same colours on both screens?
+# R0-F4 acceptance on two phones (T11): does the ceremony complete, and in time?
+#
+# The third part of R0-F4 — that both screens show the *same* colours — is not
+# something this decides. See below.
 #
 # ── What this can and cannot decide ────────────────────────────────────────
 # Three things are being claimed, and they are not equally measurable.
@@ -24,12 +26,16 @@
 # "the ceremony fits the budget with time to spare for aiming", not "the
 # fifteen seconds are accounted for".
 #
-# **The same colours on both screens.** *Not* decidable from logs, on purpose.
-# The SAS is deliberately never logged — it is the one value a relaying
-# attacker is trying to guess, and a log outlives the ceremony and leaves the
-# device in any diagnostics export. So this grabs a screenshot of each phone
-# at the moment both are showing colours, and a person compares them. That is
-# also the honest test: the claim is about what two people see.
+# **The same colours on both screens.** Not decided here at all, and not
+# decidable from logs on purpose: the SAS is deliberately never logged, being
+# the one value a relaying attacker is trying to guess and a log being a thing
+# that outlives the ceremony and leaves the device in any diagnostics export.
+#
+# So this script prints the two `screencap` commands and stops. It cannot take
+# the screenshots itself, because it cannot know when both screens are showing
+# colours — that moment is only visible to the person holding the phones. The
+# comparison is theirs to make, which is also the honest test: the claim is
+# about what two people see.
 #
 # ── Usage ──────────────────────────────────────────────────────────────────
 #   scripts/pairing-ceremony-check.sh <shower-serial> <scanner-serial>

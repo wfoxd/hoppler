@@ -102,6 +102,13 @@ class _ScannerState extends State<_Scanner> {
           child: ReaderWidget(
             onControllerCreated: (controller, error) {
               if (error == null) return;
+              // The camera tears down asynchronously and this callback can
+              // arrive after the scanner has gone — which is not a corner case
+              // here, since leaving the scanner *is* what tears the camera
+              // down. Without the guard that is "setState() called after
+              // dispose", on the one screen that already crashed once during
+              // teardown for a different reason.
+              if (!mounted) return;
               setState(() {
                 _problem = error.toString().contains('AccessDenied')
                     ? 'Hoppler needs the camera to read a code. You can turn '
