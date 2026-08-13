@@ -794,7 +794,17 @@ fn on_net_event(net: &Arc<net::Net>, event: net::NetEvent) {
                         thread_id,
                         name: persona_name,
                         colour: persona_colour,
-                    })
+                    });
+                    // The nearby list carries a `paired` flag, and a pairing is
+                    // exactly the event that changes it. Without this the badge
+                    // waits for some unrelated peer movement to rebuild the
+                    // list — on two phones the tile still read "nearby" a
+                    // minute after pairing, and only a Discovery toggle brought
+                    // it right. `SessionOpened` and `SessionClosed` refresh for
+                    // the same reason; this was the one that did not.
+                    if let Ok(devices) = nearby_devices() {
+                        emit(CoreEvent::DiscoveryUpdated { devices });
+                    }
                 }
                 Err(why) => {
                     // The ceremony succeeded and the store did not. Reported as

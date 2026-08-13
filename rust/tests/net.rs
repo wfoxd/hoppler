@@ -1711,3 +1711,172 @@ fn traffic_keeps_a_ceremony_alive_past_the_original_deadline() {
         "the ceremony did not finish: {a_events:?}"
     );
 }
+
+/// Two people looking at colours are not a stalled protocol.
+///
+/// The hardware finding, as a test. On two phones a ceremony with matching
+/// colours on both screens was abandoned after two minutes because nobody had
+/// tapped yet — and an earlier run finished with 1.9 seconds of margin, which
+/// was luck rather than headroom. Before the colours a silent ceremony is
+/// stuck; after them it is waiting on people, and the deadlines differ.
+#[test]
+fn a_ceremony_waiting_on_two_people_is_not_swept_like_a_stalled_one() {
+    let air = air();
+    let now = Instant::now();
+    let (alice, bob) = paired_up(&air, now);
+
+    let invite = Invite::fresh(
+        bob.identity
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .layer2_public(),
+        &bob.id,
+    );
+    bob.net.show_invite(invite.clone());
+    alice.net.begin_pairing(&bob.id, &invite, now).unwrap();
+    let (a_events, b_events) = settle(&alice, &bob, now);
+    assert!(sas_in(&a_events).is_some());
+    assert!(sas_in(&b_events).is_some());
+
+    // Well past the handshake deadline, with nobody having tapped anything.
+    let thinking = now + CEREMONY_DEADLINE + Duration::from_secs(60);
+    for (who, node) in [("Alice", &alice), ("Bob", &bob)] {
+        let swept = node.net.tick(thinking);
+        assert!(
+            !swept
+                .iter()
+                .any(|e| matches!(e, NetEvent::PairingFailed { .. })),
+            "{who} abandoned a ceremony that two people were still looking at: {swept:?}"
+        );
+    }
+
+    // And it still completes, which is the part that actually failed on the
+    // phones: the ceremony was gone by the time anyone pressed anything.
+    alice.net.confirm_pairing(&bob.id, thinking).unwrap();
+    settle(&alice, &bob, thinking);
+    bob.net.confirm_pairing(&alice.id, thinking).unwrap();
+    let (a_events, _) = settle(&alice, &bob, thinking);
+    assert!(
+        completion_in(&a_events).is_some(),
+        "a ceremony resumed after a long look did not finish: {a_events:?}"
+    );
+}
+
+/// The handshake half keeps its short deadline. A ceremony that never reached
+/// the colours has nobody waiting on it and should not linger for ten minutes.
+#[test]
+fn a_ceremony_that_never_reached_the_colours_is_still_swept_quickly() {
+    let air = air();
+    let now = Instant::now();
+    let alice = node(&air, "alice", "Alice", now);
+    let bob = node(&air, "bob", "Bob", now);
+    bob.net.discovery().set_enabled(true, now).unwrap();
+    alice.net.discovery().start_scanning().unwrap();
+    settle(&alice, &bob, now);
+
+    let invite = Invite::fresh(
+        bob.identity
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .layer2_public(),
+        &bob.id,
+    );
+    // Queued and never answered — no session, no colours, nobody waiting.
+    alice.net.begin_pairing(&bob.id, &invite, now).unwrap();
+    let swept = alice
+        .net
+        .tick(now + CEREMONY_DEADLINE + Duration::from_secs(1));
+    assert!(
+        swept
+            .iter()
+            .any(|e| matches!(e, NetEvent::PairingFailed { .. })),
+        "a stalled handshake was held for the human deadline: {swept:?}"
+    );
+}
+
+/// Mid-handshake counts as stalled, not as thinking.
+///
+/// The shower has answered message 1 and is waiting on a message 3 that never
+/// comes, because the person scanning backed out. It holds a ceremony, it has
+/// read traffic, and it has no colours — so the deadline it carries has to be
+/// the short one. Without this the read path can hand every ceremony the
+/// ten-minute human deadline and nothing notices, which is what mutation
+/// testing found.
+#[test]
+fn a_half_finished_handshake_is_swept_on_the_short_deadline() {
+    let air = air();
+    let now = Instant::now();
+    let (alice, bob) = paired_up(&air, now);
+
+    let invite = Invite::fresh(
+        bob.identity
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .layer2_public(),
+        &bob.id,
+    );
+    bob.net.show_invite(invite.clone());
+    alice.net.begin_pairing(&bob.id, &invite, now).unwrap();
+    // The scanner walks off before message 3. Bob still answers message 1 and
+    // is then waiting on nobody.
+    alice.net.cancel_pairing(&bob.id);
+    settle(&alice, &bob, now);
+
+    assert!(
+        bob.net.ceremony_in_flight(&alice.id),
+        "Bob never started one"
+    );
+    let swept = bob
+        .net
+        .tick(now + CEREMONY_DEADLINE + Duration::from_secs(1));
+    assert!(
+        swept
+            .iter()
+            .any(|e| matches!(e, NetEvent::PairingFailed { .. })),
+        "a half-finished handshake was held for the human deadline: {swept:?}"
+    );
+}
+
+/// One person confirming and then waiting is still not a stalled ceremony.
+///
+/// The asymmetric case, and the likelier one in a room: someone taps straight
+/// away while the other reads the colours out, checks them twice, or is talking.
+/// The first person's ceremony must survive that wait, or their side dies while
+/// the second person is still deciding.
+#[test]
+fn confirming_early_does_not_start_a_short_clock() {
+    let air = air();
+    let now = Instant::now();
+    let (alice, bob) = paired_up(&air, now);
+
+    let invite = Invite::fresh(
+        bob.identity
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .layer2_public(),
+        &bob.id,
+    );
+    bob.net.show_invite(invite.clone());
+    alice.net.begin_pairing(&bob.id, &invite, now).unwrap();
+    settle(&alice, &bob, now);
+
+    alice.net.confirm_pairing(&bob.id, now).unwrap();
+    settle(&alice, &bob, now);
+
+    // Bob is still looking. Well past the handshake deadline.
+    let later = now + CEREMONY_DEADLINE + Duration::from_secs(60);
+    let swept = alice.net.tick(later);
+    assert!(
+        !swept
+            .iter()
+            .any(|e| matches!(e, NetEvent::PairingFailed { .. })),
+        "the side that confirmed first was swept while waiting: {swept:?}"
+    );
+
+    bob.net.confirm_pairing(&alice.id, later).unwrap();
+    let (a_events, _) = settle(&alice, &bob, later);
+    assert!(
+        completion_in(&a_events).is_some(),
+        "the pairing did not finish after a long wait: {a_events:?}"
+    );
+}

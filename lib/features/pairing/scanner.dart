@@ -46,7 +46,7 @@ class QrScannerView extends StatelessWidget {
 
   final VoidCallback onCancel;
 
-  static const instruction = 'Point this at their code.';
+  static const instruction = 'Point this at their code, inside the box.';
 
   @override
   Widget build(BuildContext context) {
@@ -85,9 +85,20 @@ class _ScannerState extends State<_Scanner> {
     if (problem != null) {
       return _Blocked(reason: problem, onCancel: widget.onCancel);
     }
-    return Column(
+    // A `Stack`, not a `Column`, and this is the whole of the fix: the scanner
+    // overlay sizes its cutout from `MediaQuery.size` — the *screen* — while
+    // the decoder reads the centre of the camera image. Put the camera in an
+    // `Expanded` with anything above or below it and those two stop agreeing,
+    // so the box a person carefully aims at is not where the code is being
+    // looked for.
+    //
+    // Found on two phones, by aiming squarely at a drawn rectangle and having
+    // nothing happen. Nothing in a widget test would have shown it: the box is
+    // painted by the plugin and the mismatch is against a camera frame that
+    // does not exist in a test.
+    return Stack(
       children: [
-        Expanded(
+        Positioned.fill(
           child: ReaderWidget(
             onControllerCreated: (controller, error) {
               if (error == null) return;
@@ -113,20 +124,33 @@ class _ScannerState extends State<_Scanner> {
             },
           ),
         ),
-        Padding(
-          padding: const EdgeInsets.all(16),
-          child: Column(
-            children: [
-              const Text(
-                QrScannerView.instruction,
-                textAlign: TextAlign.center,
+        // Floating over the camera rather than sharing the page with it, so
+        // the preview keeps the full screen the overlay assumes it has.
+        Positioned(
+          left: 0,
+          right: 0,
+          bottom: 0,
+          child: ColoredBox(
+            // A camera feed is any colour at all; the words have to survive it.
+            color: Colors.black54,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text(
+                    QrScannerView.instruction,
+                    textAlign: TextAlign.center,
+                    style: TextStyle(color: Colors.white),
+                  ),
+                  TextButton(
+                    onPressed: widget.onCancel,
+                    style: TextButton.styleFrom(foregroundColor: Colors.white),
+                    child: const Text('Cancel'),
+                  ),
+                ],
               ),
-              const SizedBox(height: 8),
-              TextButton(
-                onPressed: widget.onCancel,
-                child: const Text('Cancel'),
-              ),
-            ],
+            ),
           ),
         ),
       ],
