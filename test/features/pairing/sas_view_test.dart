@@ -60,6 +60,57 @@ void main() {
     expect(find.text('slate'), findsOneWidget);
   });
 
+  testWidgets('lays out on a narrow phone, at any colour count', (t) async {
+    // The claim above — that this survives a change to the colour count — is
+    // only true if the layout survives it too.
+    //
+    // Six colours, which is past anything anyone has proposed, and that is the
+    // point: four still fit a plain row on a 320dp screen, so a test at four
+    // would pass whether or not the swatches could wrap and would have proved
+    // nothing about the count being free. Mutation testing said exactly that.
+    t.view.physicalSize = const Size(320, 640);
+    t.view.devicePixelRatio = 1.0;
+    addTearDown(t.view.reset);
+
+    await t.pumpWidget(
+      host(
+        palette: const [
+          SasColour(name: 'lavender', rgb: 0xDCBEFF),
+          SasColour(name: 'magenta', rgb: 0xF032E6),
+          SasColour(name: 'slate', rgb: 0xA9A9A9),
+          SasColour(name: 'brown', rgb: 0x9A6324),
+          SasColour(name: 'teal', rgb: 0x469990),
+          SasColour(name: 'mint', rgb: 0xAAFFC3),
+        ],
+      ),
+    );
+    expect(t.takeException(), isNull);
+    expect(find.text('lavender'), findsOneWidget);
+    expect(find.text('mint'), findsOneWidget);
+  });
+
+  testWidgets('lays out at a large text scale', (t) async {
+    // Someone who has turned text size up is exactly the person who needs the
+    // colour *names*, so this is the case least able to afford an overflow.
+    t.view.physicalSize = const Size(320, 640);
+    t.view.devicePixelRatio = 1.0;
+    addTearDown(t.view.reset);
+
+    await t.pumpWidget(
+      MediaQuery(
+        data: const MediaQueryData(textScaler: TextScaler.linear(2.0)),
+        child: host(
+          palette: const [
+            SasColour(name: 'lavender', rgb: 0xDCBEFF),
+            SasColour(name: 'magenta', rgb: 0xF032E6),
+            SasColour(name: 'slate', rgb: 0xA9A9A9),
+          ],
+        ),
+      ),
+    );
+    expect(t.takeException(), isNull);
+  });
+
   testWidgets('says to stop if they do not match', (t) async {
     await t.pumpWidget(host());
     // The one instruction on this screen that matters. A mismatch is not a

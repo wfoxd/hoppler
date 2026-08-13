@@ -64,81 +64,112 @@ class SasView extends StatelessWidget {
 
   static const prompt = 'Do these match on both phones?';
   static const waiting = 'Waiting for the other phone';
-  static const mismatchHint = "If they don't match, stop. Someone is in the way.";
+  static const mismatchHint =
+      "If they don't match, stop. Someone is in the way.";
 
   @override
   Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.all(24),
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Text(
-            'Pairing with $peerName',
-            textAlign: TextAlign.center,
-            style: Theme.of(context).textTheme.titleMedium,
-          ),
-          const SizedBox(height: 24),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              for (final c in colours) _Swatch(colour: c),
-            ],
-          ),
-          const SizedBox(height: 16),
-          Text(
-            word,
-            textAlign: TextAlign.center,
-            style: Theme.of(context).textTheme.headlineSmall,
-          ),
-          const SizedBox(height: 24),
-          Text(prompt, textAlign: TextAlign.center),
-          const SizedBox(height: 8),
-          // Said plainly, and not in a colour that reads as an error. A person
-          // who sees a mismatch is being told to stop, which is the one
-          // instruction on this screen that matters.
-          Text(
-            mismatchHint,
-            textAlign: TextAlign.center,
-            style: Theme.of(context).textTheme.bodySmall,
-          ),
-          const SizedBox(height: 24),
-          if (peerConfirmed && !weConfirmed)
-            // Shown, because a person waiting on someone who has already tapped
-            // should not think the other phone is broken. Deliberately not
-            // phrased as encouragement to press the button.
-            const Padding(
-              padding: EdgeInsets.only(bottom: 8),
-              child: Text(
-                'They have confirmed on their phone.',
-                textAlign: TextAlign.center,
-              ),
-            ),
-          if (weConfirmed)
-            const Center(child: Text(waiting))
-          else
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+    // Scrollable, because at large text scales this content is genuinely
+    // taller than a phone and there is nothing here that can be dropped to
+    // make it fit: the colours, the word, the question and the two answers are
+    // all load-bearing. `minHeight` keeps it centred whenever there *is* room,
+    // so the ordinary case looks the same as before.
+    return LayoutBuilder(
+      builder: (context, constraints) => SingleChildScrollView(
+        child: ConstrainedBox(
+          constraints: BoxConstraints(minHeight: constraints.maxHeight),
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                TextButton(
-                  onPressed: onCancel,
-                  child: const Text("They don't match"),
+                Text(
+                  'Pairing with $peerName',
+                  textAlign: TextAlign.center,
+                  style: Theme.of(context).textTheme.titleMedium,
                 ),
-                FilledButton(
-                  onPressed: onConfirm,
-                  child: const Text('They match'),
+                const SizedBox(height: 24),
+                // `Wrap`, not `Row`, so the colour count is genuinely free
+                // rather than free up to four. A row of 64px swatches fits four
+                // on a 320dp screen and overflows on five — no proposal goes
+                // that far, but the reason this is a list at all is that the
+                // number is unsettled, and a layout with a quiet ceiling in it
+                // is the sort of thing found much later by someone changing a
+                // constant in Rust.
+                Wrap(
+                  alignment: WrapAlignment.center,
+                  spacing: 24,
+                  runSpacing: 16,
+                  children: [for (final c in colours) _Swatch(colour: c)],
                 ),
+                const SizedBox(height: 16),
+                Text(
+                  word,
+                  textAlign: TextAlign.center,
+                  style: Theme.of(context).textTheme.headlineSmall,
+                ),
+                const SizedBox(height: 24),
+                Text(prompt, textAlign: TextAlign.center),
+                const SizedBox(height: 8),
+                // Said plainly, and not in a colour that reads as an error. A person
+                // who sees a mismatch is being told to stop, which is the one
+                // instruction on this screen that matters.
+                Text(
+                  mismatchHint,
+                  textAlign: TextAlign.center,
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+                const SizedBox(height: 24),
+                if (peerConfirmed && !weConfirmed)
+                  // Shown, because a person waiting on someone who has already tapped
+                  // should not think the other phone is broken. Deliberately not
+                  // phrased as encouragement to press the button.
+                  const Padding(
+                    padding: EdgeInsets.only(bottom: 8),
+                    child: Text(
+                      'They have confirmed on their phone.',
+                      textAlign: TextAlign.center,
+                    ),
+                  ),
+                if (weConfirmed)
+                  const Center(child: Text(waiting))
+                else
+                  // `OverflowBar`, not `Row`, and this is where the overflow actually
+                  // was: "They don't match" is a long label, and two of these side by
+                  // side do not fit a 320dp screen even before anyone turns text size
+                  // up. It falls back to a column rather than clipping — and the
+                  // fallback keeps the destructive answer *first*, so the button
+                  // under a thumb is never the one that confirms.
+                  OverflowBar(
+                    alignment: MainAxisAlignment.spaceEvenly,
+                    overflowAlignment: OverflowBarAlignment.center,
+                    overflowSpacing: 8,
+                    children: [
+                      TextButton(
+                        onPressed: onCancel,
+                        child: const Text("They don't match"),
+                      ),
+                      FilledButton(
+                        onPressed: onConfirm,
+                        child: const Text('They match'),
+                      ),
+                    ],
+                  ),
+                if (weConfirmed)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 16),
+                    child: Center(
+                      child: TextButton(
+                        onPressed: onCancel,
+                        child: const Text('Stop'),
+                      ),
+                    ),
+                  ),
               ],
             ),
-          if (weConfirmed)
-            Padding(
-              padding: const EdgeInsets.only(top: 16),
-              child: Center(
-                child: TextButton(onPressed: onCancel, child: const Text('Stop')),
-              ),
-            ),
-        ],
+          ),
+        ),
       ),
     );
   }
@@ -157,8 +188,8 @@ class _Swatch extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 12),
+    return SizedBox(
+      width: 64,
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
@@ -175,7 +206,10 @@ class _Swatch extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 6),
-          Text(colour.name),
+          // Centred and allowed to wrap within the swatch's width, so a long
+          // name at a large text scale grows downward rather than sideways
+          // into its neighbour.
+          Text(colour.name, textAlign: TextAlign.center),
         ],
       ),
     );
