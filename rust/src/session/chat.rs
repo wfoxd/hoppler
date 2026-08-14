@@ -202,6 +202,13 @@ pub enum Delivery {
 #[derive(Clone, Debug, Default)]
 pub struct Inbox {
     through: u64,
+    /// Every element is inside the window: `through < seq <= through +
+    /// MAX_AHEAD`. Both constructors establish it and [`Inbox::receive`] keeps
+    /// it — the run only ever moves up, which moves the window with it.
+    ///
+    /// [`Inbox::pending`] depends on this and not merely benefits from it: it
+    /// walks from the run to the highest entry, so an entry outside the window
+    /// is a walk of arbitrary length.
     ahead: BTreeSet<u64>,
 }
 
@@ -212,12 +219,28 @@ impl Inbox {
 
     /// Restore one from what was stored. See [`Inbox::through`] and
     /// [`Inbox::ahead`] for the two halves.
+    ///
+    /// Both bounds re-applied rather than trusted. What comes back has been
+    /// through the store and possibly through a different build of this file,
+    /// and the window is a constant that could reasonably change between
+    /// versions — a `seq` that was legal when it was written and is not now
+    /// would otherwise reach [`Inbox::pending`] and make it walk from the run
+    /// to wherever that number is.
+    ///
+    /// Out-of-window entries are dropped rather than refused. The cost is that
+    /// such a message is no longer known-delivered and could be shown twice if
+    /// it arrives again; the alternative is a thread that cannot be opened at
+    /// all, which is worse for the same person.
     pub fn resumed(through: u64, ahead: impl IntoIterator<Item = u64>) -> Self {
+        let window = through.saturating_add(MAX_AHEAD);
         Self {
             through,
             // Anything at or below the contiguous run is already covered by it;
             // keeping a copy would leave two answers to "have we had this".
-            ahead: ahead.into_iter().filter(|s| *s > through).collect(),
+            ahead: ahead
+                .into_iter()
+                .filter(|seq| *seq > through && *seq <= window)
+                .collect(),
         }
     }
 
@@ -496,6 +519,13 @@ mod tests {
         let mut inbox = Inbox::resumed(u64::MAX - 1, []);
         assert_eq!(inbox.receive(u64::MAX), Delivery::Accepted);
         assert_eq!(inbox.receive(u64::MAX), Delivery::Duplicate);
+
+        // And the same window on the restore path, which computes it too. A
+        // wrap there would put the top of the window *below* the run, so every
+        // stored seq would be silently thrown away and every message already
+        // delivered would arrive again as new.
+        let restored = Inbox::resumed(u64::MAX - 1, [u64::MAX]);
+        assert_eq!(restored.ahead(), vec![u64::MAX]);
     }
 
     /// The seam persistence needs (slice 3): what an inbox is, taken out and
@@ -522,5 +552,26 @@ mod tests {
             vec![6],
             "a seq inside the contiguous run was kept as if still waiting"
         );
+    }
+
+    /// Restoring re-applies the window, because what comes back has been
+    /// through the store and possibly through a build whose `MAX_AHEAD` was
+    /// larger.
+    ///
+    /// The failure this prevents is not a wrong answer, it is a phone that
+    /// stops: `pending` walks from the run to the highest entry, so one absurd
+    /// `seq` in the restored set makes opening the thread an attempt to build a
+    /// list of billions.
+    #[test]
+    fn restoring_refuses_a_seq_from_outside_the_window() {
+        let restored = Inbox::resumed(10, [11, 10 + MAX_AHEAD, 11 + MAX_AHEAD, u64::MAX]);
+        assert_eq!(
+            restored.ahead(),
+            vec![11, 10 + MAX_AHEAD],
+            "a seq from outside the window survived being restored"
+        );
+        // The proof that it is bounded: this returns rather than running for
+        // the rest of the afternoon.
+        assert_eq!(restored.pending().len() as u64, MAX_AHEAD - 2);
     }
 }
