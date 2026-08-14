@@ -164,6 +164,14 @@ impl Header {
     }
 }
 
+/// Where a kept message key lives: their ratchet public, and the number of the
+/// message it opens.
+///
+/// Both halves, because the number alone repeats — every chain starts again at
+/// zero, so a key held across a turn would collide with one from the chain
+/// before it and open the wrong message, or fail to open the right one.
+type Slot = ([u8; 32], u32);
+
 /// One end of a paired conversation.
 ///
 /// No `Debug`: it holds the root key and every live chain key, which is the
@@ -184,10 +192,10 @@ pub struct Ratchet {
     sent: u32,
     received: u32,
     previous_chain_len: u32,
-    /// Keys for messages we stepped over, by (their key, number).
-    skipped: HashMap<([u8; 32], u32), [u8; 32]>,
+    /// Keys for messages we stepped over.
+    skipped: HashMap<Slot, [u8; 32]>,
     /// Insertion order, so the oldest skipped key is the one evicted.
-    skipped_order: Vec<([u8; 32], u32)>,
+    skipped_order: Vec<Slot>,
 }
 
 impl Ratchet {
@@ -400,7 +408,7 @@ impl Ratchet {
 
     /// Hold on to the key for a message that was stepped over, so it can still
     /// be opened when it arrives.
-    fn remember_skipped(&mut self, slot: ([u8; 32], u32), key: [u8; 32]) {
+    fn remember_skipped(&mut self, slot: Slot, key: [u8; 32]) {
         if self.skipped.insert(slot, key).is_none() {
             self.skipped_order.push(slot);
         }
@@ -414,7 +422,7 @@ impl Ratchet {
         }
     }
 
-    fn forget_skipped(&mut self, slot: &([u8; 32], u32)) {
+    fn forget_skipped(&mut self, slot: &Slot) {
         if let Some(mut key) = self.skipped.remove(slot) {
             key.zeroize();
         }
@@ -468,9 +476,8 @@ impl Drop for Ratchet {
 
 /// A chain walked forward, and the keys stepped over on the way. See [`walk`].
 struct Walked {
-    /// Keyed by (their ratchet public, message number), ready for
-    /// [`Ratchet::remember_skipped`].
-    keys: Vec<(([u8; 32], u32), [u8; 32])>,
+    /// Ready for [`Ratchet::remember_skipped`].
+    keys: Vec<(Slot, [u8; 32])>,
     chain: [u8; 32],
     received: u32,
 }
