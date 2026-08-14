@@ -30,6 +30,20 @@
          still *show* a code and be scanned, which is a whole half of the
          ceremony. Marking it required would keep those devices off the store
          listing for a feature they can take part in. -->
+    <!-- Pairing by tap (T11, R0-F4). Android Beam — the NDEF push that
+         "tap two phones together" used to mean — was deprecated in Android 10
+         and removed in Android 14, so there is no phone-to-phone push left on
+         any device this app supports. What remains is card emulation: the phone
+         showing a code answers as a card, the phone reading it uses reader
+         mode. Both halves need this permission.
+
+         `required="false"` on the features: plenty of phones have no NFC, and
+         they can still pair by QR, which is the universal path. Requiring it
+         would keep them off the store listing for a feature they do not need. -->
+    <uses-permission android:name="android.permission.NFC" />
+    <uses-feature android:name="android.hardware.nfc" android:required="false" />
+    <uses-feature android:name="android.hardware.nfc.hce" android:required="false" />
+
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
@@ -38,6 +52,22 @@
         android:label="hoppler"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
+        <!-- The card half. Constructed by the system on a tap, which is why the
+             code it serves is handed over through a static rather than a
+             constructor — see HopplerApduService. -->
+        <service
+            android:name=".nfc.HopplerApduService"
+            android:exported="true"
+            android:permission="android.permission.BIND_NFC_SERVICE">
+            <intent-filter>
+                <action android:name="android.nfc.cardemulation.action.HOST_APDU_SERVICE" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+            <meta-data
+                android:name="android.nfc.cardemulation.host_apdu_service"
+                android:resource="@xml/nfc_apdu_service" />
+        </service>
+
         <activity
             android:name=".MainActivity"
             android:exported="true"

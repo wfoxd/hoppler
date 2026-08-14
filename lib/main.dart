@@ -15,6 +15,7 @@ import 'package:hoppler/src/rust/api/messaging.dart';
 import 'package:hoppler/src/rust/api/pairing.dart';
 import 'package:hoppler/src/rust/api/transfers.dart';
 import 'package:hoppler/src/rust/api/types.dart';
+import 'package:hoppler/src/nfc/nfc_channel.dart';
 import 'package:hoppler/src/platform/host.dart';
 import 'package:hoppler/src/rust/frb_generated.dart';
 import 'package:path_provider/path_provider.dart';
@@ -95,8 +96,13 @@ class _HomePageState extends State<HomePage> {
   /// Whether the camera is open. Same reason.
   bool _scanning = false;
 
-  /// Guards `onScan` firing once per camera frame.
+  /// Guards `onScan` firing once per camera frame — and a tap arriving in the
+  /// middle of one.
   bool _startingCeremony = false;
+
+  /// Whether this device can pair by tap at all. Asked once, at startup.
+  bool _canTap = false;
+  StreamSubscription<NfcEvent>? _taps;
   StreamSubscription<CoreEvent>? _events;
   late final PingService _pingService;
 
@@ -107,11 +113,35 @@ class _HomePageState extends State<HomePage> {
     final stream = coreEventStream().asBroadcastStream();
     _pingService = CorePingService(stream);
     _events = stream.listen(_onEvent);
+    _taps = nfcEvents().listen(_onTap);
+    // Asked rather than assumed: a "tap to pair" line on a phone with no NFC is
+    // an instruction nobody can follow, which is R0-N6's rule about stating
+    // reach honestly applied to a second radio.
+    nfcAvailable().then((yes) {
+      if (mounted) setState(() => _canTap = yes);
+    });
+  }
+
+  /// A code read off another phone, or a tap that produced nothing.
+  ///
+  /// Deliberately the same path as the camera's: a tap yields text, and every
+  /// question about what that text *is* has an answer in the core already.
+  /// Two front doors, one hallway.
+  void _onTap(NfcEvent event) {
+    switch (event) {
+      case NfcCodeRead(:final code):
+        _onCode(code);
+      case NfcUnreadable(:final reason):
+        // Said out loud. Two people holding phones together need to know it did
+        // not take — silence here is indistinguishable from not having tapped.
+        setState(() => _log.insert(0, reason));
+    }
   }
 
   @override
   void dispose() {
     _events?.cancel();
+    _taps?.cancel();
     super.dispose();
   }
 
@@ -155,6 +185,7 @@ class _HomePageState extends State<HomePage> {
           // the air. `PairingSurface` would draw the colours over it anyway;
           // this is what stops the advertising.
           if (_myCode != null) unawaited(_stopShowingCode());
+          if (_canTap) unawaited(stopReadingTaps());
           _scanning = false;
           _pairing = _Pairing(
             deviceId: deviceId,
@@ -296,6 +327,7 @@ class _HomePageState extends State<HomePage> {
                   : PairingCodeView(
                       code: _myCode!,
                       canScan: canScanQrCodes,
+                      canTap: _canTap,
                       onDone: _stopShowingCode,
                     ),
               nearby: NearbyView<NearbyDevice>(
@@ -337,7 +369,16 @@ class _HomePageState extends State<HomePage> {
       setState(() => _log.insert(0, 'Could not make a code: $e'));
       return;
     }
-    if (mounted) setState(() => _myCode = code);
+    if (!mounted) return;
+    setState(() => _myCode = code);
+    // The same string, offered both ways. A tap is narrower than a screen —
+    // it needs contact rather than a line of sight — so this is the better half
+    // of R0-F4 where the hardware allows it, and the QR remains the one that
+    // always works.
+    if (_canTap) {
+      await shareCode(code);
+      await startReadingTaps();
+    }
   }
 
   /// Take the code off the screen, and off the air.
@@ -351,6 +392,14 @@ class _HomePageState extends State<HomePage> {
     if (_myCode == null) return;
     setState(() => _myCode = null);
     await stopShowingInvite();
+    if (_canTap) {
+      // Off the air by both routes. A code still answering taps after its owner
+      // put the phone down keeps a Layer-2 key paired with the rung id this
+      // device advertises under — the link R0-F2's rotation exists to break,
+      // and one that a pocket-height reader could collect.
+      await stopSharingCode();
+      await stopReadingTaps();
+    }
   }
 
   void _stopScanning() => setState(() => _scanning = false);

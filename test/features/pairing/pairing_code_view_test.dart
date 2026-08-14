@@ -4,11 +4,16 @@ import 'package:hoppler/features/pairing/pairing_code_view.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 
 void main() {
-  Widget host({bool canScan = true, VoidCallback? onDone}) => MaterialApp(
+  Widget host({
+    bool canScan = true,
+    bool canTap = false,
+    VoidCallback? onDone,
+  }) => MaterialApp(
     home: Scaffold(
       body: PairingCodeView(
         code: 'HOPPLER://PAIR/MZXW6YTBOI',
         canScan: canScan,
+        canTap: canTap,
         onDone: onDone ?? () {},
       ),
     ),
@@ -45,7 +50,9 @@ void main() {
     expect(qr.backgroundColor, Colors.white);
   });
 
-  testWidgets('a device that cannot scan says so instead of instructing', (t) async {
+  testWidgets('a device that cannot scan says so instead of instructing', (
+    t,
+  ) async {
     await t.pumpWidget(host(canScan: false));
     // R0-N6's rule — state the reach honestly — applied to a platform gap
     // rather than a radio one. Telling a desktop user to scan something is an
@@ -54,14 +61,17 @@ void main() {
     expect(find.text(PairingCodeView.instruction), findsNothing);
   });
 
-  testWidgets('a device that can scan gets the ordinary instruction', (t) async {
+  testWidgets('a device that can scan gets the ordinary instruction', (
+    t,
+  ) async {
     await t.pumpWidget(host());
     expect(find.text(PairingCodeView.instruction), findsOneWidget);
     expect(find.text(PairingCodeView.noCameraHere), findsNothing);
   });
 
-  testWidgets('dismissing reaches the caller, which is what stops the code',
-      (t) async {
+  testWidgets('dismissing reaches the caller, which is what stops the code', (
+    t,
+  ) async {
     var done = false;
     await t.pumpWidget(host(onDone: () => done = true));
     await t.tap(find.text('Done'));
@@ -69,5 +79,18 @@ void main() {
     // keeps a Layer-2 key paired with the rung id this device advertises under,
     // which is the link R0-F2's rotation exists to break.
     expect(done, isTrue);
+  });
+  testWidgets('a phone that can tap is told so, beside the code', (t) async {
+    await t.pumpWidget(host(canTap: true));
+    // Beside, not instead of. The QR is the path that always works, and plenty
+    // of phones have no NFC at all — a screen offering only the tap would
+    // strand them with no way to finish.
+    expect(find.text(PairingCodeView.tapInstruction), findsOneWidget);
+    expect(find.text(PairingCodeView.instruction), findsOneWidget);
+  });
+
+  testWidgets('a phone that cannot tap is not told to', (t) async {
+    await t.pumpWidget(host());
+    expect(find.text(PairingCodeView.tapInstruction), findsNothing);
   });
 }
