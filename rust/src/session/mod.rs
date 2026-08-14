@@ -5,4 +5,5 @@
 
 pub mod frame;
 pub mod handshake;
+pub mod ratchet;
 pub mod table;
