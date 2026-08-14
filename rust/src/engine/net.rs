@@ -134,10 +134,27 @@ pub enum NetEvent {
 /// Found by a test that expected an abort to leave zero state on both sides and
 /// discovered it left zero state on one.
 ///
-/// Two minutes against R0-F4's fifteen-second budget: the budget is what the
-/// ceremony *takes*, and most of it is a person reading two colours off a
-/// screen. Sizing this to the budget would abandon anyone who looked up.
+/// Two minutes covers the handshake, where nothing is waiting on a person: if
+/// three messages have not crossed in that time the ceremony is not slow, it is
+/// stuck.
 pub const CEREMONY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How long a ceremony may sit once both screens are showing colours.
+///
+/// Much longer, because the deadline stops meaning the same thing. Up to the
+/// SAS a silent ceremony is a stalled protocol; after it, a silent ceremony is
+/// two people looking at their phones — and the correct amount of time for that
+/// is however long they take. Two minutes is not generous for reading colours
+/// down a phone line, or for being interrupted halfway.
+///
+/// This is not a guess. On two phones a ceremony with matching colours on both
+/// screens was abandoned at exactly this point, and an earlier run finished
+/// with **1.9 seconds** of margin — which was luck rather than headroom.
+///
+/// A backstop rather than a limit: what actually ends a ceremony is a
+/// confirmation, a cancellation, or the pipe going away. This exists so an
+/// abandoned one does not hold Noise state and block the next attempt forever.
+pub const CEREMONY_CONFIRM_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// A ceremony and the moment it stops being worth holding.
 struct InFlight {
@@ -414,7 +431,7 @@ impl Net {
             let in_flight = ceremonies
                 .get_mut(peer)
                 .ok_or_else(|| format!("no ceremony with {peer}"))?;
-            in_flight.deadline = now + CEREMONY_DEADLINE;
+            in_flight.deadline = now + CEREMONY_CONFIRM_DEADLINE;
             in_flight
                 .ceremony
                 .confirm(&identity)
@@ -577,10 +594,17 @@ impl Net {
                     }
                 }
             };
-            // Every message is progress, so the clock restarts. What the
-            // deadline bounds is a ceremony nobody is moving — not one whose
-            // human is taking their time between messages.
-            in_flight.deadline = now + CEREMONY_DEADLINE;
+            // Every message is progress, so the clock restarts — and how long
+            // it restarts *for* depends on what the ceremony is now waiting on.
+            // Before the colours it is waiting on a protocol, which should not
+            // take two minutes. After them it is waiting on two people, and the
+            // right amount of time for that is however long they take.
+            in_flight.deadline = now
+                + if in_flight.ceremony.sas().is_some() {
+                    CEREMONY_CONFIRM_DEADLINE
+                } else {
+                    CEREMONY_DEADLINE
+                };
             match in_flight.ceremony.read(&identity, payload) {
                 Ok(steps) => steps,
                 Err(why) => {
@@ -589,6 +613,20 @@ impl Net {
                 }
             }
         };
+        // Reaching the colours changes what the ceremony is waiting for, and
+        // that has to take effect now rather than on some later message — there
+        // may not be one. This is the exact case that killed a ceremony on two
+        // phones with matching colours on both screens.
+        if let Some(in_flight) = self
+            .ceremonies
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(peer)
+        {
+            if in_flight.ceremony.sas().is_some() {
+                in_flight.deadline = now + CEREMONY_CONFIRM_DEADLINE;
+            }
+        }
         self.dispatch(peer, steps, now)
     }
 

@@ -46,17 +46,77 @@ class QrScannerView extends StatelessWidget {
 
   final VoidCallback onCancel;
 
-  static const instruction = 'Point this at their code.';
+  static const instruction = 'Point this at their code, inside the box.';
 
   @override
   Widget build(BuildContext context) {
     if (!canScanQrCodes) {
       return _Unavailable(onCancel: onCancel);
     }
-    return Column(
+    return _Scanner(onCode: onCode, onCancel: onCancel);
+  }
+}
+
+/// The camera, and what to say when there is not one.
+class _Scanner extends StatefulWidget {
+  const _Scanner({required this.onCode, required this.onCancel});
+
+  final void Function(String code) onCode;
+  final VoidCallback onCancel;
+
+  @override
+  State<_Scanner> createState() => _ScannerState();
+}
+
+class _ScannerState extends State<_Scanner> {
+  /// Why the camera did not open, if it did not.
+  ///
+  /// The plugin asks for the permission itself and reports a refusal by
+  /// failing to build a controller. Without this the screen is simply black:
+  /// no camera, no message, and nothing to suggest the person is looking at
+  /// the consequence of their own answer to a prompt. That is the same
+  /// availability lie R0-N6 rules out for the radio, and it would have been
+  /// found on two phones rather than here.
+  String? _problem;
+
+  @override
+  Widget build(BuildContext context) {
+    final problem = _problem;
+    if (problem != null) {
+      return _Blocked(reason: problem, onCancel: widget.onCancel);
+    }
+    // A `Stack`, not a `Column`, and this is the whole of the fix: the scanner
+    // overlay sizes its cutout from `MediaQuery.size` — the *screen* — while
+    // the decoder reads the centre of the camera image. Put the camera in an
+    // `Expanded` with anything above or below it and those two stop agreeing,
+    // so the box a person carefully aims at is not where the code is being
+    // looked for.
+    //
+    // Found on two phones, by aiming squarely at a drawn rectangle and having
+    // nothing happen. Nothing in a widget test would have shown it: the box is
+    // painted by the plugin and the mismatch is against a camera frame that
+    // does not exist in a test.
+    return Stack(
       children: [
-        Expanded(
+        Positioned.fill(
           child: ReaderWidget(
+            onControllerCreated: (controller, error) {
+              if (error == null) return;
+              // The camera tears down asynchronously and this callback can
+              // arrive after the scanner has gone — which is not a corner case
+              // here, since leaving the scanner *is* what tears the camera
+              // down. Without the guard that is "setState() called after
+              // dispose", on the one screen that already crashed once during
+              // teardown for a different reason.
+              if (!mounted) return;
+              setState(() {
+                _problem = error.toString().contains('AccessDenied')
+                    ? 'Hoppler needs the camera to read a code. You can turn '
+                          'it on in Settings, or show your own code instead.'
+                    : 'The camera could not be opened. Show your own code '
+                          'instead and let the other phone scan it.';
+              });
+            },
             // Only QR. A ceremony code is a QR code, and accepting every
             // barcode format would mean decoding work on every frame for
             // formats this app has no use for — battery spent for nothing
@@ -67,18 +127,37 @@ class QrScannerView extends StatelessWidget {
             showToggleCamera: false,
             onScan: (result) {
               final text = result.text;
-              if (text != null && text.isNotEmpty) onCode(text);
+              if (text != null && text.isNotEmpty) widget.onCode(text);
             },
           ),
         ),
-        Padding(
-          padding: const EdgeInsets.all(16),
-          child: Column(
-            children: [
-              const Text(instruction, textAlign: TextAlign.center),
-              const SizedBox(height: 8),
-              TextButton(onPressed: onCancel, child: const Text('Cancel')),
-            ],
+        // Floating over the camera rather than sharing the page with it, so
+        // the preview keeps the full screen the overlay assumes it has.
+        Positioned(
+          left: 0,
+          right: 0,
+          bottom: 0,
+          child: ColoredBox(
+            // A camera feed is any colour at all; the words have to survive it.
+            color: Colors.black54,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text(
+                    QrScannerView.instruction,
+                    textAlign: TextAlign.center,
+                    style: TextStyle(color: Colors.white),
+                  ),
+                  TextButton(
+                    onPressed: widget.onCancel,
+                    style: TextButton.styleFrom(foregroundColor: Colors.white),
+                    child: const Text('Cancel'),
+                  ),
+                ],
+              ),
+            ),
           ),
         ),
       ],
@@ -93,17 +172,33 @@ class _Unavailable extends StatelessWidget {
   final VoidCallback onCancel;
 
   @override
+  Widget build(BuildContext context) => _Blocked(
+    reason:
+        'This device cannot scan a code. Show yours instead and let the '
+        'other phone scan it.',
+    onCancel: onCancel,
+  );
+}
+
+/// A camera that is not going to appear, and why.
+///
+/// One widget for both reasons — no camera on this platform, and a camera this
+/// person has declined — because the only thing that differs is the sentence,
+/// and the way out is the same.
+class _Blocked extends StatelessWidget {
+  const _Blocked({required this.reason, required this.onCancel});
+
+  final String reason;
+  final VoidCallback onCancel;
+
+  @override
   Widget build(BuildContext context) {
     return Padding(
       padding: const EdgeInsets.all(24),
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          const Text(
-            'This device cannot scan a code. Show yours instead and let the '
-            'other phone scan it.',
-            textAlign: TextAlign.center,
-          ),
+          Text(reason, textAlign: TextAlign.center),
           const SizedBox(height: 16),
           TextButton(onPressed: onCancel, child: const Text('Back')),
         ],

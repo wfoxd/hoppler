@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:hoppler/features/nearby/nearby_tile.dart';
 import 'package:hoppler/features/nearby/nearby_view.dart';
 import 'package:hoppler/features/pairing/pairing_code_view.dart';
+import 'package:hoppler/features/pairing/pairing_surface.dart';
 import 'package:hoppler/features/pairing/sas_view.dart';
 import 'package:hoppler/features/pairing/scanner.dart';
 import 'package:hoppler/features/ping/ping_service.dart';
@@ -81,6 +82,21 @@ class _HomePageState extends State<HomePage> {
   /// person; a second concurrent ceremony would put two sets of colours on one
   /// screen, which is the one thing this screen must never be ambiguous about.
   _Pairing? _pairing;
+
+  /// This device's own code, while it is on screen.
+  ///
+  /// Held as state rather than pushed as a route. It was a modal sheet, and on
+  /// two phones that meant the person showing the code reached the colours and
+  /// never saw them — their own QR was still on top of the page drawing them.
+  /// A route cannot be reasoned about from the body's state; see
+  /// [PairingSurface].
+  String? _myCode;
+
+  /// Whether the camera is open. Same reason.
+  bool _scanning = false;
+
+  /// Guards `onScan` firing once per camera frame.
+  bool _startingCeremony = false;
   StreamSubscription<CoreEvent>? _events;
   late final PingService _pingService;
 
@@ -134,6 +150,12 @@ class _HomePageState extends State<HomePage> {
         // be silently dropped, which is the only reason these four are being
         // written at all.
         case CoreEvent_PairingSas(:final deviceId, :final colours, :final word):
+          // Whatever else was on screen, the colours replace it — and if this
+          // device was showing a code, that code is now spent and comes off
+          // the air. `PairingSurface` would draw the colours over it anyway;
+          // this is what stops the advertising.
+          if (_myCode != null) unawaited(_stopShowingCode());
+          _scanning = false;
           _pairing = _Pairing(
             deviceId: deviceId,
             peerName: _nameFor(deviceId),
@@ -164,6 +186,47 @@ class _HomePageState extends State<HomePage> {
 
   @override
   Widget build(BuildContext context) {
+    // Back closes whatever pairing surface is open, instead of leaving the app.
+    //
+    // This is the cost of holding those surfaces as state rather than routes,
+    // and it has to be paid explicitly: with a modal sheet the system back
+    // popped the sheet and disposed the camera inside the app, and without one
+    // the same gesture exits — with the camera still delivering frames into an
+    // engine that has detached. That is a hard crash, and it is what a person
+    // does the moment a code will not decode.
+    //
+    // Backing out of the colours cancels the ceremony, which is the right
+    // reading of the gesture: someone leaving that screen has not agreed to
+    // anything.
+    return PopScope(
+      canPop: _pairing == null && _myCode == null && !_scanning,
+      onPopInvokedWithResult: (didPop, _) {
+        if (didPop) return;
+        if (_pairing != null) {
+          _cancelPairing();
+        } else if (_scanning) {
+          _stopScanning();
+        } else if (_myCode != null) {
+          _stopShowingCode();
+        }
+      },
+      child: _scaffold(context),
+    );
+  }
+
+  Widget _scaffold(BuildContext context) {
+    // The camera gets the whole screen, with nothing above or below it.
+    //
+    // Not a style choice. The scanner's overlay sizes its cutout from the
+    // screen while the decoder reads the centre of the camera image, so any
+    // chrome sharing the page slides the drawn rectangle away from the region
+    // actually being read — and a person aims at the rectangle. Found on two
+    // phones, by aiming carefully at a box and having nothing happen.
+    if (_scanning) {
+      return Scaffold(
+        body: QrScannerView(onCode: _onCode, onCancel: _stopScanning),
+      );
+    }
     return Scaffold(
       appBar: AppBar(
         backgroundColor: _personaColour,
@@ -181,7 +244,7 @@ class _HomePageState extends State<HomePage> {
               setState(() => _discovery = v);
             },
           ),
-          if (_pairing == null)
+          if (_pairing == null && _myCode == null && !_scanning)
             OverflowBar(
               alignment: MainAxisAlignment.center,
               children: [
@@ -196,7 +259,10 @@ class _HomePageState extends State<HomePage> {
                 // do half the ceremony.
                 if (canScanQrCodes)
                   TextButton.icon(
-                    onPressed: _scanACode,
+                    onPressed: () => setState(() {
+                      _startingCeremony = false;
+                      _scanning = true;
+                    }),
                     icon: const Icon(Icons.photo_camera),
                     label: const Text('Scan a code'),
                   ),
@@ -208,26 +274,37 @@ class _HomePageState extends State<HomePage> {
               child: LinearProgressIndicator(value: _transfer),
             ),
           Expanded(
-            child: _pairing == null
-                ? NearbyView<NearbyDevice>(
-                    discoveryOn: _discovery,
-                    radioReason: _radioReason,
-                    devices: _devices,
-                    tile: _deviceTile,
-                  )
-                // The colours take the screen while there are colours. A
-                // comparison offered alongside a scrolling list of other
-                // people is one nobody makes properly, and it is the only
-                // thing on this screen that has to be decided.
-                : SasView(
-                    colours: _pairing!.colours,
-                    word: _pairing!.word,
-                    peerName: _pairing!.peerName,
-                    peerConfirmed: _pairing!.peerConfirmed,
-                    weConfirmed: _pairing!.weConfirmed,
-                    onConfirm: _confirmPairing,
-                    onCancel: _cancelPairing,
-                  ),
+            child: PairingSurface(
+              sas: _pairing == null
+                  ? null
+                  : SasView(
+                      colours: _pairing!.colours,
+                      word: _pairing!.word,
+                      peerName: _pairing!.peerName,
+                      peerConfirmed: _pairing!.peerConfirmed,
+                      weConfirmed: _pairing!.weConfirmed,
+                      onConfirm: _confirmPairing,
+                      onCancel: _cancelPairing,
+                    ),
+              // Always null here: while scanning the camera has the whole
+              // screen and this body is not built at all. Kept as a slot so
+              // the precedence stays one ordered decision — the day a scanner
+              // does share the page, the colours must still win.
+              scanner: null,
+              code: _myCode == null
+                  ? null
+                  : PairingCodeView(
+                      code: _myCode!,
+                      canScan: canScanQrCodes,
+                      onDone: _stopShowingCode,
+                    ),
+              nearby: NearbyView<NearbyDevice>(
+                discoveryOn: _discovery,
+                radioReason: _radioReason,
+                devices: _devices,
+                tile: _deviceTile,
+              ),
+            ),
           ),
           const Divider(height: 1),
           SizedBox(
@@ -247,12 +324,11 @@ class _HomePageState extends State<HomePage> {
   /// The id is not pretty, but it is what distinguishes two answers — and a
   /// peer whose persona has not arrived yet has no name to show (their tile
   /// says so too).
-  /// Put this device's code on screen until the sheet is dismissed.
+  /// Put this device's code on screen.
   ///
-  /// `stopShowingInvite` on the way out, always. A code left showing keeps a
-  /// Layer-2 key paired with the rung id this device is advertising under, and
-  /// R0-F2 spends twelve minutes at a time making that pairing hard to
-  /// observe — leaving it up undoes that for as long as the screen is on.
+  /// Kept as state rather than pushed as a route, so that when the colours
+  /// arrive the body simply draws them instead — see [PairingSurface] for the
+  /// two-phone failure that taught this.
   Future<void> _showMyCode() async {
     final String code;
     try {
@@ -261,51 +337,42 @@ class _HomePageState extends State<HomePage> {
       setState(() => _log.insert(0, 'Could not make a code: $e'));
       return;
     }
-    if (!mounted) return;
-    await showModalBottomSheet<void>(
-      context: context,
-      isScrollControlled: true,
-      builder: (sheet) => PairingCodeView(
-        code: code,
-        canScan: canScanQrCodes,
-        onDone: () => Navigator.of(sheet).pop(),
-      ),
-    );
+    if (mounted) setState(() => _myCode = code);
+  }
+
+  /// Take the code off the screen, and off the air.
+  ///
+  /// A code left showing keeps a Layer-2 key paired with the rung id this
+  /// device is advertising under, and R0-F2 spends twelve minutes at a time
+  /// making that pairing hard to observe. Called both when the person taps
+  /// Done and when a ceremony reaches the colours — by which point the code has
+  /// been read and is of no further use to anyone but a photographer.
+  Future<void> _stopShowingCode() async {
+    if (_myCode == null) return;
+    setState(() => _myCode = null);
     await stopShowingInvite();
   }
 
-  /// Open the camera and hand whatever it reads to the core.
+  void _stopScanning() => setState(() => _scanning = false);
+
+  /// Whatever the camera decoded.
   ///
   /// The camera reports every QR code in front of it, most of which are not
   /// ours, so a rejected code is the normal case and not worth a message. The
-  /// guard is on `_starting`: `onScan` fires per frame, and without it a single
-  /// code held in view starts a ceremony and then floods "already pairing"
-  /// errors behind it.
-  Future<void> _scanACode() async {
-    var starting = false;
-    await showModalBottomSheet<void>(
-      context: context,
-      isScrollControlled: true,
-      builder: (sheet) => SizedBox(
-        height: MediaQuery.of(sheet).size.height * 0.8,
-        child: QrScannerView(
-          onCancel: () => Navigator.of(sheet).pop(),
-          onCode: (code) async {
-            if (starting) return;
-            starting = true;
-            try {
-              await beginPairing(code: code);
-              if (sheet.mounted) Navigator.of(sheet).pop();
-            } catch (_) {
-              // Not ours, or the device is not nearby. Keep looking — the
-              // person is holding a camera at a screen and the next frame is
-              // a fresh chance.
-              starting = false;
-            }
-          },
-        ),
-      ),
-    );
+  /// guard exists because `onScan` fires per frame: without it a single code
+  /// held in view starts a ceremony and then floods "already pairing" errors
+  /// behind it.
+  Future<void> _onCode(String code) async {
+    if (_startingCeremony) return;
+    _startingCeremony = true;
+    try {
+      await beginPairing(code: code);
+      if (mounted) setState(() => _scanning = false);
+    } catch (_) {
+      // Not ours, or not nearby. Keep looking — the next frame is a fresh
+      // chance and the person is still holding a camera at a screen.
+      _startingCeremony = false;
+    }
   }
 
   Future<void> _confirmPairing() async {
@@ -364,7 +431,6 @@ class _HomePageState extends State<HomePage> {
     }
   }
 }
-
 
 /// The ceremony this screen is showing.
 ///

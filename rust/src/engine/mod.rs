@@ -572,6 +572,11 @@ pub fn begin_pairing(code: String) -> Result<String, String> {
     let invite = Invite::parse(&code).map_err(|e| e.to_string())?;
     let peer = resolve_invite(&net, &invite)
         .ok_or_else(|| "that code is for a device that is not nearby".to_string())?;
+    // The start marker for the budget: the moment a code was successfully read,
+    // which is where the ceremony proper begins. Time spent aiming the camera
+    // before a decode lands is not in this and cannot be — nothing observes it
+    // but the person holding the phone.
+    log::info!("starting a ceremony with {peer}");
     net.begin_pairing(&peer, &invite, std::time::Instant::now())?;
     Ok(peer)
 }
@@ -773,12 +778,34 @@ fn on_net_event(net: &Arc<net::Net>, event: net::NetEvent) {
                 &l2_pub,
                 &l1_pub,
             ) {
-                Ok(thread_id) => emit(CoreEvent::PairingCompleted {
-                    device_id: peer,
-                    thread_id,
-                    name: persona_name,
-                    colour: persona_colour,
-                }),
+                Ok(thread_id) => {
+                    // The end marker for R0-F4's fifteen-second budget, which
+                    // can only be measured on two real devices — nothing in a
+                    // test harness has a radio or a person in it. Pairs with
+                    // the "starting a ceremony" and "reached the colours" lines
+                    // to give the two intervals that matter separately: what
+                    // the protocol costs, and what the two humans cost.
+                    //
+                    // No SAS in it, for the reason above. `thread_id` is a
+                    // local row number and names nobody.
+                    log::info!("paired with {peer} on thread {thread_id}");
+                    emit(CoreEvent::PairingCompleted {
+                        device_id: peer,
+                        thread_id,
+                        name: persona_name,
+                        colour: persona_colour,
+                    });
+                    // The nearby list carries a `paired` flag, and a pairing is
+                    // exactly the event that changes it. Without this the badge
+                    // waits for some unrelated peer movement to rebuild the
+                    // list — on two phones the tile still read "nearby" a
+                    // minute after pairing, and only a Discovery toggle brought
+                    // it right. `SessionOpened` and `SessionClosed` refresh for
+                    // the same reason; this was the one that did not.
+                    if let Ok(devices) = nearby_devices() {
+                        emit(CoreEvent::DiscoveryUpdated { devices });
+                    }
+                }
                 Err(why) => {
                     // The ceremony succeeded and the store did not. Reported as
                     // a failed pairing because that is what it is from here:
