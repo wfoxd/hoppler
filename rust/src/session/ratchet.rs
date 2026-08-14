@@ -83,6 +83,13 @@ pub enum RatchetError {
     Undecryptable,
     /// A peer's public key was not a usable one (low order, non-contributory).
     BadKey,
+    /// A chain has been used for as many messages as its counter can number.
+    ///
+    /// Four billion in one direction with no reply, so nothing will meet it —
+    /// but wrapping would reuse message numbers, and with them nonces, which is
+    /// the one failure this construction has no defence against. Refused
+    /// instead, and it heals: a reply turns the ratchet and resets the counters.
+    ChainExhausted,
 }
 
 impl std::fmt::Display for RatchetError {
@@ -91,6 +98,7 @@ impl std::fmt::Display for RatchetError {
             RatchetError::TooManySkipped => write!(f, "too many skipped messages"),
             RatchetError::Undecryptable => write!(f, "message could not be decrypted"),
             RatchetError::BadKey => write!(f, "unusable ratchet key"),
+            RatchetError::ChainExhausted => write!(f, "chain exhausted"),
         }
     }
 }
@@ -241,15 +249,18 @@ impl Ratchet {
     /// without the tag failing.
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<(Header, Vec<u8>), RatchetError> {
         let chain = self.sending.ok_or(RatchetError::Undecryptable)?;
+        // Before the chain moves, so a refusal costs nothing.
+        let advanced = self
+            .sent
+            .checked_add(1)
+            .ok_or(RatchetError::ChainExhausted)?;
         let (next, message_key) = kdf_chain(&chain);
-        self.sending = Some(next);
 
         let header = Header {
             dh: self.ours.public(),
             previous_chain_len: self.previous_chain_len,
             number: self.sent,
         };
-        self.sent += 1;
 
         let key = aead::AeadKey::from_bytes(message_key);
         let sealed = aead::seal(
@@ -258,6 +269,8 @@ impl Ratchet {
             &header.to_bytes(),
             plaintext,
         );
+        self.sending = Some(next);
+        self.sent = advanced;
         Ok((header, sealed))
     }
 
@@ -272,40 +285,77 @@ impl Ratchet {
     /// it here would quietly drop the one property that layer added — a chat
     /// line is exactly the sort of thing that should not linger in freed
     /// memory, and the caller can decide when it stops being secret.
+    ///
+    /// # Nothing is spent before the tag is checked
+    ///
+    /// A header travels in clear, and the only thing that vouches for it is the
+    /// AEAD tag on the body it is attached to — which is checked last, because
+    /// checking it is what the header is *for*. So everything between here and
+    /// there is worked out against copies and applied in one go at the end. A
+    /// message that does not open leaves the ratchet exactly as it was.
+    ///
+    /// That is not tidiness. Anything mutated earlier is mutated on the say-so
+    /// of whoever sent the packet, and all three of the things this walks —
+    /// the kept keys, the chain, the counters — are things a conversation
+    /// cannot survive losing.
     pub fn decrypt(
         &mut self,
         header: Header,
         sealed: &[u8],
     ) -> Result<Zeroizing<Vec<u8>>, RatchetError> {
-        // A key we kept when we stepped over this message. Taken, not read:
-        // using it twice would mean accepting a replay.
-        if let Some(key) = self.take_skipped(&header) {
-            return open(&key, header, sealed);
+        // A key we kept when we stepped over this message. Read, and removed
+        // only once the message opens — using it twice would mean accepting a
+        // replay, but *taking* it before the tag is checked would let a forged
+        // body carrying this header destroy the key the real message needs.
+        if let Some(key) = self.skipped.get(&(header.dh.0, header.number)).copied() {
+            let plaintext = open(&key, header, sealed)?;
+            self.forget_skipped(&(header.dh.0, header.number));
+            return Ok(plaintext);
         }
 
         let theirs_changed = self.theirs.map(|t| t.0 != header.dh.0).unwrap_or(true);
-        if theirs_changed {
-            // Worked out before anything is spent, because this is where a
-            // header can be refused: a key that cannot be used must cost
-            // nothing at all. Skipping first would let one forged header burn a
-            // chain's worth of keys into storage and evict real ones.
-            let turned = self.prepare_turn(header.dh)?;
-            // Everything still owed on the old chain, before the chain is
-            // replaced and its keys are gone for good.
-            self.skip_to(header.previous_chain_len)?;
+        let turn = if theirs_changed {
+            Some(self.prepare_turn(header.dh)?)
+        } else {
+            None
+        };
+
+        let mut skipped = Vec::new();
+        let (chain, from) = match &turn {
+            Some(turned) => {
+                // Everything still owed on the old chain, worked out before it
+                // is replaced and its keys are gone for good.
+                if let Some(old) = self.receiving {
+                    let theirs = self.theirs.map(|t| t.0).unwrap_or([0u8; 32]);
+                    skipped = walk(old, theirs, self.received, header.previous_chain_len)?.keys;
+                }
+                (turned.receiving, 0)
+            }
+            None => (
+                self.receiving.ok_or(RatchetError::Undecryptable)?,
+                self.received,
+            ),
+        };
+
+        let walked = walk(chain, header.dh.0, from, header.number)?;
+        let (next, message_key) = kdf_chain(&walked.chain);
+        let received = walked
+            .received
+            .checked_add(1)
+            .ok_or(RatchetError::ChainExhausted)?;
+
+        let plaintext = open(&message_key, header, sealed)?;
+
+        // Nothing above this line touched the ratchet, and nothing below it can
+        // fail.
+        if let Some(turned) = turn {
             self.commit_turn(turned);
         }
-
-        self.skip_to(header.number)?;
-
-        let chain = self.receiving.ok_or(RatchetError::Undecryptable)?;
-        let (next, message_key) = kdf_chain(&chain);
-        let plaintext = open(&message_key, header, sealed)?;
-        // Advanced only once the message has actually opened. Stepping first
-        // would let a forged message burn a key and desynchronise the chain —
-        // one bad packet costing a real one.
+        for (slot, key) in skipped.into_iter().chain(walked.keys) {
+            self.remember_skipped(slot, key);
+        }
         self.receiving = Some(next);
-        self.received += 1;
+        self.received = received;
         Ok(plaintext)
     }
 
@@ -348,46 +398,27 @@ impl Ratchet {
         self.ours = turn.ours;
     }
 
-    /// Keep the keys for messages between here and `until`, so they can still
-    /// be opened when they arrive.
-    fn skip_to(&mut self, until: u32) -> Result<(), RatchetError> {
-        let Some(chain) = self.receiving else {
-            return Ok(());
-        };
-        if until < self.received {
-            // Already past it: either a duplicate or a replay. Not an error —
-            // the key is simply gone, and `decrypt` will fail to find one.
-            return Ok(());
+    /// Hold on to the key for a message that was stepped over, so it can still
+    /// be opened when it arrives.
+    fn remember_skipped(&mut self, slot: ([u8; 32], u32), key: [u8; 32]) {
+        if self.skipped.insert(slot, key).is_none() {
+            self.skipped_order.push(slot);
         }
-        if until - self.received > MAX_SKIP {
-            return Err(RatchetError::TooManySkipped);
-        }
-        let theirs = self.theirs.map(|t| t.0).unwrap_or([0u8; 32]);
-        let mut chain = chain;
-        while self.received < until {
-            let (next, message_key) = kdf_chain(&chain);
-            chain = next;
-            let slot = (theirs, self.received);
-            if self.skipped.insert(slot, message_key).is_none() {
-                self.skipped_order.push(slot);
-            }
-            self.received += 1;
-            // Oldest first, so a flood of gaps costs the messages least likely
-            // to still be in flight rather than the ones most likely.
-            if self.skipped_order.len() > MAX_SKIPPED_KEYS {
-                let oldest = self.skipped_order.remove(0);
-                self.skipped.remove(&oldest);
+        // Oldest first, so a flood of gaps costs the messages least likely to
+        // still be in flight rather than the ones most likely.
+        if self.skipped_order.len() > MAX_SKIPPED_KEYS {
+            let oldest = self.skipped_order.remove(0);
+            if let Some(mut evicted) = self.skipped.remove(&oldest) {
+                evicted.zeroize();
             }
         }
-        self.receiving = Some(chain);
-        Ok(())
     }
 
-    fn take_skipped(&mut self, header: &Header) -> Option<[u8; 32]> {
-        let slot = (header.dh.0, header.number);
-        let key = self.skipped.remove(&slot)?;
-        self.skipped_order.retain(|s| *s != slot);
-        Some(key)
+    fn forget_skipped(&mut self, slot: &([u8; 32], u32)) {
+        if let Some(mut key) = self.skipped.remove(slot) {
+            key.zeroize();
+        }
+        self.skipped_order.retain(|s| s != slot);
     }
 
     /// How many keys are being held for messages that never arrived. For the
@@ -433,6 +464,52 @@ impl Drop for Ratchet {
     fn drop(&mut self) {
         self.wipe();
     }
+}
+
+/// A chain walked forward, and the keys stepped over on the way. See [`walk`].
+struct Walked {
+    /// Keyed by (their ratchet public, message number), ready for
+    /// [`Ratchet::remember_skipped`].
+    keys: Vec<(([u8; 32], u32), [u8; 32])>,
+    chain: [u8; 32],
+    received: u32,
+}
+
+/// Step a receiving chain from `from` up to `until`, collecting the message
+/// keys passed over.
+///
+/// Free-standing and taking no `&mut self` on purpose: this is the expensive,
+/// refusable part of receiving a message, and it runs on a header nobody has
+/// vouched for yet. Keeping it unable to touch the ratchet is what makes
+/// "nothing is spent before the tag is checked" a fact about the types rather
+/// than about the order of some statements.
+fn walk(chain: [u8; 32], theirs: [u8; 32], from: u32, until: u32) -> Result<Walked, RatchetError> {
+    if until < from {
+        // Already past it: either a duplicate or a replay. Not an error — the
+        // key is simply gone, and the message will fail to open.
+        return Ok(Walked {
+            keys: Vec::new(),
+            chain,
+            received: from,
+        });
+    }
+    if until - from > MAX_SKIP {
+        return Err(RatchetError::TooManySkipped);
+    }
+    let mut keys = Vec::new();
+    let mut chain = chain;
+    let mut received = from;
+    while received < until {
+        let (next, message_key) = kdf_chain(&chain);
+        chain = next;
+        keys.push(((theirs, received), message_key));
+        received += 1;
+    }
+    Ok(Walked {
+        keys,
+        chain,
+        received,
+    })
 }
 
 /// A ratchet turn, worked out but not yet applied. See [`Ratchet::prepare_turn`].
@@ -866,6 +943,115 @@ mod tests {
             bob.skipped_count(),
             held,
             "a refused header walked a chain it was never going to use"
+        );
+    }
+
+    /// The kept-key half of "a forged message must not burn a real one".
+    ///
+    /// The chain half was already tested; this path was not, and it *took* the
+    /// key before checking the tag. A header travels in clear, so anyone
+    /// watching knows which message was skipped — and a garbage body under that
+    /// header would have destroyed the key the real one needed. The message was
+    /// still in flight; it now cannot ever be read.
+    #[test]
+    fn a_forged_body_does_not_burn_a_kept_key() {
+        let (mut alice, mut bob) = pair();
+        let skipped = send(&mut alice, "the one that was overtaken");
+        recv(&mut bob, send(&mut alice, "the one that arrived first"));
+        assert_eq!(
+            bob.skipped_count(),
+            1,
+            "nothing was kept: the test is empty"
+        );
+
+        let forged = vec![0u8; skipped.1.len()];
+        assert_eq!(
+            bob.decrypt(skipped.0, &forged),
+            Err(RatchetError::Undecryptable),
+        );
+        assert_eq!(
+            recv(&mut bob, skipped),
+            "the one that was overtaken",
+            "a forged body destroyed the key a real message needed"
+        );
+    }
+
+    /// Nor may a message that never opens move the ratchet at all.
+    ///
+    /// The counters are the reason this is more than tidiness: `walk` advanced
+    /// `received` on the strength of a header alone, so anyone able to inject
+    /// packets could drive it 256 at a time — evicting kept keys, and,
+    /// eventually, running the counter off its end.
+    #[test]
+    fn a_message_that_does_not_open_moves_nothing() {
+        let (mut alice, mut bob) = pair();
+        recv(&mut bob, send(&mut alice, "one"));
+        let _skipped = send(&mut alice, "two");
+        recv(&mut bob, send(&mut alice, "three"));
+
+        let before = (bob.received, bob.receiving, bob.skipped_count());
+        let (header, sealed) = send(&mut alice, "four");
+        let claiming_a_gap = Header {
+            number: header.number + MAX_SKIP - 1,
+            ..header
+        };
+        assert_eq!(
+            bob.decrypt(claiming_a_gap, &sealed),
+            Err(RatchetError::Undecryptable),
+        );
+        assert_eq!(
+            (bob.received, bob.receiving, bob.skipped_count()),
+            before,
+            "a header nobody vouched for walked the chain anyway"
+        );
+        assert_eq!(recv(&mut bob, (header, sealed)), "four");
+    }
+
+    /// Numbering has an end, and running off it would reuse message numbers —
+    /// and with them nonces. Refused on both sides rather than wrapped.
+    ///
+    /// The counters and the chain keys are independent: the number a header
+    /// carries is whatever `sent` says, and the key is wherever the chain has
+    /// got to. So winding the counters forward puts both ends in exactly the
+    /// state four billion messages would, at a price a test can pay.
+    #[test]
+    fn an_exhausted_chain_is_refused_rather_than_wrapped() {
+        let (mut alice, mut bob) = pair();
+        recv(&mut bob, send(&mut alice, "one"));
+
+        alice.sent = u32::MAX - 1;
+        bob.received = u32::MAX - 1;
+        assert_eq!(
+            recv(&mut bob, send(&mut alice, "the last one")),
+            "the last one",
+            "the last message a chain can number was refused"
+        );
+
+        assert_eq!(
+            alice.encrypt(b"one too many").err(),
+            Some(RatchetError::ChainExhausted),
+            "the sending counter wrapped instead of refusing"
+        );
+
+        // The receiving end, built by hand because the sending end will no
+        // longer produce it — which is the whole point, but leaves a peer that
+        // does not share our arithmetic untested otherwise.
+        let (_, message_key) = kdf_chain(&bob.receiving.unwrap());
+        let header = Header {
+            dh: bob.theirs.unwrap(),
+            previous_chain_len: 0,
+            number: u32::MAX,
+        };
+        let sealed = aead::seal(
+            &aead::AeadKey::from_bytes(message_key),
+            &nonce_for(header.number),
+            &header.to_bytes(),
+            b"one too many",
+        );
+        assert_eq!(
+            bob.decrypt(header, &sealed).err(),
+            Some(RatchetError::ChainExhausted),
+            "the receiving counter wrapped instead of refusing"
         );
     }
 
