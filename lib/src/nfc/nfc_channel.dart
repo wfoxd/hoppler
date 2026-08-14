@@ -85,14 +85,23 @@ Future<void> startReadingTaps() => _commands.invokeMethod<void>('startReading');
 Future<void> stopReadingTaps() => _commands.invokeMethod<void>('stopReading');
 
 /// What the adapter reports.
+///
+/// Nothing here throws. A `map` that casts and fails takes the *stream* down
+/// with it, not just the event — and a dead stream means every later tap goes
+/// silent, which on this screen is indistinguishable from not having tapped at
+/// all. So a malformed event becomes a failed tap and the stream lives; the
+/// BLE channel treats its own the same way.
 Stream<NfcEvent> nfcEvents() => _events.receiveBroadcastStream().map((event) {
-  final map = (event as Map).cast<String, Object?>();
-  final value = map['value'] as String? ?? '';
+  if (event is! Map) return const NfcUnreadable('that tap did not take');
+  final map = event.cast<Object?, Object?>();
+  final value = map['value'];
+  final text = value is String ? value : '';
   return switch (map['type']) {
-    'codeRead' => NfcCodeRead(value),
-    // Anything unrecognised is treated as a failed tap rather than dropped. An
-    // adapter on a newer build must not be able to make an older app go quiet
-    // on the one screen where silence reads as "nothing happened".
-    _ => NfcUnreadable(value.isEmpty ? 'that tap did not take' : value),
+    // Only a code with actual text is a code. An empty one would be handed to
+    // the core as an invite, refused there, and reported as nothing at all.
+    'codeRead' when text.isNotEmpty => NfcCodeRead(text),
+    // Anything else is a failed tap rather than a dropped event. An adapter on
+    // a newer build must not be able to make an older app go quiet.
+    _ => NfcUnreadable(text.isEmpty ? 'that tap did not take' : text),
   };
 });
