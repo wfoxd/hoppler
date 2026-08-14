@@ -42,7 +42,7 @@
 
 use std::collections::HashMap;
 
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::{aead, dh, hash, kdf, CryptoError};
 
@@ -98,10 +98,20 @@ impl std::fmt::Display for RatchetError {
 impl std::error::Error for RatchetError {}
 
 impl From<CryptoError> for RatchetError {
-    fn from(_: CryptoError) -> Self {
-        // Collapsed on purpose: every crypto failure here is the same fact to a
-        // caller, and the detail is the oracle.
-        RatchetError::Undecryptable
+    fn from(error: CryptoError) -> Self {
+        match error {
+            // The one distinction worth drawing, and not an oracle: whether a
+            // public key is non-contributory is a property of the key the
+            // *sender* chose and sent in clear, decided without touching any
+            // secret of ours. It tells them what they already knew. It says
+            // something a caller cannot otherwise learn, too — from
+            // [`Ratchet::initiator`] it means the pairing itself is unusable,
+            // which "undecryptable" would report as a bad message.
+            CryptoError::InvalidPublicKey => RatchetError::BadKey,
+            // Everything else collapses on purpose: to a caller they are the
+            // same fact, and the detail is the oracle.
+            _ => RatchetError::Undecryptable,
+        }
     }
 }
 
@@ -149,7 +159,12 @@ impl Header {
 /// One end of a paired conversation.
 ///
 /// No `Debug`: it holds the root key and every live chain key, which is the
-/// whole conversation's past and future.
+/// whole conversation's past and future. Wiped on drop for the same reason, and
+/// to match the primitives in `crypto/`, all of which zeroize — a ratchet
+/// assembled from types that wipe themselves and then holding their output in
+/// plain arrays would have undone that one layer up. The cost is that `Drop`
+/// stops fields being moved out, so persistence (slice 3) reads through
+/// accessors rather than destructuring.
 pub struct Ratchet {
     root: [u8; 32],
     /// Our current ratchet key pair.
@@ -270,10 +285,15 @@ impl Ratchet {
 
         let theirs_changed = self.theirs.map(|t| t.0 != header.dh.0).unwrap_or(true);
         if theirs_changed {
+            // Worked out before anything is spent, because this is where a
+            // header can be refused: a key that cannot be used must cost
+            // nothing at all. Skipping first would let one forged header burn a
+            // chain's worth of keys into storage and evict real ones.
+            let turned = self.prepare_turn(header.dh)?;
             // Everything still owed on the old chain, before the chain is
             // replaced and its keys are gone for good.
             self.skip_to(header.previous_chain_len)?;
-            self.turn(header.dh)?;
+            self.commit_turn(turned);
         }
 
         self.skip_to(header.number)?;
@@ -289,25 +309,43 @@ impl Ratchet {
         Ok(plaintext)
     }
 
-    /// Turn the ratchet onto a new public of theirs: one DH for the chain we
-    /// will receive on, another for the chain we will send on.
-    fn turn(&mut self, theirs: dh::DhPublic) -> Result<(), RatchetError> {
+    /// Work out the turn onto a new public of theirs — one DH for the chain we
+    /// will receive on, another for the chain we will send on — without
+    /// applying any of it.
+    ///
+    /// Split from [`Ratchet::commit_turn`] because this half can fail and the
+    /// other half must not be half-done. A turn that clobbered the counters and
+    /// then rejected the key would leave the two ends deriving from different
+    /// roots for good: a single forged header, and the conversation is over
+    /// with nothing to show anyone why.
+    fn prepare_turn(&self, theirs: dh::DhPublic) -> Result<Turn, RatchetError> {
+        let shared = self.ours.diffie_hellman(&theirs)?;
+        let (root, receiving) = kdf_root(&self.root, shared.as_bytes());
+
+        let ours = dh::DhSecret::generate();
+        let shared = ours.diffie_hellman(&theirs)?;
+        let (root, sending) = kdf_root(&root, shared.as_bytes());
+
+        Ok(Turn {
+            theirs,
+            root,
+            receiving,
+            sending,
+            ours,
+        })
+    }
+
+    /// Apply a prepared turn. Infallible by construction — everything that
+    /// could refuse has already happened.
+    fn commit_turn(&mut self, turn: Turn) {
         self.previous_chain_len = self.sent;
         self.sent = 0;
         self.received = 0;
-        self.theirs = Some(theirs);
-
-        let shared = self.ours.diffie_hellman(&theirs)?;
-        let (root, receiving) = kdf_root(&self.root, shared.as_bytes());
-        self.root = root;
-        self.receiving = Some(receiving);
-
-        self.ours = dh::DhSecret::generate();
-        let shared = self.ours.diffie_hellman(&theirs)?;
-        let (root, sending) = kdf_root(&self.root, shared.as_bytes());
-        self.root = root;
-        self.sending = Some(sending);
-        Ok(())
+        self.theirs = Some(turn.theirs);
+        self.root = turn.root;
+        self.receiving = Some(turn.receiving);
+        self.sending = Some(turn.sending);
+        self.ours = turn.ours;
     }
 
     /// Keep the keys for messages between here and `until`, so they can still
@@ -357,6 +395,56 @@ impl Ratchet {
     pub fn skipped_count(&self) -> usize {
         self.skipped.len()
     }
+
+    /// Wipe every secret this holds.
+    ///
+    /// Called from `Drop`, and separate from it so it can be tested: "zeroized
+    /// on drop" is otherwise a claim no test can reach without reading freed
+    /// memory, which is exactly the sort of comment this project keeps finding
+    /// to be a description of an intention rather than of the code.
+    ///
+    /// Best effort, and worth saying which part: `[u8; 32]` is `Copy`, so the
+    /// copies a chain key made on its way through the KDFs are not reachable
+    /// from here, and a `HashMap` that rehashed may have left a skipped key in
+    /// a freed bucket. What this does guarantee is that the live copies — the
+    /// root, both chains, and every key still owed — are gone. `ours` wipes
+    /// itself: `DhSecret` zeroizes on its own drop, which runs after this.
+    ///
+    /// One line below is not covered and says so: the test can see that the
+    /// skipped keys are no longer *held*, but not that their bytes were wiped
+    /// before the map let go of them, so removing the `zeroize` inside the loop
+    /// and keeping the `clear` survives. Reading a freed bucket to prove it is
+    /// undefined behaviour, which is a worse test than none.
+    fn wipe(&mut self) {
+        self.root.zeroize();
+        self.sending.zeroize();
+        self.receiving.zeroize();
+        for key in self.skipped.values_mut() {
+            key.zeroize();
+        }
+        self.skipped.clear();
+        // Public keys, so nothing to wipe — dropped only to keep the two
+        // collections agreeing about what is being held.
+        self.skipped_order.clear();
+    }
+}
+
+impl Drop for Ratchet {
+    fn drop(&mut self) {
+        self.wipe();
+    }
+}
+
+/// A ratchet turn, worked out but not yet applied. See [`Ratchet::prepare_turn`].
+///
+/// No `Debug`, for the same reason [`Ratchet`] has none: these are the next
+/// chain keys.
+struct Turn {
+    theirs: dh::DhPublic,
+    root: [u8; 32],
+    receiving: [u8; 32],
+    sending: [u8; 32],
+    ours: dh::DhSecret,
 }
 
 /// `KDF_RK`: a new root key and a new chain key from a DH output.
@@ -701,5 +789,104 @@ mod tests {
             number: 9,
         };
         assert_eq!(Header::from_bytes(&header.to_bytes()), header);
+    }
+
+    /// The all-zero point: order one, so the exchange lands on a constant the
+    /// peer knows without holding any secret. `crypto::dh` refuses it, and this
+    /// is the only door to the primitive.
+    const UNUSABLE: dh::DhPublic = dh::DhPublic([0u8; 32]);
+
+    /// A pairing that hands over a key nothing can be done with is a broken
+    /// pairing, and has to say so. Reported as "undecryptable" it would send a
+    /// caller looking at a message that does not exist.
+    #[test]
+    fn a_ceremony_key_that_cannot_be_used_is_named_as_the_problem() {
+        assert_eq!(
+            Ratchet::initiator([7u8; 32], UNUSABLE).err(),
+            Some(RatchetError::BadKey),
+            "an unusable ratchet key from the ceremony was reported as something else"
+        );
+    }
+
+    /// One forged header must cost nothing.
+    ///
+    /// Written after the review asked why `BadKey` was unreachable: reaching it
+    /// is what showed the turn was not atomic. It reset the counters and
+    /// replaced their key *before* the exchange that refuses the key, so a
+    /// single packet anyone could send left the two ends deriving from
+    /// different roots — every later message failing, permanently, with nothing
+    /// on either screen to say why.
+    #[test]
+    fn a_forged_key_does_not_end_the_conversation() {
+        let (mut alice, mut bob) = pair();
+        assert_eq!(recv(&mut bob, send(&mut alice, "one")), "one");
+
+        let forged = Header {
+            dh: UNUSABLE,
+            previous_chain_len: 0,
+            number: 0,
+        };
+        assert_eq!(
+            bob.decrypt(forged, &[0u8; 48]),
+            Err(RatchetError::BadKey),
+            "a header carrying an unusable key was not refused as one"
+        );
+
+        // Both directions, because a half-applied turn breaks the sending chain
+        // as well as the receiving one and a test of only one would pass.
+        assert_eq!(
+            recv(&mut bob, send(&mut alice, "two")),
+            "two",
+            "one forged header ended the conversation"
+        );
+        assert_eq!(recv(&mut alice, send(&mut bob, "three")), "three");
+    }
+
+    /// Nor may a forged header spend the storage that real messages need: the
+    /// keys held for a gap are what makes a late message readable, and evicting
+    /// them loses messages that did arrive.
+    #[test]
+    fn a_forged_key_does_not_spend_the_skipped_keys() {
+        let (mut alice, mut bob) = pair();
+        recv(&mut bob, send(&mut alice, "one"));
+        for _ in 0..4 {
+            let _skipped = send(&mut alice, "gap");
+        }
+        recv(&mut bob, send(&mut alice, "landed"));
+        let held = bob.skipped_count();
+        assert_eq!(held, 4, "the gap was not held in the first place");
+
+        let forged = Header {
+            dh: UNUSABLE,
+            previous_chain_len: MAX_SKIP,
+            number: 0,
+        };
+        assert_eq!(bob.decrypt(forged, &[0u8; 48]), Err(RatchetError::BadKey));
+        assert_eq!(
+            bob.skipped_count(),
+            held,
+            "a refused header walked a chain it was never going to use"
+        );
+    }
+
+    /// `Drop` cannot be observed without reading freed memory, so what is
+    /// asserted is the wipe it calls — see [`Ratchet::wipe`].
+    #[test]
+    fn wiping_a_ratchet_leaves_no_keys_in_it() {
+        let (mut alice, mut bob) = pair();
+        recv(&mut bob, send(&mut alice, "one"));
+        let _skipped = send(&mut alice, "two");
+        recv(&mut bob, send(&mut alice, "three"));
+
+        assert_ne!(bob.root, [0u8; 32], "nothing to wipe: the test is empty");
+        assert!(bob.sending.is_some() && bob.receiving.is_some());
+        assert_eq!(bob.skipped_count(), 1);
+
+        bob.wipe();
+
+        assert_eq!(bob.root, [0u8; 32], "the root key survived");
+        assert_eq!(bob.sending, None, "the sending chain survived");
+        assert_eq!(bob.receiving, None, "the receiving chain survived");
+        assert_eq!(bob.skipped_count(), 0, "a skipped message key survived");
     }
 }
