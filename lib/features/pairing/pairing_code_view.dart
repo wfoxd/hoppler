@@ -21,6 +21,7 @@ class PairingCodeView extends StatelessWidget {
     required this.code,
     required this.onDone,
     this.canScan = true,
+    this.canTap = false,
   });
 
   /// The invite URI, straight from `pairingInvite()`.
@@ -38,7 +39,15 @@ class PairingCodeView extends StatelessWidget {
   /// than a radio one.
   final bool canScan;
 
+  /// Whether this device can also pair by tapping phones together.
+  ///
+  /// Additive, never a replacement: the tap is offered *beside* the code, not
+  /// instead of it. Plenty of phones have no NFC and the QR is the path that
+  /// always works, so a screen that mentioned only tapping would strand them.
+  final bool canTap;
+
   static const instruction = 'Have them scan this with Hoppler.';
+  static const tapInstruction = 'Or hold the two phones back to back.';
   static const noCameraHere =
       'This device cannot scan a code — it has no camera Hoppler can use. '
       'Show this one instead.';
@@ -68,6 +77,10 @@ class PairingCodeView extends StatelessWidget {
             canScan ? instruction : noCameraHere,
             textAlign: TextAlign.center,
           ),
+          if (canTap) ...[
+            const SizedBox(height: 8),
+            Text(tapInstruction, textAlign: TextAlign.center),
+          ],
           const SizedBox(height: 24),
           Center(
             child: TextButton(onPressed: onDone, child: const Text('Done')),

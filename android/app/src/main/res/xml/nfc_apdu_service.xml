@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- What this app answers to over NFC (T11, R0-F4).
+
+     Category "other", not "payment": Hoppler is not a wallet, and a payment
+     AID would put it in the list a person chooses a default payment app from —
+     somewhere it has no business being, and where a stray tap at a terminal
+     could reach it.
+
+     requireDeviceUnlock: a pairing code is only meaningful while its owner is
+     holding the phone out, and answering from a locked screen would let a
+     reader take one out of a pocket. R0-F4 is an in-person ceremony; this is
+     that sentence expressed to the NFC stack. -->
+<host-apdu-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:description="@string/nfc_service_description"
+    android:requireDeviceUnlock="true">
+    <aid-group
+        android:description="@string/nfc_aid_group_description"
+        android:category="other">
+        <!-- Must match NfcApdu.AID, which is where the reason for these bytes
+             is written down. Changing either alone stops two phones talking. -->
+        <aid-filter android:name="F0484F50504C4552" />
+    </aid-group>
+</host-apdu-service>

@@ -9,6 +9,7 @@ import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodChannel
 import org.hoppler.hoppler.ble.BleAdapter
 import org.hoppler.hoppler.ble.BlePermissions
+import org.hoppler.hoppler.nfc.NfcAdapter
 
 class MainActivity : FlutterActivity() {
     private companion object {
@@ -22,6 +23,7 @@ class MainActivity : FlutterActivity() {
     }
 
     private var ble: BleAdapter? = null
+    private var nfc: NfcAdapter? = null
 
     /**
      * Held while the app is in the foreground so mDNS can be *received*.
@@ -44,6 +46,15 @@ class MainActivity : FlutterActivity() {
         val messenger = flutterEngine.dartExecutor.binaryMessenger
         MethodChannel(messenger, BleAdapter.METHOD_CHANNEL).setMethodCallHandler(adapter)
         EventChannel(messenger, BleAdapter.EVENT_CHANNEL).setStreamHandler(adapter)
+
+        // The activity, not the application context: reader mode is bound to a
+        // foreground activity by the platform, which is also the honest shape
+        // for R0-N6 — a tap is something a person is doing, not something the
+        // app does while nobody is looking.
+        val tap = NfcAdapter(this)
+        nfc = tap
+        MethodChannel(messenger, NfcAdapter.METHOD_CHANNEL).setMethodCallHandler(tap)
+        EventChannel(messenger, NfcAdapter.EVENT_CHANNEL).setStreamHandler(tap)
     }
 
     override fun onResume() {
@@ -115,6 +126,13 @@ class MainActivity : FlutterActivity() {
         // not on screen is not discovering, and the radio cost is real.
         multicastLock?.let { if (it.isHeld) it.release() }
         multicastLock = null
+        // Reader mode is bound to a foreground activity, and the platform is
+        // entitled to complain if it outlives one. Also the honest behaviour:
+        // a tap is something a person is doing, so an app in the background has
+        // no business holding the field open. The *card* half stays — it is the
+        // system that answers a reader, and it only has something to answer
+        // with while a code is on screen.
+        nfc?.dispose()
         super.onPause()
     }
 
@@ -124,6 +142,8 @@ class MainActivity : FlutterActivity() {
         // rung exists to avoid.
         ble?.shutdown()
         ble = null
+        nfc?.dispose()
+        nfc = null
         super.onDestroy()
     }
 }

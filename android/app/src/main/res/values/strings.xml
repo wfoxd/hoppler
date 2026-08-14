@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Shown by Android in its own NFC settings, so it has to make sense to
+         someone who has arrived there from the system UI rather than from us. -->
+    <string name="nfc_service_description">Hoppler pairing</string>
+    <string name="nfc_aid_group_description">Share a Hoppler pairing code by tapping phones</string>
+</resources>
