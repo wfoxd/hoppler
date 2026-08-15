@@ -3,6 +3,7 @@
 //! A Noise IK handshake ([`handshake`]) followed by AEAD-framed traffic. See
 //! that module for why the pattern changed from XX and what each static is.
 
+pub mod chat;
 pub mod frame;
 pub mod handshake;
 pub mod ratchet;

@@ -1,0 +1,40 @@
+syntax = "proto3";
+
+package hoppler.v0;
+
+// One chat message, as it travels inside an established session (T12, R0-F5).
+//
+// This rides sealed: the Double Ratchet encrypts these bytes and the frame
+// carries [ratchet header][ciphertext]. Nothing here is visible to anyone
+// watching the wire, which is why the fields can be as plain as they are.
+//
+// # Why there is no thread_id
+//
+// The task names the envelope `{thread_id, seq, msg_id, body}`, and three of
+// those travel. A session has exactly one peer, so the thread is whichever one
+// belongs to that peer — the receiver knows it before the message arrives, and
+// the sender's local row id would be meaningless to the other device anyway.
+// Putting it on the wire would be a number that could only ever be wrong.
+message ChatMessage {
+  // Position in this sender's stream for this thread, from 1. Durable and
+  // never reused: it is what puts a reunion's worth of messages back in order,
+  // what makes a gap visible rather than silent, and what tells a resend from
+  // a new message.
+  //
+  // Per *sender*, so the two directions of one conversation number
+  // independently and neither has to know the other's count.
+  uint64 seq    = 1;
+  // 16 random bytes, chosen once by the sender and kept with the outbox entry
+  // so a resend carries the same one.
+  //
+  // The store's global dedup key (`messages.msg_id UNIQUE`). Random rather
+  // than derived from the content: two people can legitimately send the same
+  // word twice, and an id that collided for them would silently drop the
+  // second one.
+  bytes  msg_id = 2;
+  // The message itself. Bytes rather than string: v0 is text, but a peer
+  // sending invalid UTF-8 must not be able to make a whole envelope
+  // unparseable — proto3 `string` rejects it at decode, which would turn one
+  // bad message into a session that cannot be read at all.
+  bytes  body   = 3;
+}
