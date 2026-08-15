@@ -831,6 +831,19 @@ impl Store {
                 inbox.through
             ))
         })?;
+        // The same bound the read applies, on the way in as well.
+        //
+        // Asymmetric validation is worse than none: a write that accepts what
+        // the read refuses stores state that cannot be loaded again, so the
+        // thread opens once and never afterwards, and the damage is already on
+        // disk by the time anything notices. Refused here, the commit rolls
+        // back and the conversation carries on from where it was.
+        if inbox.ahead.len() > MAX_AHEAD as usize {
+            return Err(StoreError::Db(format!(
+                "inbox holds {} out-of-order seqs, over the {MAX_AHEAD} bound",
+                inbox.ahead.len()
+            )));
+        }
         let mut ahead = Vec::with_capacity(inbox.ahead.len() * 8);
         for seq in &inbox.ahead {
             ahead.extend_from_slice(&seq.to_be_bytes());
@@ -2046,6 +2059,53 @@ mod tests {
             s.inbox_position(thread).unwrap().unwrap().ahead.len(),
             MAX_AHEAD as usize
         );
+    }
+
+    /// A write that accepts what the read refuses is state that can be stored
+    /// and never loaded — the thread opens once and never again.
+    #[test]
+    fn an_inbox_over_the_bound_is_refused_on_the_way_in_too() {
+        let (s, _d) = store();
+        let thread = a_thread(&s);
+        let good = InboxPosition {
+            through: 1,
+            ahead: vec![],
+        };
+        s.commit_received(b"state one", &good, &an_incoming(thread, 1, 1), 3000)
+            .unwrap();
+
+        let too_many = InboxPosition {
+            through: 1,
+            ahead: (2..=MAX_AHEAD + 2).collect(),
+        };
+        assert!(
+            s.commit_received(b"state two", &too_many, &an_incoming(thread, 2, 2), 3001)
+                .is_err(),
+            "an inbox the read side would refuse was written anyway"
+        );
+        // And the refusal rolls the whole commit back, rather than leaving the
+        // ratchet ahead of a thread whose inbox never moved.
+        assert_eq!(
+            s.ratchet_state(thread).unwrap().unwrap()[..],
+            b"state one"[..]
+        );
+        assert_eq!(s.inbox_position(thread).unwrap().unwrap(), good);
+
+        // Exactly the bound goes through, so what is refused is the bound and
+        // not the shape of the thing — and so an off-by-one here shows up as a
+        // conversation that cannot hold the gaps it is allowed to.
+        let at_the_bound = InboxPosition {
+            through: 1,
+            ahead: (2..MAX_AHEAD + 2).collect(),
+        };
+        s.commit_received(
+            b"state two",
+            &at_the_bound,
+            &an_incoming(thread, 2, 2),
+            3002,
+        )
+        .unwrap();
+        assert_eq!(s.inbox_position(thread).unwrap().unwrap(), at_the_bound);
     }
 
     #[test]
