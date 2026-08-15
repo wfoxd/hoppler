@@ -5,6 +5,9 @@
 //! keeping the store deterministic and unit-testable.
 
 use rusqlite::{params, OptionalExtension};
+use zeroize::Zeroizing;
+
+use crate::session::chat::MAX_AHEAD;
 
 use super::{Store, StoreError};
 
@@ -772,12 +775,17 @@ impl Store {
     /// from a duplicate that cost nothing.
     pub fn commit_received(
         &self,
-        thread_id: i64,
         ratchet: &[u8],
         inbox: &InboxPosition,
         message: &NewMessage,
         now: i64,
     ) -> Result<InsertOutcome, StoreError> {
+        // Which thread this is comes from the message and nowhere else.
+        // Review asked for a check that a separately-passed `thread_id`
+        // matched; taking the parameter away is the same guarantee without a
+        // check that can be forgotten, and there was never a caller that wanted
+        // to write one thread's state alongside another thread's message.
+        let thread_id = message.thread_id;
         let tx = self.conn.unchecked_transaction()?;
         // State first, message last, and the order is the test's: written the
         // other way round, a message that fails its insert leaves nothing to
@@ -836,15 +844,21 @@ impl Store {
     }
 
     /// A thread's stored ratchet state, or `None` if it has never had one.
-    pub fn ratchet_state(&self, thread_id: i64) -> Result<Option<Vec<u8>>, StoreError> {
+    ///
+    /// `Zeroizing`, as `FileStore::get` is and for the same reason: this is the
+    /// root key, both chains, and every key still owed. It came out of the
+    /// database as a plain `Vec` and that copy is unavoidable, but the one the
+    /// caller holds wipes when it goes.
+    pub fn ratchet_state(&self, thread_id: i64) -> Result<Option<Zeroizing<Vec<u8>>>, StoreError> {
         Ok(self
             .conn
             .query_row(
                 "SELECT state FROM ratchets WHERE thread_id = ?1",
                 params![thread_id],
-                |r| r.get(0),
+                |r| r.get::<_, Vec<u8>>(0),
             )
-            .optional()?)
+            .optional()?
+            .map(Zeroizing::new))
     }
 
     /// A thread's stored inbox position, or `None` if nothing has arrived yet.
@@ -864,6 +878,17 @@ impl Store {
             return Err(StoreError::Db(format!(
                 "inbox for thread {thread_id} has {} bytes of ahead, not a whole number of seqs",
                 packed.len()
+            )));
+        }
+        // The session layer's bound, re-applied here rather than restated: a
+        // second constant that had to agree with the first is the kind of pair
+        // that drifts. Bytes on disk have been through builds where it may have
+        // been larger, and a blob taken at face value is an allocation nobody
+        // had to attack us to cause.
+        if packed.len() / 8 > MAX_AHEAD as usize {
+            return Err(StoreError::Db(format!(
+                "inbox for thread {thread_id} holds {} out-of-order seqs, over the {MAX_AHEAD} bound",
+                packed.len() / 8
             )));
         }
         let through = u64::try_from(through)
@@ -1820,16 +1845,13 @@ mod tests {
             through: 4,
             ahead: vec![7, 9],
         };
-        s.commit_received(
-            thread,
-            b"state one",
-            &inbox,
-            &an_incoming(thread, 1, 1),
-            3000,
-        )
-        .unwrap();
+        s.commit_received(b"state one", &inbox, &an_incoming(thread, 1, 1), 3000)
+            .unwrap();
 
-        assert_eq!(s.ratchet_state(thread).unwrap().unwrap(), b"state one");
+        assert_eq!(
+            s.ratchet_state(thread).unwrap().unwrap()[..],
+            b"state one"[..]
+        );
         assert_eq!(s.inbox_position(thread).unwrap().unwrap(), inbox);
     }
 
@@ -1847,34 +1869,31 @@ mod tests {
             through: 2,
             ahead: vec![5],
         };
-        s.commit_received(
-            thread,
-            b"state one",
-            &first,
-            &an_incoming(thread, 1, 1),
-            3000,
-        )
-        .unwrap();
-        s.commit_received(
-            thread,
-            b"state two",
-            &second,
-            &an_incoming(thread, 2, 2),
-            3001,
-        )
-        .unwrap();
+        s.commit_received(b"state one", &first, &an_incoming(thread, 1, 1), 3000)
+            .unwrap();
+        s.commit_received(b"state two", &second, &an_incoming(thread, 2, 2), 3001)
+            .unwrap();
 
-        assert_eq!(s.ratchet_state(thread).unwrap().unwrap(), b"state two");
+        assert_eq!(
+            s.ratchet_state(thread).unwrap().unwrap()[..],
+            b"state two"[..]
+        );
         assert_eq!(s.inbox_position(thread).unwrap().unwrap(), second);
         assert_eq!(s.messages_for_thread(thread).unwrap().len(), 2);
     }
 
     /// The kill-the-app-mid-delivery case, as far as a test can stand in for
-    /// it: if the message cannot be written, the ratchet must not have moved.
+    /// it: if any part of the commit fails, the ratchet must not have moved.
     ///
-    /// Provoked with a message whose thread does not exist, because that fails
-    /// inside the transaction on a foreign key — after `add_message` has been
-    /// called and before the commit, which is exactly where a crash would land.
+    /// Provoked with an inbox position that does not fit its column, because
+    /// that fails in `write_inbox` — *after* the ratchet has been written and
+    /// before the commit, which is the only arrangement where the rollback is
+    /// doing anything at all.
+    ///
+    /// The first version of this used a message against a missing thread. That
+    /// looked like the same test and was not: with the thread taken from the
+    /// message, the failure happens on the first statement, nothing has been
+    /// written, and the assertion holds whether or not there is a transaction.
     #[test]
     fn a_commit_that_fails_leaves_the_ratchet_where_it_was() {
         let (s, _d) = store();
@@ -1883,37 +1902,43 @@ mod tests {
             through: 1,
             ahead: vec![],
         };
-        s.commit_received(
-            thread,
-            b"state one",
-            &before,
-            &an_incoming(thread, 1, 1),
-            3000,
-        )
-        .unwrap();
+        s.commit_received(b"state one", &before, &an_incoming(thread, 1, 1), 3000)
+            .unwrap();
 
-        let doomed = an_incoming(thread + 999, 2, 2);
-        let after = InboxPosition {
-            through: 2,
+        let impossible = InboxPosition {
+            through: u64::MAX,
             ahead: vec![],
         };
         assert!(
-            s.commit_received(thread, b"state two", &after, &doomed, 3001)
+            s.commit_received(b"state two", &impossible, &an_incoming(thread, 2, 2), 3001)
                 .is_err(),
-            "a message against a thread that does not exist was accepted"
+            "an inbox position that cannot be stored was accepted"
         );
 
         assert_eq!(
-            s.ratchet_state(thread).unwrap().unwrap(),
-            b"state one",
+            s.ratchet_state(thread).unwrap().unwrap()[..],
+            b"state one"[..],
             "the ratchet moved for a message that was never stored — its key is \
              spent and the message is gone"
         );
+        assert_eq!(s.inbox_position(thread).unwrap().unwrap(), before);
         assert_eq!(
-            s.inbox_position(thread).unwrap().unwrap(),
-            before,
-            "the inbox moved past a message that was never stored"
+            s.messages_for_thread(thread).unwrap().len(),
+            1,
+            "a message was stored by a commit that failed"
         );
+    }
+
+    /// And a message for a thread that does not exist is refused rather than
+    /// written against a dangling id.
+    #[test]
+    fn a_commit_for_a_thread_that_does_not_exist_is_refused() {
+        let (s, _d) = store();
+        let thread = a_thread(&s);
+        let nowhere = InboxPosition::default();
+        assert!(s
+            .commit_received(b"state", &nowhere, &an_incoming(thread + 999, 1, 1), 3000)
+            .is_err());
     }
 
     /// A duplicate is not a failure: the message is silently not inserted, but
@@ -1929,31 +1954,22 @@ mod tests {
             through: 1,
             ahead: vec![],
         };
-        s.commit_received(
-            thread,
-            b"state one",
-            &first,
-            &an_incoming(thread, 1, 1),
-            3000,
-        )
-        .unwrap();
+        s.commit_received(b"state one", &first, &an_incoming(thread, 1, 1), 3000)
+            .unwrap();
 
         let moved = InboxPosition {
             through: 1,
             ahead: vec![3],
         };
         assert_eq!(
-            s.commit_received(
-                thread,
-                b"state two",
-                &moved,
-                &an_incoming(thread, 1, 1),
-                3001
-            )
-            .unwrap(),
+            s.commit_received(b"state two", &moved, &an_incoming(thread, 1, 1), 3001)
+                .unwrap(),
             InsertOutcome::Duplicate,
         );
-        assert_eq!(s.ratchet_state(thread).unwrap().unwrap(), b"state two");
+        assert_eq!(
+            s.ratchet_state(thread).unwrap().unwrap()[..],
+            b"state two"[..]
+        );
         assert_eq!(s.messages_for_thread(thread).unwrap().len(), 1);
     }
 
@@ -1993,6 +2009,43 @@ mod tests {
             )
             .unwrap();
         assert!(s.inbox_position(thread).is_err());
+    }
+
+    /// Same lesson as the ratchet's skipped-key count and `Inbox::resumed`: a
+    /// length read off disk is an allocation nobody had to attack us to cause.
+    #[test]
+    fn an_inbox_holding_more_than_the_bound_is_refused() {
+        let (s, _d) = store();
+        let thread = a_thread(&s);
+        let packed = |count: usize| {
+            (0..count)
+                .flat_map(|i| (i as u64).to_be_bytes())
+                .collect::<Vec<u8>>()
+        };
+
+        s.conn
+            .execute(
+                "INSERT INTO inboxes (thread_id, through, ahead) VALUES (?1, 0, ?2)",
+                params![thread, packed(MAX_AHEAD as usize + 1)],
+            )
+            .unwrap();
+        assert!(
+            s.inbox_position(thread).is_err(),
+            "an inbox over the bound was read back at face value"
+        );
+
+        // And exactly the bound is fine, so what is refused is the bound and
+        // not the shape of the thing.
+        s.conn
+            .execute(
+                "UPDATE inboxes SET ahead = ?2 WHERE thread_id = ?1",
+                params![thread, packed(MAX_AHEAD as usize)],
+            )
+            .unwrap();
+        assert_eq!(
+            s.inbox_position(thread).unwrap().unwrap().ahead.len(),
+            MAX_AHEAD as usize
+        );
     }
 
     #[test]
