@@ -5,6 +5,9 @@
 //! keeping the store deterministic and unit-testable.
 
 use rusqlite::{params, OptionalExtension};
+use zeroize::Zeroizing;
+
+use crate::session::chat::MAX_AHEAD;
 
 use super::{Store, StoreError};
 
@@ -186,6 +189,19 @@ pub struct NewMessage {
     pub direction: Direction,
     pub state: MessageState,
     pub created_at: i64,
+}
+
+/// How far a thread's incoming stream has got: the contiguous run, and the
+/// messages past it that have arrived out of order.
+///
+/// The store's shape of `session::chat::Inbox`, kept as a plain pair of numbers
+/// rather than the type itself so the store does not have to know what an inbox
+/// means — only what it is made of. The session layer holds the rules; this
+/// holds the two values they operate on.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct InboxPosition {
+    pub through: u64,
+    pub ahead: Vec<u64>,
 }
 
 /// Outcome of inserting a message: either it was stored, or its `msg_id` was
@@ -730,6 +746,171 @@ impl Store {
             })
         })
         .collect()
+    }
+
+    // ── thread receive state (T12) ──────────────────────────────────────────
+
+    /// Write a thread's ratchet state and inbox position, and the message that
+    /// moved them, as one fact.
+    ///
+    /// This is the transaction T12 calls the correctness heart of Chat, and the
+    /// reason is that the three halves fail in different directions:
+    ///
+    /// - **Ratchet saved, message not.** The message is gone for good. Its key
+    ///   was consumed by the decryption that produced it and the chain has
+    ///   moved past; nothing can make that key again. A person watched a
+    ///   message arrive and it is not there.
+    /// - **Message saved, ratchet not.** On restart the ratchet is behind what
+    ///   the conversation actually is. The peer's next message still opens —
+    ///   the skip logic sees to that — so nothing reports an error, and the
+    ///   thread quietly drifts.
+    /// - **Either saved, inbox not.** The gap the screen was showing is either
+    ///   forgotten or re-opened, so a message that arrived reads as missing or
+    ///   a missing one reads as arrived.
+    ///
+    /// None of the three announces itself. That is what makes one transaction
+    /// the requirement rather than the tidy option.
+    ///
+    /// Returns whether the message was new, so a caller can tell a delivery
+    /// from a duplicate that cost nothing.
+    pub fn commit_received(
+        &self,
+        ratchet: &[u8],
+        inbox: &InboxPosition,
+        message: &NewMessage,
+        now: i64,
+    ) -> Result<InsertOutcome, StoreError> {
+        // Which thread this is comes from the message and nowhere else.
+        // Review asked for a check that a separately-passed `thread_id`
+        // matched; taking the parameter away is the same guarantee without a
+        // check that can be forgotten, and there was never a caller that wanted
+        // to write one thread's state alongside another thread's message.
+        let thread_id = message.thread_id;
+        let tx = self.conn.unchecked_transaction()?;
+        // State first, message last, and the order is the test's: written the
+        // other way round, a message that fails its insert leaves nothing to
+        // roll back, and `a_commit_that_fails_leaves_the_ratchet_where_it_was`
+        // passes whether or not there is a transaction at all. That is the
+        // shape of test this project keeps catching — one that asserts a
+        // property the code happens not to be exercising.
+        self.write_ratchet(thread_id, ratchet, now)?;
+        self.write_inbox(thread_id, inbox)?;
+        let outcome = self.add_message(message)?;
+        tx.commit()?;
+        Ok(outcome)
+    }
+
+    /// Save a thread's ratchet on its own — the pairing case, where there is a
+    /// ratchet before there is any message to go with it.
+    ///
+    /// Everything after that first save goes through [`Store::commit_received`]
+    /// instead. A bare save mid-conversation would be a ratchet moving without
+    /// the message that moved it, which is the second failure listed there.
+    pub fn start_ratchet(
+        &self,
+        thread_id: i64,
+        ratchet: &[u8],
+        now: i64,
+    ) -> Result<(), StoreError> {
+        self.write_ratchet(thread_id, ratchet, now)
+    }
+
+    fn write_ratchet(&self, thread_id: i64, state: &[u8], now: i64) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO ratchets (thread_id, state, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(thread_id) DO UPDATE SET state = ?2, updated_at = ?3",
+            params![thread_id, state, now],
+        )?;
+        Ok(())
+    }
+
+    fn write_inbox(&self, thread_id: i64, inbox: &InboxPosition) -> Result<(), StoreError> {
+        let through = i64::try_from(inbox.through).map_err(|_| {
+            StoreError::Db(format!(
+                "inbox position {} does not fit the column",
+                inbox.through
+            ))
+        })?;
+        // The same bound the read applies, on the way in as well.
+        //
+        // Asymmetric validation is worse than none: a write that accepts what
+        // the read refuses stores state that cannot be loaded again, so the
+        // thread opens once and never afterwards, and the damage is already on
+        // disk by the time anything notices. Refused here, the commit rolls
+        // back and the conversation carries on from where it was.
+        if inbox.ahead.len() > MAX_AHEAD as usize {
+            return Err(StoreError::Db(format!(
+                "inbox holds {} out-of-order seqs, over the {MAX_AHEAD} bound",
+                inbox.ahead.len()
+            )));
+        }
+        let mut ahead = Vec::with_capacity(inbox.ahead.len() * 8);
+        for seq in &inbox.ahead {
+            ahead.extend_from_slice(&seq.to_be_bytes());
+        }
+        self.conn.execute(
+            "INSERT INTO inboxes (thread_id, through, ahead) VALUES (?1, ?2, ?3)
+             ON CONFLICT(thread_id) DO UPDATE SET through = ?2, ahead = ?3",
+            params![thread_id, through, ahead],
+        )?;
+        Ok(())
+    }
+
+    /// A thread's stored ratchet state, or `None` if it has never had one.
+    ///
+    /// `Zeroizing`, as `FileStore::get` is and for the same reason: this is the
+    /// root key, both chains, and every key still owed. It came out of the
+    /// database as a plain `Vec` and that copy is unavoidable, but the one the
+    /// caller holds wipes when it goes.
+    pub fn ratchet_state(&self, thread_id: i64) -> Result<Option<Zeroizing<Vec<u8>>>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT state FROM ratchets WHERE thread_id = ?1",
+                params![thread_id],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .map(Zeroizing::new))
+    }
+
+    /// A thread's stored inbox position, or `None` if nothing has arrived yet.
+    pub fn inbox_position(&self, thread_id: i64) -> Result<Option<InboxPosition>, StoreError> {
+        let row: Option<(i64, Vec<u8>)> = self
+            .conn
+            .query_row(
+                "SELECT through, ahead FROM inboxes WHERE thread_id = ?1",
+                params![thread_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((through, packed)) = row else {
+            return Ok(None);
+        };
+        if packed.len() % 8 != 0 {
+            return Err(StoreError::Db(format!(
+                "inbox for thread {thread_id} has {} bytes of ahead, not a whole number of seqs",
+                packed.len()
+            )));
+        }
+        // The session layer's bound, re-applied here rather than restated: a
+        // second constant that had to agree with the first is the kind of pair
+        // that drifts. Bytes on disk have been through builds where it may have
+        // been larger, and a blob taken at face value is an allocation nobody
+        // had to attack us to cause.
+        if packed.len() / 8 > MAX_AHEAD as usize {
+            return Err(StoreError::Db(format!(
+                "inbox for thread {thread_id} holds {} out-of-order seqs, over the {MAX_AHEAD} bound",
+                packed.len() / 8
+            )));
+        }
+        let through = u64::try_from(through)
+            .map_err(|_| StoreError::Db(format!("inbox position {through} is negative")))?;
+        let ahead = packed
+            .chunks_exact(8)
+            .map(|c| u64::from_be_bytes(c.try_into().expect("8 bytes")))
+            .collect();
+        Ok(Some(InboxPosition { through, ahead }))
     }
 
     // ── settings ────────────────────────────────────────────────────────────
@@ -1639,6 +1820,292 @@ mod tests {
         assert!(s.list_blocks().unwrap()[0].revoked_pairing);
         s.unblock(&p).unwrap();
         assert!(!s.is_blocked(&p).unwrap());
+    }
+
+    // ── thread receive state (T12) ──────────────────────────────────────────
+
+    /// A paired thread with nothing received yet.
+    fn a_thread(s: &Store) -> i64 {
+        let id = s.add_contact(&a_contact()).unwrap();
+        s.pair_contact(id, &[9u8; 32], 2000).unwrap()
+    }
+
+    fn an_incoming(thread_id: i64, seq: i64, msg_id: u8) -> NewMessage {
+        NewMessage {
+            thread_id,
+            seq,
+            msg_id: vec![msg_id; 16],
+            body: b"hello".to_vec(),
+            direction: Direction::Incoming,
+            state: MessageState::Delivered,
+            created_at: 3000,
+        }
+    }
+
+    #[test]
+    fn a_thread_starts_with_no_ratchet_and_no_inbox() {
+        let (s, _d) = store();
+        let thread = a_thread(&s);
+        assert_eq!(s.ratchet_state(thread).unwrap(), None);
+        assert_eq!(s.inbox_position(thread).unwrap(), None);
+    }
+
+    #[test]
+    fn a_ratchet_and_an_inbox_round_trip() {
+        let (s, _d) = store();
+        let thread = a_thread(&s);
+        let inbox = InboxPosition {
+            through: 4,
+            ahead: vec![7, 9],
+        };
+        s.commit_received(b"state one", &inbox, &an_incoming(thread, 1, 1), 3000)
+            .unwrap();
+
+        assert_eq!(
+            s.ratchet_state(thread).unwrap().unwrap()[..],
+            b"state one"[..]
+        );
+        assert_eq!(s.inbox_position(thread).unwrap().unwrap(), inbox);
+    }
+
+    /// A ratchet is a moving thing: the second write must replace the first,
+    /// not sit beside it. A second row would be a second conversation.
+    #[test]
+    fn a_second_commit_replaces_the_state_rather_than_adding_one() {
+        let (s, _d) = store();
+        let thread = a_thread(&s);
+        let first = InboxPosition {
+            through: 1,
+            ahead: vec![],
+        };
+        let second = InboxPosition {
+            through: 2,
+            ahead: vec![5],
+        };
+        s.commit_received(b"state one", &first, &an_incoming(thread, 1, 1), 3000)
+            .unwrap();
+        s.commit_received(b"state two", &second, &an_incoming(thread, 2, 2), 3001)
+            .unwrap();
+
+        assert_eq!(
+            s.ratchet_state(thread).unwrap().unwrap()[..],
+            b"state two"[..]
+        );
+        assert_eq!(s.inbox_position(thread).unwrap().unwrap(), second);
+        assert_eq!(s.messages_for_thread(thread).unwrap().len(), 2);
+    }
+
+    /// The kill-the-app-mid-delivery case, as far as a test can stand in for
+    /// it: if any part of the commit fails, the ratchet must not have moved.
+    ///
+    /// Provoked with an inbox position that does not fit its column, because
+    /// that fails in `write_inbox` — *after* the ratchet has been written and
+    /// before the commit, which is the only arrangement where the rollback is
+    /// doing anything at all.
+    ///
+    /// The first version of this used a message against a missing thread. That
+    /// looked like the same test and was not: with the thread taken from the
+    /// message, the failure happens on the first statement, nothing has been
+    /// written, and the assertion holds whether or not there is a transaction.
+    #[test]
+    fn a_commit_that_fails_leaves_the_ratchet_where_it_was() {
+        let (s, _d) = store();
+        let thread = a_thread(&s);
+        let before = InboxPosition {
+            through: 1,
+            ahead: vec![],
+        };
+        s.commit_received(b"state one", &before, &an_incoming(thread, 1, 1), 3000)
+            .unwrap();
+
+        let impossible = InboxPosition {
+            through: u64::MAX,
+            ahead: vec![],
+        };
+        assert!(
+            s.commit_received(b"state two", &impossible, &an_incoming(thread, 2, 2), 3001)
+                .is_err(),
+            "an inbox position that cannot be stored was accepted"
+        );
+
+        assert_eq!(
+            s.ratchet_state(thread).unwrap().unwrap()[..],
+            b"state one"[..],
+            "the ratchet moved for a message that was never stored — its key is \
+             spent and the message is gone"
+        );
+        assert_eq!(s.inbox_position(thread).unwrap().unwrap(), before);
+        assert_eq!(
+            s.messages_for_thread(thread).unwrap().len(),
+            1,
+            "a message was stored by a commit that failed"
+        );
+    }
+
+    /// And a message for a thread that does not exist is refused rather than
+    /// written against a dangling id.
+    #[test]
+    fn a_commit_for_a_thread_that_does_not_exist_is_refused() {
+        let (s, _d) = store();
+        let thread = a_thread(&s);
+        let nowhere = InboxPosition::default();
+        assert!(s
+            .commit_received(b"state", &nowhere, &an_incoming(thread + 999, 1, 1), 3000)
+            .is_err());
+    }
+
+    /// A duplicate is not a failure: the message is silently not inserted, but
+    /// the ratchet genuinely did move to open it, so that has to be saved.
+    ///
+    /// Getting this backwards would roll back a real advance and leave the
+    /// ratchet behind the conversation.
+    #[test]
+    fn a_duplicate_message_still_saves_the_ratchet_that_opened_it() {
+        let (s, _d) = store();
+        let thread = a_thread(&s);
+        let first = InboxPosition {
+            through: 1,
+            ahead: vec![],
+        };
+        s.commit_received(b"state one", &first, &an_incoming(thread, 1, 1), 3000)
+            .unwrap();
+
+        let moved = InboxPosition {
+            through: 1,
+            ahead: vec![3],
+        };
+        assert_eq!(
+            s.commit_received(b"state two", &moved, &an_incoming(thread, 1, 1), 3001)
+                .unwrap(),
+            InsertOutcome::Duplicate,
+        );
+        assert_eq!(
+            s.ratchet_state(thread).unwrap().unwrap()[..],
+            b"state two"[..]
+        );
+        assert_eq!(s.messages_for_thread(thread).unwrap().len(), 1);
+    }
+
+    /// Under R0-F9 a deleted thread must not leave key material behind: the
+    /// root and every kept message key live in that blob.
+    #[test]
+    fn deleting_a_contact_takes_the_ratchet_with_it() {
+        let (s, _d) = store();
+        let contact = s.add_contact(&a_contact()).unwrap();
+        let thread = s.pair_contact(contact, &[9u8; 32], 2000).unwrap();
+        s.start_ratchet(thread, b"state one", 3000).unwrap();
+
+        // Straight to SQL, as the messages cascade test next door does: there
+        // is no public delete, and the property under test is the schema's, not
+        // an API's.
+        s.conn
+            .execute("DELETE FROM contacts WHERE id = ?1", params![contact])
+            .unwrap();
+        assert_eq!(
+            s.ratchet_state(thread).unwrap(),
+            None,
+            "a deleted conversation left its keys in the database"
+        );
+        assert_eq!(s.inbox_position(thread).unwrap(), None);
+    }
+
+    /// Corruption in the packed `ahead` column is reported rather than read as
+    /// whatever happens to be there.
+    #[test]
+    fn an_inbox_that_is_not_a_whole_number_of_seqs_is_refused() {
+        let (s, _d) = store();
+        let thread = a_thread(&s);
+        s.conn
+            .execute(
+                "INSERT INTO inboxes (thread_id, through, ahead) VALUES (?1, 1, ?2)",
+                params![thread, vec![0u8; 12]],
+            )
+            .unwrap();
+        assert!(s.inbox_position(thread).is_err());
+    }
+
+    /// Same lesson as the ratchet's skipped-key count and `Inbox::resumed`: a
+    /// length read off disk is an allocation nobody had to attack us to cause.
+    #[test]
+    fn an_inbox_holding_more_than_the_bound_is_refused() {
+        let (s, _d) = store();
+        let thread = a_thread(&s);
+        let packed = |count: usize| {
+            (0..count)
+                .flat_map(|i| (i as u64).to_be_bytes())
+                .collect::<Vec<u8>>()
+        };
+
+        s.conn
+            .execute(
+                "INSERT INTO inboxes (thread_id, through, ahead) VALUES (?1, 0, ?2)",
+                params![thread, packed(MAX_AHEAD as usize + 1)],
+            )
+            .unwrap();
+        assert!(
+            s.inbox_position(thread).is_err(),
+            "an inbox over the bound was read back at face value"
+        );
+
+        // And exactly the bound is fine, so what is refused is the bound and
+        // not the shape of the thing.
+        s.conn
+            .execute(
+                "UPDATE inboxes SET ahead = ?2 WHERE thread_id = ?1",
+                params![thread, packed(MAX_AHEAD as usize)],
+            )
+            .unwrap();
+        assert_eq!(
+            s.inbox_position(thread).unwrap().unwrap().ahead.len(),
+            MAX_AHEAD as usize
+        );
+    }
+
+    /// A write that accepts what the read refuses is state that can be stored
+    /// and never loaded — the thread opens once and never again.
+    #[test]
+    fn an_inbox_over_the_bound_is_refused_on_the_way_in_too() {
+        let (s, _d) = store();
+        let thread = a_thread(&s);
+        let good = InboxPosition {
+            through: 1,
+            ahead: vec![],
+        };
+        s.commit_received(b"state one", &good, &an_incoming(thread, 1, 1), 3000)
+            .unwrap();
+
+        let too_many = InboxPosition {
+            through: 1,
+            ahead: (2..=MAX_AHEAD + 2).collect(),
+        };
+        assert!(
+            s.commit_received(b"state two", &too_many, &an_incoming(thread, 2, 2), 3001)
+                .is_err(),
+            "an inbox the read side would refuse was written anyway"
+        );
+        // And the refusal rolls the whole commit back, rather than leaving the
+        // ratchet ahead of a thread whose inbox never moved.
+        assert_eq!(
+            s.ratchet_state(thread).unwrap().unwrap()[..],
+            b"state one"[..]
+        );
+        assert_eq!(s.inbox_position(thread).unwrap().unwrap(), good);
+
+        // Exactly the bound goes through, so what is refused is the bound and
+        // not the shape of the thing — and so an off-by-one here shows up as a
+        // conversation that cannot hold the gaps it is allowed to.
+        let at_the_bound = InboxPosition {
+            through: 1,
+            ahead: (2..MAX_AHEAD + 2).collect(),
+        };
+        s.commit_received(
+            b"state two",
+            &at_the_bound,
+            &an_incoming(thread, 2, 2),
+            3002,
+        )
+        .unwrap();
+        assert_eq!(s.inbox_position(thread).unwrap().unwrap(), at_the_bound);
     }
 
     #[test]
