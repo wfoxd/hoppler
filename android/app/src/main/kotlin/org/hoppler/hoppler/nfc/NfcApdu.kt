@@ -97,12 +97,21 @@ object NfcApdu {
     /**
      * Cut one response out of [payload] starting at [offset].
      *
-     * Chunked rather than sent whole, and not as a precaution: an invite is
-     * about 160 bytes today, but its rung hint is bounded at 64 and a full one
-     * pushes it past what a short-form response can carry. A payload that
-     * silently lost its tail would arrive as a code that simply does not parse,
-     * on the one screen where nobody can see why — so the length is handled
-     * rather than assumed to fit.
+     * Chunked, and **the chunking is not exercised today**. That was worth
+     * measuring rather than asserting: an invite is 126 bytes with no rung
+     * hint and 231 with the longest one [MAX_BODY] allows, so every invite
+     * this build can produce fits in one response. An earlier version of this
+     * comment claimed a full hint pushed past the limit. It does not.
+     *
+     * Kept anyway, because the failure it prevents is the expensive kind: a
+     * payload that silently lost its tail arrives as a code that does not
+     * parse, on the one screen where nobody can see why. The invite is a wire
+     * format that can grow, and the day it does this is either already right
+     * or a bug nobody will look for.
+     *
+     * The measurement is pinned by `an_invite_fits_one_nfc_response` in
+     * `rust/src/pairing/invite.rs` — on the Rust side, because that is where
+     * the length is decided.
      *
      * More to come is signalled with `61 XX`, ISO 7816's "XX bytes still
      * waiting", which is what makes the reader ask again with GET RESPONSE.

@@ -163,6 +163,11 @@ class NfcAdapter(private val activity: Activity) :
                 report(EVENT_UNREADABLE, "no code to read on that phone")
                 return
             }
+            // Content-free, and the only evidence anywhere that a code
+            // arrived by tap rather than by camera: both routes hand the same
+            // text to the same handler, so without this a hardware run cannot
+            // tell which door it came through.
+            Log.i(TAG, "read a pairing code from a tap (${code.length} chars)")
             report(EVENT_CODE_READ, code)
         } catch (e: Exception) {
             // Moving a phone away mid-exchange lands here, and it is the normal

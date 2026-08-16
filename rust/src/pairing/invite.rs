@@ -308,6 +308,42 @@ mod tests {
         )
     }
 
+    /// What the NFC tap can carry in one exchange, pinned here because this is
+    /// where the length is decided.
+    ///
+    /// `NfcApdu.MAX_BODY` is 253 bytes: a payload longer than that has to be
+    /// fetched in pieces with GET RESPONSE. The Kotlin side used to say a
+    /// maximum-length rung hint pushed an invite past that. It does not — the
+    /// longest invite this build can make is well inside one response — and the
+    /// comment stood for a fortnight saying otherwise, which is why the number
+    /// is a test now rather than a sentence.
+    ///
+    /// If this ever fails, nothing is broken: the chunking exists and is tested
+    /// on the JVM. What has changed is that it starts being *used*, and the
+    /// hardware path that has never run in anger becomes the ordinary one. That
+    /// is worth knowing on the day it happens rather than from a bug report.
+    #[test]
+    fn an_invite_fits_one_nfc_response() {
+        const MAX_NFC_BODY: usize = 253;
+        let longest = Invite::from_parts(
+            sign::PublicKey([7u8; sign::PUBLIC_KEY_LEN]),
+            "b".repeat(MAX_BLE_HINT_LEN),
+            [9u8; CEREMONY_NONCE_LEN],
+        );
+        assert_eq!(
+            longest.ble_hint.len(),
+            MAX_BLE_HINT_LEN,
+            "the hint was trimmed"
+        );
+        assert!(
+            longest.to_uri().len() <= MAX_NFC_BODY,
+            "the longest invite is now {} bytes, past the {MAX_NFC_BODY} an NFC \
+             response carries — a tap will start using the chunking path, which \
+             no hardware run has ever exercised",
+            longest.to_uri().len()
+        );
+    }
+
     #[test]
     fn round_trips() {
         let invite = an_invite();

@@ -2,6 +2,7 @@ package org.hoppler.hoppler.nfc
 
 import android.nfc.cardemulation.HostApduService
 import android.os.Bundle
+import android.util.Log
 
 /**
  * The card half of a pairing tap: this phone answers a reader with the code it
@@ -25,6 +26,10 @@ import android.os.Bundle
  */
 class HopplerApduService : HostApduService() {
 
+    companion object {
+        private const val TAG = "HopplerNfc"
+    }
+
     /** How far through [payload] the current exchange has got. */
     private var offset = 0
     private var payload: ByteArray? = null
@@ -40,9 +45,18 @@ class HopplerApduService : HostApduService() {
             // broken tap rather than a race.
             val current = NfcAdapter.shared.get()
             if (current == null || current.isEmpty()) {
+                // Said out loud because the alternative is a silent run. This
+                // phone is the only place that knows a reader arrived at all,
+                // and "nothing happened" and "a reader asked and we had
+                // nothing" are the same on the other screen.
+                Log.i(TAG, "a reader asked for a code and there is none on screen")
                 payload = null
                 return NfcApdu.NOTHING_TO_SHARE
             }
+            // Length only, never the code. An invite carries a Layer-2 key and
+            // the rung id this device advertises under, and a log line pairing
+            // those outlives the twelve minutes R0-F2 spends separating them.
+            Log.i(TAG, "serving a pairing code to a reader (${current.size} bytes)")
             payload = current
             offset = 0
             val response = NfcApdu.respond(current, 0)
