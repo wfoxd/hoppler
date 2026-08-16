@@ -167,7 +167,13 @@ class NfcAdapter(private val activity: Activity) :
             // arrived by tap rather than by camera: both routes hand the same
             // text to the same handler, so without this a hardware run cannot
             // tell which door it came through.
-            Log.i(TAG, "read a pairing code from a tap (${code.length} chars)")
+            //
+            // Bytes, not characters, so this number is the same one the card
+            // side logs when it serves the code. That the two agree is the
+            // only evidence a payload arrived whole — and `code.length` would
+            // silently stop agreeing the day an invite carries anything
+            // outside ASCII.
+            Log.i(TAG, "read a pairing code from a tap (${gathered.size} bytes)")
             report(EVENT_CODE_READ, code)
         } catch (e: Exception) {
             // Moving a phone away mid-exchange lands here, and it is the normal

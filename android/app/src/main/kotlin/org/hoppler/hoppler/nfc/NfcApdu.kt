@@ -99,9 +99,10 @@ object NfcApdu {
      *
      * Chunked, and **the chunking is not exercised today**. That was worth
      * measuring rather than asserting: an invite is 126 bytes with no rung
-     * hint and 231 with the longest one [MAX_BODY] allows, so every invite
-     * this build can produce fits in one response. An earlier version of this
-     * comment claimed a full hint pushed past the limit. It does not.
+     * hint and 231 with the longest hint the core allows (64 bytes,
+     * `MAX_BLE_HINT_LEN`), against the [MAX_BODY] of 253 one response carries.
+     * So every invite this build can produce fits in one. An earlier version
+     * of this comment claimed a full hint pushed past the limit. It does not.
      *
      * Kept anyway, because the failure it prevents is the expensive kind: a
      * payload that silently lost its tail arrives as a code that does not
