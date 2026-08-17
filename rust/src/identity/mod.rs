@@ -37,6 +37,7 @@
 //!   malicious low-order peer point; `DhSecret` deliberately has no byte export,
 //!   so §5 hand-rolls Noise on `crypto::dh` (consistent with crypto confinement).
 
+pub mod filekeystore;
 pub mod keystore;
 
 use prost::Message;
