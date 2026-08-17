@@ -312,6 +312,14 @@ fn a_corrupt_persona_is_ignored_rather_than_used() {
             v.extend_from_slice(&[b'x'; MAX_PERSONA_NAME_LEN + 1]);
             v
         }),
+        // Refused on length before a byte of it is examined, so a corrupt row
+        // cannot choose how much work startup does.
+        ("enormous", {
+            let mut v = 1u32.to_be_bytes().to_vec();
+            v.extend_from_slice(&1u32.to_be_bytes());
+            v.extend_from_slice(&vec![b'x'; 4 * 1024 * 1024]);
+            v
+        }),
         ("name is not text", {
             let mut v = 1u32.to_be_bytes().to_vec();
             v.extend_from_slice(&1u32.to_be_bytes());

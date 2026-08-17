@@ -1218,8 +1218,18 @@ fn stored_persona(store: &Store) -> Result<Option<Persona>, String> {
         log::warn!("stored persona ignored, falling back to the default: {why}");
         Ok(None)
     };
+    // Length before anything else, the same order `envelope::decode` and
+    // `verify_persona_record` use. Validating UTF-8 first would walk whatever
+    // the row happens to contain before deciding it was too long to keep —
+    // work a corrupt row gets to choose the size of, on the startup path.
     if bytes.len() < 8 {
         return refuse(&format!("{} bytes, too short to read", bytes.len()));
+    }
+    if bytes.len() > 8 + MAX_PERSONA_NAME_LEN {
+        return refuse(&format!(
+            "{} bytes, longer than a persona can be",
+            bytes.len()
+        ));
     }
     let version = u32::from_be_bytes(bytes[..4].try_into().expect("4 bytes"));
     let colour = u32::from_be_bytes(bytes[4..8].try_into().expect("4 bytes"));
@@ -1231,9 +1241,6 @@ fn stored_persona(store: &Store) -> Result<Option<Persona>, String> {
     }
     if colour & !COLOUR_MASK != 0 {
         return refuse(&format!("colour {colour:#010x} is not 24-bit"));
-    }
-    if name.len() > MAX_PERSONA_NAME_LEN {
-        return refuse(&format!("name is {} bytes, over the bound", name.len()));
     }
     Ok(Some(Persona {
         version,

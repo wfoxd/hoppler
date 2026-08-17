@@ -269,6 +269,18 @@ impl Identity {
             <[u8; sign::SEED_LEN]>::try_from(&layer1[..]),
             <[u8; sign::SEED_LEN]>::try_from(&layer2[..]),
         ) else {
+            // Coarse to the caller, specific in the log. This becomes a fatal
+            // startup error, and "keystore backend error" alone cannot tell a
+            // seed written by an older format from a disk that stopped
+            // answering — which are the same sentence and completely different
+            // afternoons. Lengths only; a seed never appears in a log.
+            log::warn!(
+                "sealed seeds are {} and {} bytes, not {}: this is not state \
+                 this build wrote",
+                layer1.len(),
+                layer2.len(),
+                sign::SEED_LEN
+            );
             return Err(KeystoreError::Backend);
         };
         Ok(Some(Self::from_parts(&one, &two, persona)))
