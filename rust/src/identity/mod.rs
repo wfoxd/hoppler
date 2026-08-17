@@ -46,6 +46,8 @@ use zeroize::Zeroizing;
 use crate::crypto::{dh, kdf, sign};
 use crate::proto::v0::{PersonaBody, SignedPersona};
 
+use self::keystore::{Keystore, KeystoreError};
+
 /// Domain-separation label for the pseudonym KDF. Versioned: changing it is a
 /// wire-protocol break, so it is frozen for compatible builds.
 const PSEUDONYM_LABEL: &[u8] = b"hoppler/pseudonym/v1";
@@ -198,6 +200,72 @@ impl Identity {
             layer2: sign::SigningKeyPair::generate(),
             persona: normalise_persona(name, colour, 1),
         }
+    }
+
+    /// Keystore labels for the two seeds.
+    ///
+    /// Versioned like every other label here, so a future change of what a seed
+    /// *is* cannot be read back as the old thing.
+    pub const LAYER1_LABEL: &str = "hoppler/layer1-seed/v1";
+    pub const LAYER2_LABEL: &str = "hoppler/layer2-seed/v1";
+
+    /// Seal both seeds so this identity survives the process.
+    ///
+    /// The only path secret material takes out of this type, and it goes
+    /// straight into the keystore without passing through a caller — which is
+    /// the same reason [`Identity::update_persona`] exists rather than a
+    /// setter that round-trips Layer-1 material. There is deliberately no
+    /// public seed accessor to build this out of.
+    ///
+    /// # Not atomic, and what that costs
+    ///
+    /// Two labels, two writes, no transaction across them. A crash between
+    /// leaves one seed sealed and the other absent, which [`Identity::unsealed`]
+    /// treats as no identity at all rather than as half of one. That is safe
+    /// because the order is seal-then-use: an identity whose sealing did not
+    /// finish was never handed to anything, so nothing was signed with it and
+    /// nothing paired against it. Regenerating loses nothing that existed.
+    pub fn seal_seeds(&self, keystore: &dyn Keystore) -> Result<(), KeystoreError> {
+        keystore.seal(Self::LAYER1_LABEL, &self.layer1.to_seed()[..])?;
+        keystore.seal(Self::LAYER2_LABEL, &self.layer2.to_seed()[..])?;
+        Ok(())
+    }
+
+    /// Rebuild the identity this device sealed, or `None` if it has never
+    /// sealed one.
+    ///
+    /// `None` is what "first launch" means, and it is the only definition of it
+    /// — a flag stored beside the seeds could disagree with them, and the seeds
+    /// are the thing that actually matters.
+    ///
+    /// A seed of the wrong length is refused rather than padded: it is not a
+    /// seed this build wrote, and guessing at it would produce a *different*
+    /// identity that looked like a working one, which is the failure mode with
+    /// no symptom.
+    pub fn unsealed(
+        keystore: &dyn Keystore,
+        persona: Persona,
+    ) -> Result<Option<Self>, KeystoreError> {
+        let (layer1, layer2) = match (
+            keystore.unseal(Self::LAYER1_LABEL),
+            keystore.unseal(Self::LAYER2_LABEL),
+        ) {
+            (Ok(one), Ok(two)) => (one, two),
+            // Either absent is no identity. Both absent is a first launch; one
+            // absent is a sealing that died partway, and the argument above
+            // says the half-sealed identity was never used.
+            (Err(KeystoreError::NotFound), _) | (_, Err(KeystoreError::NotFound)) => {
+                return Ok(None)
+            }
+            (Err(e), _) | (_, Err(e)) => return Err(e),
+        };
+        let (Ok(one), Ok(two)) = (
+            <[u8; sign::SEED_LEN]>::try_from(&layer1[..]),
+            <[u8; sign::SEED_LEN]>::try_from(&layer2[..]),
+        ) else {
+            return Err(KeystoreError::Backend);
+        };
+        Ok(Some(Self::from_parts(&one, &two, persona)))
     }
 
     /// Reconstruct from seeds unsealed from the keystore plus the stored persona.

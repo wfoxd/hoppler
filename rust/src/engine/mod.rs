@@ -39,6 +39,7 @@ use crate::api::types::{
 use crate::crypto::rng;
 use crate::frb_generated::StreamSink;
 use crate::identity::filekeystore::FileKeystore;
+use crate::identity::keystore::Keystore;
 use crate::identity::{Identity, Persona, VerifiedPersona};
 use crate::pairing::invite::Invite;
 use crate::store::{
@@ -103,7 +104,7 @@ pub fn init(support_dir: String) -> Result<PersonaDto, String> {
 
 /// Initialise on a chosen rung.
 pub fn init_on(support_dir: String, radio: Radio) -> Result<PersonaDto, String> {
-    let store = open_store(support_dir)?;
+    let (store, keystore) = open_store(support_dir)?;
     let (tx, rx) = std::sync::mpsc::channel();
     let sink: crate::transport::EventSink = Box::new(move |e| {
         let _ = tx.send(e);
@@ -136,7 +137,7 @@ pub fn init_on(support_dir: String, radio: Radio) -> Result<PersonaDto, String> 
         "core starting on the {radio:?} rung (transport built: {})",
         transport.is_some()
     );
-    install(store, transport, &local_id, rx)
+    install(store, keystore, transport, &local_id, rx)
 }
 
 /// Initialise against a caller-supplied transport.
@@ -151,8 +152,8 @@ pub fn init_with_transport(
     local_id: &str,
     events: std::sync::mpsc::Receiver<crate::transport::TransportEvent>,
 ) -> Result<PersonaDto, String> {
-    let store = open_store(support_dir)?;
-    install(store, Some(transport), local_id, events)
+    let (store, keystore) = open_store(support_dir)?;
+    install(store, keystore, Some(transport), local_id, events)
 }
 
 /// Whether the engine holds a session with `device_id`.
@@ -184,10 +185,18 @@ pub fn has_session(device_id: &str) -> bool {
 /// test did. `pub` with a note, following the precedent in this crate, because
 /// `#[cfg(test)]` items are invisible to `tests/`.
 pub fn open_store_for_test(support_dir: String) -> Result<Store, String> {
-    open_store(support_dir)
+    open_store(support_dir).map(|(store, _)| store)
 }
 
-fn open_store(support_dir: String) -> Result<Store, String> {
+/// Open the store, and hand back the keystore that keyed it.
+///
+/// Returned rather than rebuilt by the caller because there must be exactly one
+/// view of what this device has sealed: a second `FileKeystore` over the same
+/// directory would work, and would be a second place for the answer to "is this
+/// a first launch" to come from.
+type Opened = (Store, Arc<FileKeystore>);
+
+fn open_store(support_dir: String) -> Result<Opened, String> {
     let dir = PathBuf::from(support_dir);
     let db = dir.join("hoppler.db");
     let files = dir.join("files");
@@ -208,13 +217,15 @@ fn open_store(support_dir: String) -> Result<Store, String> {
     // path that may destroy data.
     let had_master = Store::master_is_sealed(keystore.as_ref());
     match Store::open(keystore.clone(), &db, &files) {
-        Ok(s) => Ok(s),
+        Ok(s) => Ok((s, keystore)),
         Err(_) if !had_master && db.exists() => {
             reset_stale_db(&db)?;
             // The file store is keyed by the same (now absent) master, so its
             // ciphertext is likewise unrecoverable — clear it too.
             let _ = std::fs::remove_dir_all(&files);
-            Store::open(keystore, &db, &files).map_err(stringify)
+            Store::open(keystore.clone(), &db, &files)
+                .map(|s| (s, keystore))
+                .map_err(stringify)
         }
         Err(e) => Err(stringify(e)),
     }
@@ -222,11 +233,12 @@ fn open_store(support_dir: String) -> Result<Store, String> {
 
 fn install(
     store: Store,
+    keystore: Arc<FileKeystore>,
     transport: Option<Arc<dyn crate::transport::Transport>>,
     local_id: &str,
     events: std::sync::mpsc::Receiver<crate::transport::TransportEvent>,
 ) -> Result<PersonaDto, String> {
-    let identity = Arc::new(Mutex::new(Identity::generate("Me", 0x0044_88ff)));
+    let identity = Arc::new(Mutex::new(load_identity(&store, keystore.as_ref())?));
     let dto = persona_dto(identity.lock().unwrap_or_else(|e| e.into_inner()).persona());
 
     let net = transport.map(|t| {
@@ -332,6 +344,12 @@ pub fn update_persona(name: String, colour: u32) -> Result<PersonaDto, String> {
     with_core_mut(|core| {
         let mut identity = core.identity.lock().unwrap_or_else(|e| e.into_inner());
         identity.update_persona(name, colour);
+        // Written before the caller is told it worked. A rename that lived only
+        // in memory would be the old bug in miniature: the screen says the new
+        // name, every peer is told the new name, and the next launch is back to
+        // the old one with nothing to explain it.
+        core.store
+            .settings_set(PERSONA_KEY, &encode_persona(identity.persona()))?;
         Ok(persona_dto(identity.persona()))
     })
 }
@@ -1093,6 +1111,110 @@ fn stringify(e: StoreError) -> String {
 /// was *ever* sealed, so this ran on every launch and threw away a database it
 /// could have opened. It is loud now, because a line that deletes everything
 /// should say so on the one occasion it is correct to.
+/// Where the persona lives between launches.
+const PERSONA_KEY: &str = "identity/persona/v1";
+
+/// What a device is called before anyone has said otherwise.
+///
+/// A placeholder, and it has been shipping as the real thing: R0-F1 says the
+/// person chooses a name, no step ever asks, so every install is called "Me"
+/// and the pairing screen reads "Pairing with Me" — on the one screen whose job
+/// is saying who is at the other end. The first-launch step is what retires
+/// this; until then it is at least persisted rather than reinvented hourly.
+const DEFAULT_NAME: &str = "Me";
+const DEFAULT_COLOUR: u32 = 0x0044_88ff;
+
+/// The identity this device sealed, or a fresh one on first launch.
+///
+/// # Why failing to seal is fatal
+///
+/// A device that cannot persist its identity is a device that is a different
+/// person every launch — which is exactly the bug this replaces, and it is
+/// invisible from the inside: pairing works, chat works, and then everything
+/// silently belongs to somebody who no longer exists. Refusing to start says
+/// so once, loudly, instead.
+fn load_identity(store: &Store, keystore: &dyn Keystore) -> Result<Identity, String> {
+    // A persona that failed to store is not a reason to throw away keys, so the
+    // default stands in and only the name is lost.
+    let persona = stored_persona(store)?.unwrap_or(Persona {
+        name: DEFAULT_NAME.to_string(),
+        colour: DEFAULT_COLOUR,
+        version: 1,
+    });
+
+    if let Some(identity) =
+        Identity::unsealed(keystore, persona.clone()).map_err(|e| e.to_string())?
+    {
+        return Ok(identity);
+    }
+
+    let identity = Identity::generate(persona.name, persona.colour);
+    identity.seal_seeds(keystore).map_err(|e| {
+        format!(
+            "this device cannot store its identity, so it would be a new person every launch: {e}"
+        )
+    })?;
+    store_persona(store, identity.persona())?;
+    log::info!("first launch: a new identity was generated and sealed");
+    Ok(identity)
+}
+
+/// `[version:4][colour:4][name]`, big-endian.
+///
+/// Hand-rolled and local-only, like the ratchet's stored state and for the same
+/// reason: a `.proto` would generate Dart types for something the UI has no
+/// business reading. Not signed either — this sits inside the SQLCipher
+/// database, which authenticates it already, and a second signature would need
+/// the key it is stored alongside.
+fn encode_persona(persona: &Persona) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + persona.name.len());
+    out.extend_from_slice(&persona.version.to_be_bytes());
+    out.extend_from_slice(&persona.colour.to_be_bytes());
+    out.extend_from_slice(persona.name.as_bytes());
+    out
+}
+
+/// For the persistence tests; see [`open_store_for_test`].
+pub fn store_persona_for_test(store: &Store, persona: &Persona) -> Result<(), String> {
+    store_persona(store, persona)
+}
+
+/// For the persistence tests; see [`open_store_for_test`].
+pub fn stored_persona_for_test(store: &Store) -> Result<Option<Persona>, String> {
+    stored_persona(store)
+}
+
+fn store_persona(store: &Store, persona: &Persona) -> Result<(), String> {
+    store
+        .settings_set(PERSONA_KEY, &encode_persona(persona))
+        .map_err(stringify)
+}
+
+/// Read it back, refusing anything this build did not write.
+///
+/// A short or non-UTF-8 record is `None` rather than an error: the keys are
+/// what matter and they are sealed separately, so a damaged persona costs a
+/// name and not an identity. Bounds are re-applied by `Identity::from_parts`,
+/// which normalises whatever it is given.
+fn stored_persona(store: &Store) -> Result<Option<Persona>, String> {
+    let Some(bytes) = store.settings_get(PERSONA_KEY).map_err(stringify)? else {
+        return Ok(None);
+    };
+    if bytes.len() < 8 {
+        log::warn!("stored persona is {} bytes, too short to read", bytes.len());
+        return Ok(None);
+    }
+    let Ok(name) = std::str::from_utf8(&bytes[8..]) else {
+        log::warn!("stored persona name is not text");
+        return Ok(None);
+    };
+    Ok(Some(Persona {
+        version: u32::from_be_bytes(bytes[..4].try_into().expect("4 bytes")),
+        colour: u32::from_be_bytes(bytes[4..8].try_into().expect("4 bytes")),
+        name: name.to_string(),
+    }))
+}
+
 fn reset_stale_db(db: &Path) -> Result<(), String> {
     log::warn!(
         "no sealed master and a database at {} — resetting it, as nothing can \
