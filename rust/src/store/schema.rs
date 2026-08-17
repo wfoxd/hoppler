@@ -96,6 +96,35 @@ const MIGRATIONS: &[&str] = &[
         paired_at  INTEGER NOT NULL
     );
     "#,
+    // v2 -> v3: where a thread's receive state lives (T12 slice 3).
+    //
+    // Two tables and not one, because they are two kinds of thing. `ratchets`
+    // holds key material — the root, both chains, and every key still owed for
+    // a message that has not arrived — in one opaque blob whose encoding
+    // deliberately exists only in Rust. `inboxes` holds numbers: what has
+    // arrived and what is still missing, which is what the screen needs to show
+    // a gap rather than close over it.
+    //
+    // Keeping them apart means the blob can stay a blob. Folding the counters
+    // into it would mean parsing key material to answer "what is this thread
+    // waiting for", and parsing key material to draw a screen is how it ends up
+    // somewhere it should not be.
+    //
+    // Both are keyed by thread and cascade with it: a deleted thread must not
+    // leave a ratchet behind, which under R0-F9 would be key material outliving
+    // the conversation it belongs to.
+    r#"
+    CREATE TABLE ratchets (
+        thread_id  INTEGER PRIMARY KEY REFERENCES threads(id) ON DELETE CASCADE,
+        state      BLOB NOT NULL,
+        updated_at INTEGER NOT NULL
+    );
+    CREATE TABLE inboxes (
+        thread_id INTEGER PRIMARY KEY REFERENCES threads(id) ON DELETE CASCADE,
+        through   INTEGER NOT NULL,
+        ahead     BLOB NOT NULL
+    );
+    "#,
 ];
 
 /// The schema version this build migrates to.
@@ -279,5 +308,49 @@ mod tests {
             columns(&conn, "pairings"),
             ["contact_id", "l1_pub", "paired_at"]
         );
+        assert_eq!(
+            columns(&conn, "ratchets"),
+            ["thread_id", "state", "updated_at"]
+        );
+        assert_eq!(columns(&conn, "inboxes"), ["thread_id", "through", "ahead"]);
+    }
+
+    /// A database that predates the receive-state tables gets them, and keeps
+    /// what was in it.
+    ///
+    /// The upgrade path matters more here than the tables do: someone running
+    /// this build already has conversations, and a migration that dropped them
+    /// to make room for a ratchet would be the worst possible way to add
+    /// persistence to a chat app.
+    #[test]
+    fn an_older_database_gains_the_receive_tables_without_losing_its_threads() {
+        let conn = Connection::open_in_memory().unwrap();
+        at_version(&conn, 2);
+        conn.execute_batch(
+            "INSERT INTO contacts (id, pseudonym, l2_pub, name, colour, persona_version, first_seen)
+             VALUES (1, x'01', x'02', 'Alice', 0, 1, 100);
+             INSERT INTO threads (id, contact_id, created_at) VALUES (7, 1, 200);
+             INSERT INTO messages (thread_id, seq, msg_id, body, direction, state, created_at)
+             VALUES (7, 1, x'aa', x'bb', 0, 0, 300);",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        assert_eq!(current_version(&conn).unwrap(), LATEST_VERSION);
+        let messages: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM messages WHERE thread_id = 7",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(messages, 1, "the upgrade lost an existing conversation");
+        // The new tables exist and are empty, which is what "no ratchet yet"
+        // has to look like for a thread that predates them.
+        let ratchets: i64 = conn
+            .query_row("SELECT count(*) FROM ratchets", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ratchets, 0);
     }
 }

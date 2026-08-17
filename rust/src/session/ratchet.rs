@@ -90,6 +90,14 @@ pub enum RatchetError {
     /// the one failure this construction has no defence against. Refused
     /// instead, and it heals: a reply turns the ratchet and resets the counters.
     ChainExhausted,
+    /// Stored state this build cannot read: a version it does not know, a field
+    /// that is not there, or a length past what it allows.
+    ///
+    /// Always this rather than a partial ratchet. A conversation that cannot be
+    /// continued is recoverable — two people can pair again — where one
+    /// continued from half-read state is two devices deriving different keys
+    /// and neither able to say why.
+    UnreadableState,
 }
 
 impl std::fmt::Display for RatchetError {
@@ -99,6 +107,7 @@ impl std::fmt::Display for RatchetError {
             RatchetError::Undecryptable => write!(f, "message could not be decrypted"),
             RatchetError::BadKey => write!(f, "unusable ratchet key"),
             RatchetError::ChainExhausted => write!(f, "chain exhausted"),
+            RatchetError::UnreadableState => write!(f, "stored ratchet state is unreadable"),
         }
     }
 }
@@ -435,6 +444,109 @@ impl Ratchet {
         self.skipped.len()
     }
 
+    /// Everything this holds, as bytes for the store (T12 slice 3).
+    ///
+    /// # Why this is hand-rolled and not a protobuf
+    ///
+    /// Every other structured thing in this project is a `.proto`, and one more
+    /// would have been less code. But `scripts/gen-proto.sh` compiles
+    /// `proto/*.proto` for Dart as well, and CI asserts the generated Dart is
+    /// committed — so a `RatchetState` message would put a typed accessor for
+    /// the root key and every chain key in the UI language, checked in, one
+    /// import from anywhere. Nothing would use it. It would sit there being
+    /// available.
+    ///
+    /// This encoding cannot leave Rust, which is the only property that
+    /// matters about it. Being fixed-width and dull is the rest.
+    ///
+    /// Zeroizing because it is the whole conversation's past and future laid
+    /// out flat: the caller hands it to the store and the copy here goes.
+    pub fn to_state(&self) -> Zeroizing<Vec<u8>> {
+        let mut out = Vec::with_capacity(STATE_PREFIX_LEN + self.skipped.len() * SKIPPED_ENTRY_LEN);
+        out.push(STATE_VERSION);
+        out.extend_from_slice(&self.root);
+        out.extend_from_slice(&self.ours.expose_secret()[..]);
+        push_optional(&mut out, self.theirs.map(|t| t.0));
+        push_optional(&mut out, self.sending);
+        push_optional(&mut out, self.receiving);
+        out.extend_from_slice(&self.sent.to_be_bytes());
+        out.extend_from_slice(&self.received.to_be_bytes());
+        out.extend_from_slice(&self.previous_chain_len.to_be_bytes());
+        out.extend_from_slice(&(self.skipped_order.len() as u32).to_be_bytes());
+        // In `skipped_order`, not the map's order: which key is evicted next
+        // depends on it, and a restore that shuffled them would start throwing
+        // away the wrong messages.
+        for slot in &self.skipped_order {
+            let key = self
+                .skipped
+                .get(slot)
+                .expect("skipped_order and skipped hold the same slots");
+            out.extend_from_slice(&slot.0);
+            out.extend_from_slice(&slot.1.to_be_bytes());
+            out.extend_from_slice(key);
+        }
+        Zeroizing::new(out)
+    }
+
+    /// Rebuild one from [`Ratchet::to_state`].
+    ///
+    /// Every field is bounds-checked rather than trusted. These bytes have been
+    /// through the store and possibly through a different build, and a length
+    /// taken at face value is an allocation an attacker never had to be
+    /// involved in — a truncated write and a corrupt page get there on their
+    /// own.
+    pub fn from_state(bytes: &[u8]) -> Result<Self, RatchetError> {
+        let mut read = Reader::new(bytes);
+        if read.byte()? != STATE_VERSION {
+            return Err(RatchetError::UnreadableState);
+        }
+        let root = read.array32()?;
+        let ours = dh::DhSecret::from_bytes(&read.array32()?);
+        let theirs = read.optional32()?.map(dh::DhPublic);
+        let sending = read.optional32()?;
+        let receiving = read.optional32()?;
+        let sent = read.u32()?;
+        let received = read.u32()?;
+        let previous_chain_len = read.u32()?;
+
+        let count = read.u32()? as usize;
+        if count > MAX_SKIPPED_KEYS {
+            // The bound this build enforces, re-applied on the way in. It is a
+            // constant that could change between versions, and `remember_skipped`
+            // only trims as keys are added — state restored over the line would
+            // sit there held.
+            return Err(RatchetError::UnreadableState);
+        }
+        let mut skipped = HashMap::with_capacity(count);
+        let mut skipped_order = Vec::with_capacity(count);
+        for _ in 0..count {
+            let slot = (read.array32()?, read.u32()?);
+            let key = read.array32()?;
+            if skipped.insert(slot, key).is_none() {
+                skipped_order.push(slot);
+            }
+        }
+        if !read.is_empty() {
+            // Trailing bytes mean this is not the state it claims to be.
+            // Accepting them would let a longer future encoding decode as a
+            // shorter one, silently dropping whatever was added.
+            return Err(RatchetError::UnreadableState);
+        }
+
+        Ok(Self {
+            root,
+            ours,
+            theirs,
+            sending,
+            receiving,
+            sent,
+            received,
+            previous_chain_len,
+            skipped,
+            skipped_order,
+        })
+    }
+
     /// Wipe every secret this holds.
     ///
     /// Called from `Drop`, and separate from it so it can be tested: "zeroized
@@ -471,6 +583,95 @@ impl Ratchet {
 impl Drop for Ratchet {
     fn drop(&mut self) {
         self.wipe();
+    }
+}
+
+/// Version byte on a stored state. First thing written and first thing checked,
+/// so a state from a build that laid the fields out differently is refused
+/// rather than read as though the fields were where this one puts them.
+const STATE_VERSION: u8 = 1;
+
+/// Everything before the skipped keys themselves: version, root, our secret,
+/// three optional 32-byte fields with their flags, three counters, and the
+/// count of keys that follow.
+///
+/// The count belongs to the prefix because it sits in it — leaving it out was
+/// worth four bytes of arithmetic to a reader and cost a wrong offset in the
+/// test that pokes at the count field.
+const STATE_PREFIX_LEN: usize = 1 + 32 + 32 + 3 * 33 + 3 * 4 + 4;
+
+/// One skipped key: their ratchet public, the message number, the key.
+const SKIPPED_ENTRY_LEN: usize = 32 + 4 + 32;
+
+fn push_optional(out: &mut Vec<u8>, value: Option<[u8; 32]>) {
+    match value {
+        Some(bytes) => {
+            out.push(1);
+            out.extend_from_slice(&bytes);
+        }
+        // The 32 bytes are still written, so every field sits at a fixed
+        // offset. A present/absent flag that also changed the length would make
+        // the layout depend on the data, which is how a parser ends up reading
+        // one field as another.
+        None => {
+            out.push(0);
+            out.extend_from_slice(&[0u8; 32]);
+        }
+    }
+}
+
+/// A cursor that cannot run off the end.
+///
+/// Every read is checked, so the parse above reads as a list of fields rather
+/// than a list of fields interleaved with length arithmetic — which is where
+/// the mistakes live.
+struct Reader<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> Reader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes }
+    }
+
+    fn take(&mut self, n: usize) -> Result<&'a [u8], RatchetError> {
+        if self.bytes.len() < n {
+            return Err(RatchetError::UnreadableState);
+        }
+        let (head, rest) = self.bytes.split_at(n);
+        self.bytes = rest;
+        Ok(head)
+    }
+
+    fn byte(&mut self) -> Result<u8, RatchetError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn array32(&mut self) -> Result<[u8; 32], RatchetError> {
+        Ok(self.take(32)?.try_into().expect("32 bytes"))
+    }
+
+    fn u32(&mut self) -> Result<u32, RatchetError> {
+        Ok(u32::from_be_bytes(
+            self.take(4)?.try_into().expect("4 bytes"),
+        ))
+    }
+
+    fn optional32(&mut self) -> Result<Option<[u8; 32]>, RatchetError> {
+        let present = self.byte()?;
+        let value = self.array32()?;
+        match present {
+            0 => Ok(None),
+            1 => Ok(Some(value)),
+            // Not "anything non-zero is true": a byte that is neither is a
+            // state this build did not write, and guessing at it is how a
+            // corrupt field becomes a live key.
+            _ => Err(RatchetError::UnreadableState),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
     }
 }
 
@@ -873,6 +1074,231 @@ mod tests {
             number: 9,
         };
         assert_eq!(Header::from_bytes(&header.to_bytes()), header);
+    }
+
+    /// A ratchet mid-conversation, with a gap outstanding: the shape worth
+    /// storing, since an empty one would exercise none of the optional fields
+    /// and none of the skipped keys.
+    fn mid_conversation() -> (Ratchet, Ratchet) {
+        let (mut alice, mut bob) = pair();
+        recv(&mut bob, send(&mut alice, "one"));
+        recv(&mut alice, send(&mut bob, "and back"));
+        let _skipped = send(&mut alice, "two");
+        recv(&mut bob, send(&mut alice, "three"));
+        assert_eq!(bob.skipped_count(), 1, "the fixture holds no gap");
+        (alice, bob)
+    }
+
+    /// The whole point of persisting: a conversation that survives the app
+    /// being closed. Restored state has to be the *same* ratchet, which means
+    /// it opens the message the live one would have opened.
+    #[test]
+    fn a_stored_ratchet_carries_on_the_conversation() {
+        let (mut alice, bob) = mid_conversation();
+        let stored = bob.to_state();
+        drop(bob);
+
+        let mut restored = Ratchet::from_state(&stored).unwrap();
+        assert_eq!(
+            recv(&mut restored, send(&mut alice, "after the restart")),
+            "after the restart"
+        );
+        // And in the other direction, which uses the sending chain and our own
+        // key — a restore that lost either would still pass a receive-only test.
+        assert_eq!(
+            recv(&mut alice, send(&mut restored, "still here")),
+            "still here"
+        );
+    }
+
+    /// A message skipped before the restart must still open after it. These
+    /// keys are the only copy: the chain has moved past them and cannot make
+    /// them again.
+    #[test]
+    fn a_stored_ratchet_keeps_the_keys_it_was_holding() {
+        let (mut alice, mut bob) = pair();
+        recv(&mut bob, send(&mut alice, "one"));
+        let overtaken = send(&mut alice, "two");
+        recv(&mut bob, send(&mut alice, "three"));
+
+        let mut restored = Ratchet::from_state(&bob.to_state()).unwrap();
+        assert_eq!(
+            recv(&mut restored, overtaken),
+            "two",
+            "the key for a skipped message did not survive the restart"
+        );
+    }
+
+    /// Which key is evicted next depends on the order they were kept in, so the
+    /// order is part of the state rather than an artefact of the map.
+    ///
+    /// Sixty-four of them, built directly. Five real ones through a
+    /// conversation was the first version and it was not a test: with that few,
+    /// a `HashMap`'s iteration order can happen to match the insertion order,
+    /// and writing the map's order instead survived.
+    #[test]
+    fn a_stored_ratchet_keeps_the_eviction_order() {
+        const HELD: u32 = 64;
+        let slot = |i: u32| ([1u8; 32], i);
+        let mut ratchet = Ratchet::responder([7u8; 32], dh::DhSecret::generate());
+        for i in 0..HELD {
+            ratchet.remember_skipped(slot(i), [i as u8; 32]);
+        }
+
+        let mut restored = Ratchet::from_state(&ratchet.to_state()).unwrap();
+        assert_eq!(
+            restored.skipped_order, ratchet.skipped_order,
+            "the order the keys would be evicted in changed across a restart"
+        );
+
+        // And what that order is for: fill to the bound and the oldest is the
+        // one that goes. A restart that shuffled them would start throwing away
+        // whichever key happened to land first in a hash bucket.
+        for i in HELD..(MAX_SKIPPED_KEYS as u32 + 1) {
+            restored.remember_skipped(slot(i), [0xAA; 32]);
+        }
+        assert!(
+            !restored.skipped.contains_key(&slot(0)),
+            "the oldest key was not the one evicted"
+        );
+        assert!(restored.skipped.contains_key(&slot(1)));
+    }
+
+    /// The state is on disk between runs of possibly different builds, so it is
+    /// pinned like a wire format. A layout change that this did not notice
+    /// would be every existing conversation silently unreadable.
+    #[test]
+    fn the_stored_layout_is_pinned() {
+        let ratchet = Ratchet {
+            root: [1u8; 32],
+            ours: dh::DhSecret::from_bytes(&[2u8; 32]),
+            theirs: Some(dh::DhPublic([3u8; 32])),
+            sending: Some([4u8; 32]),
+            receiving: None,
+            sent: 7,
+            received: 9,
+            previous_chain_len: 5,
+            skipped: HashMap::from([(([6u8; 32], 11), [8u8; 32])]),
+            skipped_order: vec![([6u8; 32], 11)],
+        };
+        let expected = [
+            "01",             // version
+            &"01".repeat(32), // root
+            &"02".repeat(32), // our secret, as stored
+            "01",
+            &"03".repeat(32), // theirs, present
+            "01",
+            &"04".repeat(32), // sending, present
+            "00",
+            &"00".repeat(32), // receiving, absent — still 32 bytes
+            "00000007",       // sent
+            "00000009",       // received
+            "00000005",       // previous chain length
+            "00000001",       // one skipped key
+            &"06".repeat(32), // their ratchet public
+            "0000000b",       // message number 11
+            &"08".repeat(32), // the key
+        ]
+        .concat();
+        assert_eq!(hex::encode(&ratchet.to_state()[..]), expected);
+        assert_eq!(
+            ratchet.to_state().len(),
+            STATE_PREFIX_LEN + SKIPPED_ENTRY_LEN
+        );
+    }
+
+    /// Truncation is what a half-finished write looks like, and every field
+    /// boundary is a place a parser can read the next field as this one.
+    #[test]
+    fn a_truncated_state_is_refused_at_every_length() {
+        let (_, bob) = mid_conversation();
+        let stored = bob.to_state();
+        for cut in 0..stored.len() {
+            assert_eq!(
+                Ratchet::from_state(&stored[..cut]).err(),
+                Some(RatchetError::UnreadableState),
+                "a state cut to {cut} of {} bytes was accepted",
+                stored.len()
+            );
+        }
+        assert!(
+            Ratchet::from_state(&stored).is_ok(),
+            "the whole thing failed"
+        );
+    }
+
+    /// And the other end: bytes after the state mean it is not the state it
+    /// claims to be. Accepting them would let a longer future encoding decode
+    /// as this shorter one, dropping whatever was added without a word.
+    #[test]
+    fn a_state_with_anything_after_it_is_refused() {
+        let (_, bob) = mid_conversation();
+        let mut extended = bob.to_state().to_vec();
+        extended.push(0);
+        assert_eq!(
+            Ratchet::from_state(&extended).err(),
+            Some(RatchetError::UnreadableState)
+        );
+    }
+
+    #[test]
+    fn a_state_from_another_version_is_refused() {
+        let (_, bob) = mid_conversation();
+        let mut other = bob.to_state().to_vec();
+        other[0] = STATE_VERSION + 1;
+        assert_eq!(
+            Ratchet::from_state(&other).err(),
+            Some(RatchetError::UnreadableState),
+            "a state this build did not write was read as though it had"
+        );
+    }
+
+    /// A present/absent flag that is neither is a corrupt field, and guessing
+    /// at it is how corruption becomes a live key.
+    #[test]
+    fn a_state_whose_optional_flag_is_neither_is_refused() {
+        let (_, bob) = mid_conversation();
+        let mut corrupt = bob.to_state().to_vec();
+        corrupt[1 + 32 + 32] = 2;
+        assert_eq!(
+            Ratchet::from_state(&corrupt).err(),
+            Some(RatchetError::UnreadableState)
+        );
+    }
+
+    /// The bound re-applied on the way in, the lesson from [`Inbox::resumed`]
+    /// next door: a count is a constant that can change between versions, and
+    /// state written over this build's line would otherwise sit there held.
+    ///
+    /// [`Inbox::resumed`]: crate::session::chat::Inbox::resumed
+    #[test]
+    fn a_state_claiming_more_skipped_keys_than_allowed_is_refused() {
+        const OVER: usize = MAX_SKIPPED_KEYS + 1;
+        let (_, bob) = mid_conversation();
+
+        // The keys are really there, not merely claimed. The first version of
+        // this only rewrote the count, so without the bound the parse ran off
+        // the end of the buffer and failed anyway — the test passed either way
+        // and proved nothing about the bound.
+        let mut over = bob.to_state()[..STATE_PREFIX_LEN - 4].to_vec();
+        over.extend_from_slice(&(OVER as u32).to_be_bytes());
+        for i in 0..OVER {
+            over.extend_from_slice(&[1u8; 32]);
+            over.extend_from_slice(&(i as u32).to_be_bytes());
+            over.extend_from_slice(&[2u8; 32]);
+        }
+        assert_eq!(
+            Ratchet::from_state(&over).err(),
+            Some(RatchetError::UnreadableState),
+            "a state holding more keys than the bound allows was accepted"
+        );
+
+        // And one key fewer is fine, so what is being refused is the bound and
+        // not the shape of the thing.
+        let mut allowed = over[..STATE_PREFIX_LEN - 4].to_vec();
+        allowed.extend_from_slice(&(MAX_SKIPPED_KEYS as u32).to_be_bytes());
+        allowed.extend_from_slice(&over[STATE_PREFIX_LEN..over.len() - SKIPPED_ENTRY_LEN]);
+        assert!(Ratchet::from_state(&allowed).is_ok());
     }
 
     /// The all-zero point: order one, so the exchange lands on a constant the
