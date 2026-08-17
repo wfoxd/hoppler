@@ -238,12 +238,106 @@ fn a_renamed_persona_survives_a_restart() {
 
     // Next launch: a fresh store over the same directory, as `load_identity`
     // would open it.
-    let store = engine::open_store_for_test(path).unwrap();
+    let store = engine::open_store_for_test(path.clone()).unwrap();
     assert_eq!(
         engine::stored_persona_for_test(&store)
             .unwrap()
             .map(|p| p.name),
         Some("Wren".to_string()),
         "the chosen name did not survive the app being closed"
+    );
+}
+
+/// A keystore that fails must not read as a device that has never sealed
+/// anything.
+///
+/// This is the one that would have cost an identity. Read as "first launch",
+/// the engine generates a new one and seals it *over* the seed that was there
+/// but momentarily unreadable — destroying, on a transient IO error, the only
+/// key material on the device that cannot be recreated.
+#[test]
+fn a_failing_keystore_is_not_mistaken_for_a_first_launch() {
+    use rust_lib_hoppler::identity::keystore::{Keystore, KeystoreError};
+    use std::sync::Mutex;
+
+    /// Layer-1 present and readable; Layer-2 there but refusing.
+    struct HalfBroken(Mutex<Vec<u8>>);
+    impl Keystore for HalfBroken {
+        fn seal(&self, _: &str, _: &[u8]) -> Result<(), KeystoreError> {
+            Ok(())
+        }
+        fn unseal(&self, label: &str) -> Result<zeroize::Zeroizing<Vec<u8>>, KeystoreError> {
+            if label == Identity::LAYER1_LABEL {
+                Ok(zeroize::Zeroizing::new(self.0.lock().unwrap().clone()))
+            } else {
+                Err(KeystoreError::Backend)
+            }
+        }
+        fn wipe(&self, _: &str) -> Result<(), KeystoreError> {
+            Ok(())
+        }
+    }
+
+    let ks = HalfBroken(Mutex::new(vec![3u8; 32]));
+    assert_eq!(
+        Identity::unsealed(&ks, a_persona()).err(),
+        Some(KeystoreError::Backend),
+        "a backend failure read as a first launch, which would have sealed a \
+         new identity over the one that was there"
+    );
+}
+
+/// A corrupt persona record falls back to the default rather than becoming a
+/// live persona. Every invariant the writer holds, checked on the way in.
+#[test]
+fn a_corrupt_persona_is_ignored_rather_than_used() {
+    use rust_lib_hoppler::identity::{COLOUR_MASK, MAX_PERSONA_NAME_LEN};
+
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        ("too short", vec![0u8; 7]),
+        ("version zero", {
+            let mut v = vec![0u8; 8];
+            v.extend_from_slice(b"Wren");
+            v
+        }),
+        ("colour with a top byte", {
+            let mut v = 1u32.to_be_bytes().to_vec();
+            v.extend_from_slice(&(COLOUR_MASK + 1).to_be_bytes());
+            v.extend_from_slice(b"Wren");
+            v
+        }),
+        ("name over the bound", {
+            let mut v = 1u32.to_be_bytes().to_vec();
+            v.extend_from_slice(&1u32.to_be_bytes());
+            v.extend_from_slice(&[b'x'; MAX_PERSONA_NAME_LEN + 1]);
+            v
+        }),
+        ("name is not text", {
+            let mut v = 1u32.to_be_bytes().to_vec();
+            v.extend_from_slice(&1u32.to_be_bytes());
+            v.extend_from_slice(&[0xff, 0xfe]);
+            v
+        }),
+    ];
+
+    for (why, bytes) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let store = engine::open_store_for_test(dir.path().to_string_lossy().into_owned()).unwrap();
+        store.settings_set("identity/persona/v1", &bytes).unwrap();
+        assert_eq!(
+            engine::stored_persona_for_test(&store).unwrap(),
+            None,
+            "a persona that is {why} was read back as usable"
+        );
+    }
+
+    // And a good one still reads, so what is refused is the corruption and not
+    // the format.
+    let dir = tempfile::tempdir().unwrap();
+    let store = engine::open_store_for_test(dir.path().to_string_lossy().into_owned()).unwrap();
+    engine::store_persona_for_test(&store, &a_persona()).unwrap();
+    assert_eq!(
+        engine::stored_persona_for_test(&store).unwrap(),
+        Some(a_persona())
     );
 }

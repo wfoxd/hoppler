@@ -41,6 +41,7 @@ use crate::frb_generated::StreamSink;
 use crate::identity::filekeystore::FileKeystore;
 use crate::identity::keystore::Keystore;
 use crate::identity::{Identity, Persona, VerifiedPersona};
+use crate::identity::{COLOUR_MASK, MAX_PERSONA_NAME_LEN};
 use crate::pairing::invite::Invite;
 use crate::store::{
     Direction, MessageState, NewContact, NewMessage, NewTransfer, Store, StoreError, TransferState,
@@ -343,13 +344,20 @@ pub fn current_persona() -> Result<PersonaDto, String> {
 pub fn update_persona(name: String, colour: u32) -> Result<PersonaDto, String> {
     with_core_mut(|core| {
         let mut identity = core.identity.lock().unwrap_or_else(|e| e.into_inner());
-        identity.update_persona(name, colour);
-        // Written before the caller is told it worked. A rename that lived only
-        // in memory would be the old bug in miniature: the screen says the new
-        // name, every peer is told the new name, and the next launch is back to
-        // the old one with nothing to explain it.
+        // Stored first, then made live, and that order is the fix rather than a
+        // preference. Renaming in memory and then failing to store leaves the
+        // core serving and announcing a name the next launch will not have,
+        // while telling the caller the rename failed — the same shape as a
+        // ratchet turning before the exchange that could refuse it.
+        let next = identity.persona_after(name.clone(), colour);
         core.store
-            .settings_set(PERSONA_KEY, &encode_persona(identity.persona()))?;
+            .settings_set(PERSONA_KEY, &encode_persona(&next))?;
+        identity.update_persona(name, colour);
+        debug_assert_eq!(
+            identity.persona(),
+            &next,
+            "what was stored is not what went live"
+        );
         Ok(persona_dto(identity.persona()))
     })
 }
@@ -1192,25 +1200,44 @@ fn store_persona(store: &Store, persona: &Persona) -> Result<(), String> {
 
 /// Read it back, refusing anything this build did not write.
 ///
-/// A short or non-UTF-8 record is `None` rather than an error: the keys are
-/// what matter and they are sealed separately, so a damaged persona costs a
-/// name and not an identity. Bounds are re-applied by `Identity::from_parts`,
-/// which normalises whatever it is given.
+/// Every invariant the writer holds is checked, because a sentence promising
+/// that and eight bytes of length check is how a corrupt record becomes a live
+/// persona: a version of zero is one this build never wrote (they start at 1
+/// and only rise), a colour is 24 bits so its top byte is always clear, and a
+/// name is bounded at [`MAX_PERSONA_NAME_LEN`].
+///
+/// All of it is `None` rather than an error, and that is the point of checking
+/// so carefully: the keys are sealed separately, so a damaged persona costs a
+/// name and not an identity — falling back to the default is a recoverable
+/// afternoon, and refusing to start over a display name is not.
 fn stored_persona(store: &Store) -> Result<Option<Persona>, String> {
     let Some(bytes) = store.settings_get(PERSONA_KEY).map_err(stringify)? else {
         return Ok(None);
     };
-    if bytes.len() < 8 {
-        log::warn!("stored persona is {} bytes, too short to read", bytes.len());
-        return Ok(None);
-    }
-    let Ok(name) = std::str::from_utf8(&bytes[8..]) else {
-        log::warn!("stored persona name is not text");
-        return Ok(None);
+    let refuse = |why: &str| {
+        log::warn!("stored persona ignored, falling back to the default: {why}");
+        Ok(None)
     };
+    if bytes.len() < 8 {
+        return refuse(&format!("{} bytes, too short to read", bytes.len()));
+    }
+    let version = u32::from_be_bytes(bytes[..4].try_into().expect("4 bytes"));
+    let colour = u32::from_be_bytes(bytes[4..8].try_into().expect("4 bytes"));
+    let Ok(name) = std::str::from_utf8(&bytes[8..]) else {
+        return refuse("the name is not text");
+    };
+    if version == 0 {
+        return refuse("version 0, which is never written");
+    }
+    if colour & !COLOUR_MASK != 0 {
+        return refuse(&format!("colour {colour:#010x} is not 24-bit"));
+    }
+    if name.len() > MAX_PERSONA_NAME_LEN {
+        return refuse(&format!("name is {} bytes, over the bound", name.len()));
+    }
     Ok(Some(Persona {
-        version: u32::from_be_bytes(bytes[..4].try_into().expect("4 bytes")),
-        colour: u32::from_be_bytes(bytes[4..8].try_into().expect("4 bytes")),
+        version,
+        colour,
         name: name.to_string(),
     }))
 }

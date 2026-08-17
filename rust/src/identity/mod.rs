@@ -73,10 +73,10 @@ const BINDING_LABEL: &[u8] = b"hoppler/session-binding/v1";
 const MAX_PERSONA_RECORD_LEN: usize = 4096;
 
 /// Hard cap on a persona name, in bytes.
-const MAX_PERSONA_NAME_LEN: usize = 64;
+pub const MAX_PERSONA_NAME_LEN: usize = 64;
 
 /// Colour is a packed 0xRRGGBB value; the top byte is not meaningful.
-const COLOUR_MASK: u32 = 0x00ff_ffff;
+pub const COLOUR_MASK: u32 = 0x00ff_ffff;
 
 /// Normalise persona fields so a locally-held persona always satisfies the same
 /// bounds `verify_persona_record` enforces on peers — colour masked to 24 bits,
@@ -251,13 +251,19 @@ impl Identity {
             keystore.unseal(Self::LAYER2_LABEL),
         ) {
             (Ok(one), Ok(two)) => (one, two),
-            // Either absent is no identity. Both absent is a first launch; one
-            // absent is a sealing that died partway, and the argument above
-            // says the half-sealed identity was never used.
-            (Err(KeystoreError::NotFound), _) | (_, Err(KeystoreError::NotFound)) => {
-                return Ok(None)
+            // A real backend failure is checked *before* absence, and the order
+            // is the whole point. Written the other way round, an unreadable
+            // seed beside a missing one read as "first launch", and the caller
+            // generated a new identity and sealed it over the top — destroying,
+            // on a transient permission or IO error, the one key material on
+            // this device that cannot be recreated.
+            (Err(e @ KeystoreError::Backend), _) | (_, Err(e @ KeystoreError::Backend)) => {
+                return Err(e)
             }
-            (Err(e), _) | (_, Err(e)) => return Err(e),
+            // What is left is absence. Both absent is a first launch; one absent
+            // is a sealing that died partway, and the argument above says that
+            // identity was never used.
+            _ => return Ok(None),
         };
         let (Ok(one), Ok(two)) = (
             <[u8; sign::SEED_LEN]>::try_from(&layer1[..]),
@@ -291,6 +297,17 @@ impl Identity {
 
     pub fn persona(&self) -> &Persona {
         &self.persona
+    }
+
+    /// What [`Identity::update_persona`] would produce, without producing it.
+    ///
+    /// Exists so a caller can write the new persona down *before* making it
+    /// live: a rename that is announced to every peer and then fails to store
+    /// is the same bug as the ratchet turning before its exchange succeeded —
+    /// the screen and the wire say one thing, the next launch says another, and
+    /// nothing explains the difference.
+    pub fn persona_after(&self, name: impl Into<String>, colour: u32) -> Persona {
+        normalise_persona(name, colour, self.persona.version.saturating_add(1))
     }
 
     /// Replace the displayed persona and bump its version. The Layer-2 key is
@@ -487,6 +504,26 @@ pub fn verify_persona_record(wire: &[u8]) -> Result<VerifiedPersona, IdentityErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The engine stores `persona_after`'s answer and then makes
+    /// `update_persona`'s live. If those ever disagreed, every rename would
+    /// write down one thing and announce another.
+    #[test]
+    fn what_would_be_stored_is_what_goes_live() {
+        let mut id = Identity::generate("Me", 0x0044_88ff);
+        for (name, colour) in [
+            ("Wren", 0x00ff_0000),
+            ("Wren", 0x00ff_0000),
+            ("x", 0),
+            // Past both bounds, so the projection has to normalise exactly as
+            // the mutation does rather than merely pass the arguments through.
+            (&"y".repeat(MAX_PERSONA_NAME_LEN + 10)[..], 0xffff_ffff),
+        ] {
+            let projected = id.persona_after(name, colour);
+            id.update_persona(name, colour);
+            assert_eq!(id.persona(), &projected);
+        }
+    }
 
     #[test]
     fn generate_produces_two_distinct_layers() {
