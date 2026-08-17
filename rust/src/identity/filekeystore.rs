@@ -35,6 +35,7 @@
 //! *look* like protection while providing none, which is worse than this.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use zeroize::Zeroizing;
@@ -57,6 +58,30 @@ fn backend(what: &str, label_hash: &Path, error: std::io::Error) -> KeystoreErro
     KeystoreError::Backend
 }
 
+/// Keep a directory to its owner.
+///
+/// The security of everything here *is* the file permissions — that is the
+/// claim the module doc makes — so leaving the directory at whatever the umask
+/// happened to be would make the claim untrue on any desktop with a lax one.
+/// Android's umask is already restrictive; a Linux desktop's commonly is not.
+///
+/// Failing rather than warning: a keystore that cannot make itself private is
+/// storing the store master where other users can read it, and continuing
+/// would mean the module doc describes a protection that is not there.
+#[cfg(unix)]
+fn restrict(dir: &Path) -> Result<(), KeystoreError> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+        .map_err(|e| backend("restrict", dir, e))
+}
+
+#[cfg(not(unix))]
+fn restrict(_dir: &Path) -> Result<(), KeystoreError> {
+    // Ring 0 is Android and Linux desktop, both Unix. A non-Unix target
+    // reaching here would need its own answer rather than this silent one.
+    Ok(())
+}
+
 /// Domain separator for turning a label into a filename.
 const LABEL_CONTEXT: &str = "hoppler/keystore/label/v1";
 
@@ -74,6 +99,7 @@ impl FileKeystore {
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, KeystoreError> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir).map_err(|e| backend("create", &dir, e))?;
+        restrict(&dir)?;
         Ok(Self { dir })
     }
 
@@ -108,13 +134,39 @@ impl Keystore for FileKeystore {
     fn seal(&self, label: &str, secret: &[u8]) -> Result<(), KeystoreError> {
         let path = self.path_for(label);
         let staging = path.with_extension("new");
-        fs::write(&staging, secret).map_err(|e| backend("write", &staging, e))?;
+        {
+            let mut file =
+                fs::File::create(&staging).map_err(|e| backend("create", &staging, e))?;
+            file.write_all(secret)
+                .map_err(|e| backend("write", &staging, e))?;
+            // Before the rename, not after, and this is the whole point of the
+            // staging file. `write` returning Ok only means the bytes reached
+            // the page cache; a power loss then leaves the rename done and the
+            // contents empty, which is a master that exists and decrypts
+            // nothing — worse than one that is missing, because the missing
+            // case is detected and handled and this one is not.
+            file.sync_all().map_err(|e| backend("flush", &staging, e))?;
+        }
         fs::rename(&staging, &path).map_err(|e| {
             // Leaving the staging file behind would be a secret on disk under a
             // name nothing looks for, so it goes even on the failure path.
             let _ = fs::remove_file(&staging);
             backend("replace", &path, e)
         })?;
+        // And the rename itself, or the directory entry can be the thing that
+        // is lost. Best-effort, as in `FileStore::put`: opening a directory as
+        // a file is Unix-only, and a failure here cannot corrupt the file that
+        // was just written.
+        //
+        // Neither fsync is covered by a test and neither can be: observing the
+        // difference needs the power cut between the write and the read, which
+        // no test in this repository can arrange. Removing them breaks nothing
+        // that runs here. Recorded so the surviving mutant reads as what it is
+        // — an untestable property, like the zeroize-on-drop next door — rather
+        // than as a hole somebody later fills by deleting the lines.
+        if let Ok(dir) = fs::File::open(&self.dir) {
+            let _ = dir.sync_all();
+        }
         Ok(())
     }
 
@@ -243,6 +295,31 @@ mod tests {
         assert_eq!(&*ks.unseal("hoppler/layer1-seed/v1").unwrap(), &[1u8; 32]);
         assert_eq!(&*ks.unseal("hoppler/layer2-seed/v1").unwrap(), &[2u8; 32]);
         assert_eq!(&*ks.unseal("hoppler/store-master/v1").unwrap(), &[3u8; 32]);
+    }
+
+    /// The module's whole security claim is the file permissions, so the
+    /// directory has to actually have them — under a lax umask it would not.
+    #[cfg(unix)]
+    #[test]
+    fn the_keystore_directory_is_private_to_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keys");
+        // Created wide open first, so this proves the permissions are *set*
+        // rather than inherited from a strict umask the test happened to run
+        // under — which is what made the first version of this pass anywhere.
+        fs::create_dir_all(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o777)).unwrap();
+
+        let ks = FileKeystore::open(&path).unwrap();
+        ks.seal("hoppler/store-master/v1", &[1u8; 32]).unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "the keystore directory is {mode:o}, so the store master is \
+             readable by someone the module doc says it is not"
+        );
     }
 
     /// A replacement that dies partway must not take the old secret with it.
