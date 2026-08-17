@@ -4,10 +4,20 @@
 //! radio plane (T08–T10). Not scanned by flutter_rust_bridge (only `crate::api`
 //! is), so it stays free of bridge concerns.
 //!
-//! Dev keystore caveat: the store's master is held in an in-memory
-//! `SoftwareKeystore`, so identity does not survive a process restart yet — the
-//! native Secure Enclave / StrongBox backend (deferred with T05/T08) fixes that.
-//! Everything within a session persists to the real encrypted store.
+//! Keystore, and what is still owed. The store's master is sealed in a
+//! [`FileKeystore`](crate::identity::filekeystore), so the database now
+//! survives the app being closed — until this changed it did not, and the
+//! phrase that stood here ("everything within a session persists to the real
+//! encrypted store") was true only in the sense that a session was all there
+//! ever was: an in-memory keystore meant no master was found on the next
+//! launch, and the database was deleted unread.
+//!
+//! Two things remain owed. The *identity* is still regenerated on every launch
+//! — the seeds are not sealed yet, so the device is a new person each time even
+//! though its store now persists. And R0-F1's "master secret in platform
+//! hardware" needs the Android Keystore backend; file permissions are what
+//! stands in for it today, which is a real boundary on Android and a weak one
+//! on desktop. Both are written up where they live.
 //!
 //! The fake network ([`fake`]) is the Ring-0 implementation, not a test double:
 //! it ships in this build because no real transport exists yet. When T08–T10
@@ -28,7 +38,7 @@ use crate::api::types::{
 };
 use crate::crypto::rng;
 use crate::frb_generated::StreamSink;
-use crate::identity::keystore::SoftwareKeystore;
+use crate::identity::filekeystore::FileKeystore;
 use crate::identity::{Identity, Persona, VerifiedPersona};
 use crate::pairing::invite::Invite;
 use crate::store::{
@@ -166,11 +176,30 @@ pub fn has_session(device_id: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Open the store exactly as a launch does, for the persistence tests.
+///
+/// Deliberately the real thing rather than a fixture. What broke was not the
+/// store but the keystore underneath it, and a test that supplied its own
+/// keystore would have gone on passing throughout — which is what every store
+/// test did. `pub` with a note, following the precedent in this crate, because
+/// `#[cfg(test)]` items are invisible to `tests/`.
+pub fn open_store_for_test(support_dir: String) -> Result<Store, String> {
+    open_store(support_dir)
+}
+
 fn open_store(support_dir: String) -> Result<Store, String> {
     let dir = PathBuf::from(support_dir);
     let db = dir.join("hoppler.db");
     let files = dir.join("files");
-    let keystore = Arc::new(SoftwareKeystore::new());
+    // Durable, which it was not until now. `SoftwareKeystore` keeps its
+    // entries in a `HashMap`, so every launch got an empty one, found no
+    // master, and took the stale-database path below — deleting the database
+    // and the file store. Measured on a Pixel: `hoppler.db` came back with a
+    // different inode after every restart. Nothing had ever survived a close.
+    //
+    // Which means the reset below has, until this line changed, run on every
+    // single launch and never once in the situation it was written for.
+    let keystore = Arc::new(FileKeystore::open(dir.join("keys")).map_err(|e| e.to_string())?);
 
     // Record whether a master already existed *before* open (open seals a fresh
     // one on first use). A stale DB is safe to reset only when no master
@@ -1055,7 +1084,21 @@ fn stringify(e: StoreError) -> String {
 }
 
 /// Remove a stale (unkeyable) database and its WAL sidecars before recreating.
+/// Delete a database whose key is gone.
+///
+/// Only reachable when no master is sealed and a database file exists — a
+/// combination that means the ciphertext is provably unkeyable, so nothing is
+/// being destroyed that was not already lost. That reasoning was always right
+/// and the precondition was always wrong: with an in-memory keystore no master
+/// was *ever* sealed, so this ran on every launch and threw away a database it
+/// could have opened. It is loud now, because a line that deletes everything
+/// should say so on the one occasion it is correct to.
 fn reset_stale_db(db: &Path) -> Result<(), String> {
+    log::warn!(
+        "no sealed master and a database at {} — resetting it, as nothing can \
+         decrypt it",
+        db.display()
+    );
     std::fs::remove_file(db).map_err(|_| "could not reset stale database".to_string())?;
     for suffix in ["-wal", "-shm", "-journal"] {
         let mut sidecar = db.as_os_str().to_owned();
