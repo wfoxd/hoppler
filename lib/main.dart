@@ -19,6 +19,7 @@ import 'package:hoppler/src/rust/api/transfers.dart';
 import 'package:hoppler/src/rust/api/types.dart';
 import 'package:hoppler/src/nfc/nfc_channel.dart';
 import 'package:hoppler/src/platform/host.dart';
+import 'package:hoppler/src/platform/permissions.dart';
 import 'package:hoppler/src/rust/frb_generated.dart';
 import 'package:path_provider/path_provider.dart';
 
@@ -310,8 +311,27 @@ class _HomePageState extends State<HomePage> {
             subtitle: Text(_discovery ? 'Visible — who\'s nearby?' : 'Off'),
             value: _discovery,
             onChanged: (v) async {
+              // Asked here, which is the moment somebody said they wanted to be
+              // found. Turning *off* asks nothing: withdrawing does not need a
+              // permission, and prompting to stop being discoverable would be
+              // absurd.
+              if (v && !await ensureRadioPermission()) {
+                // Declined. The switch goes back rather than sitting on while
+                // nothing works — an "on" that discovers nobody is the failure
+                // this app cannot tell apart from an empty room.
+                if (!mounted) return;
+                setState(() {
+                  _discovery = false;
+                  _log.insert(
+                    0,
+                    'Discovery needs permission to use Bluetooth. '
+                    'You can grant it in Settings.',
+                  );
+                });
+                return;
+              }
               await setDiscovery(enabled: v);
-              setState(() => _discovery = v);
+              if (mounted) setState(() => _discovery = v);
             },
           ),
           if (_pairing == null && _myCode == null && !_scanning)

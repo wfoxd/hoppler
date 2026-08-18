@@ -14,6 +14,7 @@ import org.hoppler.hoppler.nfc.NfcAdapter
 class MainActivity : FlutterActivity() {
     private companion object {
         const val BLE_PERMISSION_REQUEST = 1
+        const val PERMISSION_CHANNEL = "org.hoppler/permissions"
 
         /**
          * Process-scoped, not per-activity: asking again because the activity
@@ -24,6 +25,21 @@ class MainActivity : FlutterActivity() {
 
     private var ble: BleAdapter? = null
     private var nfc: NfcAdapter? = null
+
+    /**
+     * The Dart calls waiting on a permission dialog, if one is up.
+     *
+     * `requestPermissions` answers through [onRequestPermissionsResult], so a
+     * result has to be parked rather than returned. A list because a second
+     * caller can arrive while the first prompt is still on screen, and the
+     * right answer for it is the one the person is in the middle of giving —
+     * not "denied", which would be answering on their behalf while they are
+     * still looking at the dialog.
+     *
+     * Non-empty *is* "a prompt is in flight", which is what separates that case
+     * from [asked], meaning one was shown and refused earlier.
+     */
+    private val awaitingRadio = mutableListOf<MethodChannel.Result>()
 
     /**
      * Held while the app is in the foreground so mDNS can be *received*.
@@ -55,6 +71,64 @@ class MainActivity : FlutterActivity() {
         nfc = tap
         MethodChannel(messenger, NfcAdapter.METHOD_CHANNEL).setMethodCallHandler(tap)
         EventChannel(messenger, NfcAdapter.EVENT_CHANNEL).setStreamHandler(tap)
+
+        // Its own channel rather than a method on the BLE one: asking needs an
+        // *Activity*, and `BleAdapter` deliberately holds the application
+        // context so it can outlive one. Putting the ask there would mean
+        // handing it an activity reference for this alone.
+        MethodChannel(messenger, PERMISSION_CHANNEL).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "ensureRadio" -> ensureRadio(result)
+                else -> result.notImplemented()
+            }
+        }
+    }
+
+    /**
+     * Ask for the Bluetooth permissions, now that somebody has asked to be
+     * discoverable.
+     *
+     * Called from the Discovery toggle rather than from `onResume`, which is
+     * where it used to live. On first launch that put "allow Hoppler to find,
+     * connect to and determine the relative position of nearby devices" in
+     * front of a person who had not yet said who they were, let alone that they
+     * wanted to be found — the prompt most likely to be denied, at the moment
+     * it makes least sense. Android's own guidance is to ask in context, and
+     * Hoppler has one: this switch.
+     *
+     * Answers `true` when the permissions are held. A refusal answers `false`
+     * rather than an error: being denied is a thing a person chose, not a fault.
+     */
+    private fun ensureRadio(result: MethodChannel.Result) {
+        val state = BlePermissions.state {
+            checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED
+        }
+        if (state is BlePermissions.State.Granted) {
+            result.success(true)
+            return
+        }
+        // A prompt is already up. Join it: the person is mid-decision, and
+        // answering "denied" for them because they were slow would be a switch
+        // that refused itself while they were reaching for Allow.
+        if (awaitingRadio.isNotEmpty()) {
+            awaitingRadio += result
+            return
+        }
+        // A second ask *after* a refusal shows no dialog at all — Android
+        // answers "denied" immediately — so it would be a switch that does
+        // nothing with no way for the person to tell why. Answered honestly
+        // instead; the route back is Settings, and `onResume` notices a grant
+        // made there.
+        if (asked) {
+            result.success(false)
+            return
+        }
+        asked = true
+        awaitingRadio += result
+        requestPermissions(
+            (state as BlePermissions.State.Missing).permissions.toTypedArray(),
+            BLE_PERMISSION_REQUEST,
+        )
     }
 
     override fun onResume() {
@@ -70,42 +144,13 @@ class MainActivity : FlutterActivity() {
                 acquire()
             }
         }
-        askForTheRadio()
-    }
-
-    /**
-     * Ask for the Bluetooth permissions, once.
-     *
-     * Nothing asked before this. BLE worked on the two phones it was developed
-     * on because their permissions had been granted by hand over `adb`, and
-     * would have failed on every other device as an empty peer list — the app
-     * has no way to reach the radio and no way to ask for one.
-     *
-     * Once per process rather than once per resume: after a second refusal
-     * Android answers immediately with "denied" and shows no dialog, so asking
-     * on every resume would be a loop the user cannot get out of. A refusal is
-     * answered by an availability event carrying the reason, and a grant made
-     * later in Settings is picked up by the re-check below.
-     *
-     * The reason reaches the core but stops there — `Net` folds availability
-     * into a bare `PeersChanged` and drops it — so a refusal is still an empty
-     * list on screen. Carrying it through is the other half of acceptance
-     * check 6 and is not done here.
-     */
-    private fun askForTheRadio() {
-        val state = BlePermissions.state {
-            checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED
-        }
-        if (state is BlePermissions.State.Missing && !asked) {
-            asked = true
-            requestPermissions(state.permissions.toTypedArray(), BLE_PERMISSION_REQUEST)
-            return
-        }
         // A grant made in Settings while we were away is invisible to the
-        // adapter — Android broadcasts nothing for it, and the app is
-        // restarted only if a permission is *revoked*. Resume is where it gets
-        // noticed, and the re-arm on the way back through is what actually
-        // starts the radio.
+        // adapter — Android broadcasts nothing for it, and the app is restarted
+        // only if a permission is *revoked*. Resume is where it gets noticed,
+        // and the re-arm on the way back through is what actually starts the
+        // radio. This half stays; what used to sit beside it — the ask itself —
+        // moved to [ensureRadio], because a resume is not a moment anybody
+        // asked to be found.
         ble?.refreshAvailability()
     }
 
@@ -115,10 +160,18 @@ class MainActivity : FlutterActivity() {
         grantResults: IntArray
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode != BLE_PERMISSION_REQUEST) return
         // Reported either way, and a grant is the case that matters: it is what
         // flips the rung to available, which is what re-arms the radio. Without
         // this the permission is held and nothing has started using it.
-        if (requestCode == BLE_PERMISSION_REQUEST) ble?.refreshAvailability()
+        ble?.refreshAvailability()
+        // Answer the Dart call that is still waiting on this dialog. Both
+        // outcomes answer it: a switch left spinning because somebody declined
+        // is worse than one that goes back to off.
+        val granted = grantResults.isNotEmpty() &&
+            grantResults.all { it == PackageManager.PERMISSION_GRANTED }
+        awaitingRadio.forEach { it.success(granted) }
+        awaitingRadio.clear()
     }
 
     override fun onPause() {
@@ -137,6 +190,12 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onDestroy() {
+        // Anything still waiting on a dialog is answered before the activity
+        // goes. A `Result` that is never completed is a Dart `await` that never
+        // returns, which here is a Discovery switch stuck mid-flip for the rest
+        // of the session.
+        awaitingRadio.forEach { it.success(false) }
+        awaitingRadio.clear()
         // Radios outlive activities unless something stops them; leaving one
         // advertising after the app is gone is the R0-F2 failure the whole
         // rung exists to avoid.
