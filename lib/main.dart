@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:hoppler/features/nearby/nearby_tile.dart';
+import 'package:hoppler/features/onboarding/name_view.dart';
 import 'package:hoppler/features/nearby/nearby_view.dart';
 import 'package:hoppler/features/pairing/pairing_code_view.dart';
 import 'package:hoppler/features/pairing/pairing_surface.dart';
@@ -11,6 +12,7 @@ import 'package:hoppler/features/ping/ping_service.dart';
 import 'package:hoppler/src/rust/api/core.dart';
 import 'package:hoppler/src/rust/api/discovery.dart';
 import 'package:hoppler/src/rust/api/events.dart';
+import 'package:hoppler/src/rust/api/identity.dart';
 import 'package:hoppler/src/rust/api/messaging.dart';
 import 'package:hoppler/src/rust/api/pairing.dart';
 import 'package:hoppler/src/rust/api/transfers.dart';
@@ -40,9 +42,22 @@ Future<void> main() async {
   runApp(HopplerApp(persona: persona));
 }
 
-class HopplerApp extends StatelessWidget {
+class HopplerApp extends StatefulWidget {
   const HopplerApp({super.key, required this.persona});
   final PersonaDto persona;
+
+  @override
+  State<HopplerApp> createState() => _HopplerAppState();
+}
+
+class _HopplerAppState extends State<HopplerApp> {
+  late PersonaDto _persona;
+
+  @override
+  void initState() {
+    super.initState();
+    _persona = widget.persona;
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -51,7 +66,25 @@ class HopplerApp extends StatelessWidget {
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.orange),
       ),
-      home: HomePage(persona: persona),
+      // The name step stands in front of the app rather than over it. A device
+      // with no chosen name would otherwise be discoverable as "Me" while its
+      // owner is still deciding, and R0-F1's answer to who this is would be
+      // decided by how long they took.
+      home: _persona.needsName
+          ? NameView(
+              colour: Color(0xFF000000 | _persona.colour),
+              onChosen: (name) async {
+                final chosen = await updatePersona(
+                  name: name,
+                  colour: _persona.colour,
+                );
+                // Only after the core has stored it. `updatePersona` writes
+                // before it makes the name live and throws if it cannot, so
+                // reaching here means the next launch will agree with this one.
+                setState(() => _persona = chosen);
+              },
+            )
+          : HomePage(persona: _persona),
     );
   }
 }
