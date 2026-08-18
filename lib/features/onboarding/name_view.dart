@@ -1,4 +1,7 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 /// The first thing a new device asks (R0-F1).
 ///
@@ -29,6 +32,13 @@ class NameView extends StatefulWidget {
   /// anything longer. Enforced here so a long name is refused while it is being
   /// typed rather than silently shortened after it is chosen — a person who
   /// typed a name and got a different one back has been told nothing.
+  ///
+  /// **Bytes, not characters.** Flutter's `maxLength` counts code units, and
+  /// this limit is a byte count in Rust, so the two disagree for every name
+  /// outside ASCII — sixty-four emoji are 64 to `maxLength` and 256 to the
+  /// core, which would truncate them after submission. That is the exact
+  /// failure the paragraph above claims to prevent, so it is counted properly
+  /// by [_ByteLimit] rather than approximated.
   static const maxNameBytes = 64;
 
   /// The colour the core drew for this device. Shown, not chosen: R0-F1 asks
@@ -64,14 +74,20 @@ class _NameViewState extends State<NameView> {
     });
     try {
       await widget.onChosen(name);
-    } catch (e) {
+    } catch (e, stack) {
       // Stays on this screen. The core refuses the name when it cannot store
       // it, and continuing into the app would mean discovering as a name the
       // next launch will not have.
+      //
+      // The exception goes to the log, not the screen. What reaches a person
+      // standing here holding a phone has to be something they can act on, and
+      // a store error is not — while the detail is exactly what is wanted in a
+      // bug report.
+      debugPrint('choosing a name failed: $e\n$stack');
       if (mounted) {
         setState(() {
           _saving = false;
-          _failed = 'That name could not be saved. $e';
+          _failed = 'That name could not be saved. Try again.';
         });
       }
     }
@@ -117,7 +133,20 @@ class _NameViewState extends State<NameView> {
                   TextField(
                     controller: _controller,
                     autofocus: true,
-                    maxLength: NameView.maxNameBytes,
+                    inputFormatters: const [_ByteLimit(NameView.maxNameBytes)],
+                    // Counted in the same units the limit is in. A counter
+                    // disagreeing with the thing it counts is worse than none.
+                    buildCounter:
+                        (
+                          context, {
+                          required currentLength,
+                          required maxLength,
+                          required isFocused,
+                        }) => Text(
+                          '${utf8.encode(_controller.text).length}'
+                          '/${NameView.maxNameBytes}',
+                          style: theme.textTheme.bodySmall,
+                        ),
                     textInputAction: TextInputAction.done,
                     enabled: !_saving,
                     decoration: const InputDecoration(
@@ -149,4 +178,21 @@ class _NameViewState extends State<NameView> {
       ),
     );
   }
+}
+
+/// Refuses an edit that would put the name over [NameView.maxNameBytes] *bytes*.
+///
+/// Rejects rather than truncates: cutting the value mid-edit can slice a
+/// multi-byte character in half, and refusing the keystroke is what a person
+/// reading a full counter expects anyway.
+class _ByteLimit extends TextInputFormatter {
+  const _ByteLimit(this.maxBytes);
+
+  final int maxBytes;
+
+  @override
+  TextEditingValue formatEditUpdate(
+    TextEditingValue oldValue,
+    TextEditingValue newValue,
+  ) => utf8.encode(newValue.text).length > maxBytes ? oldValue : newValue;
 }

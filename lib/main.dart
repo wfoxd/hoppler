@@ -51,7 +51,13 @@ class HopplerApp extends StatefulWidget {
 }
 
 class _HopplerAppState extends State<HopplerApp> {
-  late PersonaDto _persona = widget.persona;
+  late PersonaDto _persona;
+
+  @override
+  void initState() {
+    super.initState();
+    _persona = widget.persona;
+  }
 
   @override
   Widget build(BuildContext context) {
