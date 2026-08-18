@@ -84,11 +84,17 @@ jobs:
       # reserve the same key — `Failed to save: Unable to reserve cache`, which
       # is what finally gave it away. Two pull requests measured at 679s and
       # 600s against an 809s baseline, and every second of that came from the
-      # two environment variables below rather than from the cache.
+      # two environment variables at the top of this job rather than from the
+      # cache.
       #
       # Writing on main is what makes one build serve every branch.
+      # The default branch specifically, not "not a pull request". A
+      # `workflow_dispatch` from a topic branch is not a pull request either,
+      # and would write exactly the branch-scoped entry this whole change
+      # exists to stop — the same bug arriving by a different door, and it
+      # would have evicted main's copy on the way past.
       - uses: actions/cache@v4
-        if: github.event_name != 'pull_request'
+        if: github.ref == 'refs/heads/main'
         with:
           # All four. A debug build produces armv7 as well, and leaving it out
           # would have rebuilt it cold every run — while the description quoted
@@ -110,7 +116,7 @@ jobs:
       # would be visible to that one branch and nothing else — and trying is
       # how the reserve conflicts happened.
       - uses: actions/cache/restore@v4
-        if: github.event_name == 'pull_request'
+        if: github.ref != 'refs/heads/main'
         with:
           path: |
             build/rust_lib_hoppler/build/aarch64-linux-android
