@@ -1192,10 +1192,12 @@ impl SseDecode for crate::api::types::PersonaDto {
         let mut var_name = <String>::sse_decode(deserializer);
         let mut var_colour = <u32>::sse_decode(deserializer);
         let mut var_version = <u32>::sse_decode(deserializer);
+        let mut var_needsName = <bool>::sse_decode(deserializer);
         return crate::api::types::PersonaDto {
             name: var_name,
             colour: var_colour,
             version: var_version,
+            needs_name: var_needsName,
         };
     }
 }
@@ -1585,6 +1587,7 @@ impl flutter_rust_bridge::IntoDart for crate::api::types::PersonaDto {
             self.name.into_into_dart().into_dart(),
             self.colour.into_into_dart().into_dart(),
             self.version.into_into_dart().into_dart(),
+            self.needs_name.into_into_dart().into_dart(),
         ]
         .into_dart()
     }
@@ -1994,6 +1997,7 @@ impl SseEncode for crate::api::types::PersonaDto {
         <String>::sse_encode(self.name, serializer);
         <u32>::sse_encode(self.colour, serializer);
         <u32>::sse_encode(self.version, serializer);
+        <bool>::sse_encode(self.needs_name, serializer);
     }
 }
 

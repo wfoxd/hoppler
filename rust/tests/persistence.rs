@@ -349,3 +349,64 @@ fn a_corrupt_persona_is_ignored_rather_than_used() {
         Some(a_persona())
     );
 }
+
+/// R0-F1's first-launch question: has anyone chosen this device's name?
+///
+/// Derived from the stored persona rather than a flag, so this checks the
+/// derivation rather than a boolean somebody set. A device that has sealed an
+/// identity but stored no persona has never been asked; one with a stored
+/// persona has.
+#[test]
+fn a_device_asks_for_a_name_until_one_is_chosen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_string_lossy().into_owned();
+
+    let store = engine::open_store_for_test(path.clone()).unwrap();
+    assert!(
+        engine::needs_name_for_test(&store),
+        "a device with no stored persona must ask — otherwise the placeholder \
+         ships as the real name, which is how every install came to be 'Me'"
+    );
+
+    engine::store_persona_for_test(&store, &a_persona()).unwrap();
+    assert!(
+        !engine::needs_name_for_test(&store),
+        "a device whose owner chose a name must not be asked again"
+    );
+
+    // And a persona too damaged to read asks again, which is the right answer:
+    // the name genuinely is not known.
+    store
+        .settings_set("identity/persona/v1", &[0u8; 3])
+        .unwrap();
+    assert!(engine::needs_name_for_test(&store));
+}
+
+/// The launch path itself, which is where the placeholder could be written
+/// down by accident.
+///
+/// Two launches, because the second is the one that matters: the first seals an
+/// identity, and if it stored the made-up persona while doing so, the device
+/// would come back on the second launch already believing somebody had chosen
+/// to be called "Me".
+#[test]
+fn sealing_an_identity_does_not_count_as_choosing_a_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_string_lossy().into_owned();
+
+    assert!(
+        engine::launch_needs_name_for_test(path.clone()).unwrap(),
+        "a first launch must still ask"
+    );
+    assert!(
+        engine::launch_needs_name_for_test(path.clone()).unwrap(),
+        "the second launch stopped asking, so sealing an identity was taken \
+         for choosing a name"
+    );
+
+    // And once a name is chosen, no launch asks again.
+    let store = engine::open_store_for_test(path.clone()).unwrap();
+    engine::store_persona_for_test(&store, &a_persona()).unwrap();
+    drop(store);
+    assert!(!engine::launch_needs_name_for_test(path).unwrap());
+}

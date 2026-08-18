@@ -240,7 +240,10 @@ fn install(
     events: std::sync::mpsc::Receiver<crate::transport::TransportEvent>,
 ) -> Result<PersonaDto, String> {
     let identity = Arc::new(Mutex::new(load_identity(&store, keystore.as_ref())?));
-    let dto = persona_dto(identity.lock().unwrap_or_else(|e| e.into_inner()).persona());
+    let dto = persona_dto(
+        identity.lock().unwrap_or_else(|e| e.into_inner()).persona(),
+        needs_name(&store),
+    );
 
     let net = transport.map(|t| {
         let net = Arc::new(net::Net::new(
@@ -337,7 +340,7 @@ fn fresh_node_id() -> String {
 pub fn current_persona() -> Result<PersonaDto, String> {
     with_core(|core| {
         let identity = core.identity.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(persona_dto(identity.persona()))
+        Ok(persona_dto(identity.persona(), needs_name(&core.store)))
     })
 }
 
@@ -358,7 +361,9 @@ pub fn update_persona(name: String, colour: u32) -> Result<PersonaDto, String> {
             &next,
             "what was stored is not what went live"
         );
-        Ok(persona_dto(identity.persona()))
+        // False from here on, and by construction rather than by assignment:
+        // the row this just wrote is the thing `needs_name` reads.
+        Ok(persona_dto(identity.persona(), false))
     })
 }
 
@@ -1085,12 +1090,45 @@ fn ensure_thread(core: &Core, device_id: &str, now: i64) -> Result<i64, StoreErr
     }
 }
 
-fn persona_dto(p: &Persona) -> PersonaDto {
+fn persona_dto(p: &Persona, needs_name: bool) -> PersonaDto {
     PersonaDto {
         name: p.name.clone(),
         colour: p.colour,
         version: p.version,
+        needs_name,
     }
+}
+
+/// Whether anyone has chosen this device's name.
+///
+/// The stored persona *is* the answer: nothing is written down until somebody
+/// chooses one, so there is no separate flag able to disagree with it. A
+/// persona too damaged to read also lands here, and asking again is the right
+/// answer to that — the name genuinely is not known.
+/// For the persistence tests; see [`open_store_for_test`].
+pub fn needs_name_for_test(store: &Store) -> bool {
+    needs_name(store)
+}
+
+/// Run a launch's identity load and report whether a name is still wanted.
+///
+/// The whole launch path, not its parts: whether the placeholder gets written
+/// down is decided inside `load_identity`, and a test that opened a store and
+/// asked `needs_name` never went near it. Mutation testing said exactly that —
+/// adding a `store_persona` back into the first-launch branch broke nothing.
+pub fn launch_needs_name_for_test(support_dir: String) -> Result<bool, String> {
+    let (store, keystore) = open_store(support_dir)?;
+    load_identity(&store, keystore.as_ref())?;
+    Ok(needs_name(&store))
+}
+
+fn needs_name(store: &Store) -> bool {
+    // Written as "not a readable persona" rather than "no persona", so a store
+    // that cannot be read asks again. Only reachable when `settings_get` itself
+    // fails, which no test here can arrange, so the mutation to the narrower
+    // form survives — it is a difference in what happens when the database is
+    // unreadable, and asking is the safer of the two answers.
+    !matches!(stored_persona(store), Ok(Some(_)))
 }
 
 fn new_msg_id() -> (Vec<u8>, String) {
@@ -1130,7 +1168,32 @@ const PERSONA_KEY: &str = "identity/persona/v1";
 /// is saying who is at the other end. The first-launch step is what retires
 /// this; until then it is at least persisted rather than reinvented hourly.
 const DEFAULT_NAME: &str = "Me";
-const DEFAULT_COLOUR: u32 = 0x0044_88ff;
+
+/// Colours a device may be given before anyone picks one.
+///
+/// One fixed colour for every install made the nearby list a column of
+/// identical dots, which is a small thing until two people are trying to work
+/// out which entry is which. Drawn at random rather than derived from anything
+/// about the device: a colour derived from a hardware identifier would be a
+/// stable handle that survives the twelve-minute rotation R0-F2 exists to
+/// enforce, and this is shown to strangers by design (R0-F2 again).
+///
+/// Five bits of entropy at most, so it is a convenience and never an identity.
+const DEFAULT_COLOURS: [u32; 8] = [
+    0x0044_88ff, // blue
+    0x00e0_5c4a, // coral
+    0x0037_a86b, // green
+    0x00b3_6ae2, // violet
+    0x00e0_9c3a, // amber
+    0x0027_9b9b, // teal
+    0x00d4_5c8a, // rose
+    0x006b_7280, // slate
+];
+
+fn a_starting_colour() -> u32 {
+    let pick = rng::random_array::<1>()[0] as usize;
+    DEFAULT_COLOURS[pick % DEFAULT_COLOURS.len()]
+}
 
 /// The identity this device sealed, or a fresh one on first launch.
 ///
@@ -1144,9 +1207,9 @@ const DEFAULT_COLOUR: u32 = 0x0044_88ff;
 fn load_identity(store: &Store, keystore: &dyn Keystore) -> Result<Identity, String> {
     // A persona that failed to store is not a reason to throw away keys, so the
     // default stands in and only the name is lost.
-    let persona = stored_persona(store)?.unwrap_or(Persona {
+    let persona = stored_persona(store)?.unwrap_or_else(|| Persona {
         name: DEFAULT_NAME.to_string(),
-        colour: DEFAULT_COLOUR,
+        colour: a_starting_colour(),
         version: 1,
     });
 
@@ -1162,7 +1225,10 @@ fn load_identity(store: &Store, keystore: &dyn Keystore) -> Result<Identity, Str
             "this device cannot store its identity, so it would be a new person every launch: {e}"
         )
     })?;
-    store_persona(store, identity.persona())?;
+    // Deliberately *not* stored. The persona row is written only when somebody
+    // chooses a name, which is what makes its absence mean "never chosen" — a
+    // separate flag would be a second answer to the same question, and the two
+    // would drift.
     log::info!("first launch: a new identity was generated and sealed");
     Ok(identity)
 }

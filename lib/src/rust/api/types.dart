@@ -217,14 +217,28 @@ class PersonaDto {
   final int colour;
   final int version;
 
+  /// Nobody has chosen this name yet — it is the placeholder the core made up.
+  ///
+  /// R0-F1 says the person chooses a display name on first launch, and until
+  /// now no step ever asked, so every device shipped called "Me". The visible
+  /// cost landed on the pairing screen, which read "Pairing with Me" on the
+  /// one screen whose whole job is saying who is at the other end.
+  ///
+  /// Derived rather than stored as a flag: a persona is written down only
+  /// when somebody chooses one, so "nothing stored" *is* "never chosen" and
+  /// the two cannot disagree.
+  final bool needsName;
+
   const PersonaDto({
     required this.name,
     required this.colour,
     required this.version,
+    required this.needsName,
   });
 
   @override
-  int get hashCode => name.hashCode ^ colour.hashCode ^ version.hashCode;
+  int get hashCode =>
+      name.hashCode ^ colour.hashCode ^ version.hashCode ^ needsName.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -233,7 +247,8 @@ class PersonaDto {
           runtimeType == other.runtimeType &&
           name == other.name &&
           colour == other.colour &&
-          version == other.version;
+          version == other.version &&
+          needsName == other.needsName;
 }
 
 /// One colour of a pairing SAS: what to paint, and what to call it.

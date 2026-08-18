@@ -7,6 +7,17 @@ pub struct PersonaDto {
     /// Packed 0xRRGGBB.
     pub colour: u32,
     pub version: u32,
+    /// Nobody has chosen this name yet — it is the placeholder the core made up.
+    ///
+    /// R0-F1 says the person chooses a display name on first launch, and until
+    /// now no step ever asked, so every device shipped called "Me". The visible
+    /// cost landed on the pairing screen, which read "Pairing with Me" on the
+    /// one screen whose whole job is saying who is at the other end.
+    ///
+    /// Derived rather than stored as a flag: a persona is written down only
+    /// when somebody chooses one, so "nothing stored" *is* "never chosen" and
+    /// the two cannot disagree.
+    pub needs_name: bool,
 }
 
 /// A device visible in Discovery.
