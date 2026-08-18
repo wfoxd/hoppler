@@ -1,0 +1,39 @@
+name: apt
+description: Install packages, with a bound on how long a bad mirror can cost.
+
+# Why this exists rather than four copies of `sudo apt-get install`.
+#
+# On 18 Aug 2026 `apt-get update` hung on a GitHub runner for **78 minutes**
+# before anyone noticed, in two pull requests at once, holding up merges that
+# were otherwise green. Nothing was wrong with either branch: the step has no
+# timeout, so a stalled mirror waits until the job's six-hour limit.
+#
+# The bound is the point. A retry alone would still hang on the first attempt.
+
+inputs:
+  packages:
+    description: Space-separated package names.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -uo pipefail
+        # Three minutes is many times the normal cost — `apt-get update` plus a
+        # small package is seconds — so a timeout here means stuck rather than
+        # slow, and the next attempt gets a different mirror.
+        for attempt in 1 2 3; do
+          if sudo timeout 180 apt-get update && \
+             sudo timeout 180 apt-get install -y ${{ inputs.packages }}; then
+            exit 0
+          fi
+          echo "::warning::apt attempt $attempt did not finish; retrying"
+          # Long enough for a load balancer to hand out a different mirror,
+          # short enough that three attempts still cost under ten minutes in
+          # the worst case.
+          sleep 10
+        done
+        echo "::error::apt failed three times — this is the runner's network, not the branch"
+        exit 1
