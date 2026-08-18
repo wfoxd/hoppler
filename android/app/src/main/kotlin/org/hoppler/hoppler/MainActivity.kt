@@ -27,14 +27,19 @@ class MainActivity : FlutterActivity() {
     private var nfc: NfcAdapter? = null
 
     /**
-     * The Dart call waiting on a permission dialog, if one is up.
+     * The Dart calls waiting on a permission dialog, if one is up.
      *
-     * `requestPermissions` answers through [onRequestPermissionsResult], so the
-     * result has to be parked here rather than returned. One at a time: the
-     * platform shows one dialog, and a second caller arriving mid-prompt is
-     * answered when that prompt is.
+     * `requestPermissions` answers through [onRequestPermissionsResult], so a
+     * result has to be parked rather than returned. A list because a second
+     * caller can arrive while the first prompt is still on screen, and the
+     * right answer for it is the one the person is in the middle of giving —
+     * not "denied", which would be answering on their behalf while they are
+     * still looking at the dialog.
+     *
+     * Non-empty *is* "a prompt is in flight", which is what separates that case
+     * from [asked], meaning one was shown and refused earlier.
      */
-    private var awaitingRadio: MethodChannel.Result? = null
+    private val awaitingRadio = mutableListOf<MethodChannel.Result>()
 
     /**
      * Held while the app is in the foreground so mDNS can be *received*.
@@ -102,18 +107,28 @@ class MainActivity : FlutterActivity() {
             result.success(true)
             return
         }
-        // A second ask after a refusal shows no dialog at all — Android answers
-        // "denied" immediately — so it would be a switch that does nothing with
-        // no way for the person to tell why. Answered honestly instead; the
-        // route back is Settings, and `onResume` notices a grant made there.
+        // A prompt is already up. Join it: the person is mid-decision, and
+        // answering "denied" for them because they were slow would be a switch
+        // that refused itself while they were reaching for Allow.
+        if (awaitingRadio.isNotEmpty()) {
+            awaitingRadio += result
+            return
+        }
+        // A second ask *after* a refusal shows no dialog at all — Android
+        // answers "denied" immediately — so it would be a switch that does
+        // nothing with no way for the person to tell why. Answered honestly
+        // instead; the route back is Settings, and `onResume` notices a grant
+        // made there.
         if (asked) {
             result.success(false)
             return
         }
         asked = true
-        awaitingRadio?.success(false)
-        awaitingRadio = result
-        requestPermissions((state as BlePermissions.State.Missing).permissions.toTypedArray(), BLE_PERMISSION_REQUEST)
+        awaitingRadio += result
+        requestPermissions(
+            (state as BlePermissions.State.Missing).permissions.toTypedArray(),
+            BLE_PERMISSION_REQUEST,
+        )
     }
 
     override fun onResume() {
@@ -155,8 +170,8 @@ class MainActivity : FlutterActivity() {
         // is worse than one that goes back to off.
         val granted = grantResults.isNotEmpty() &&
             grantResults.all { it == PackageManager.PERMISSION_GRANTED }
-        awaitingRadio?.success(granted)
-        awaitingRadio = null
+        awaitingRadio.forEach { it.success(granted) }
+        awaitingRadio.clear()
     }
 
     override fun onPause() {
@@ -175,6 +190,12 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onDestroy() {
+        // Anything still waiting on a dialog is answered before the activity
+        // goes. A `Result` that is never completed is a Dart `await` that never
+        // returns, which here is a Discovery switch stuck mid-flip for the rest
+        // of the session.
+        awaitingRadio.forEach { it.success(false) }
+        awaitingRadio.clear()
         // Radios outlive activities unless something stops them; leaving one
         // advertising after the app is gone is the R0-F2 failure the whole
         // rung exists to avoid.
