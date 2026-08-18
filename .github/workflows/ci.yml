@@ -44,18 +44,79 @@ jobs:
 
   android:
     runs-on: ubuntu-latest
+    # Incremental compilation buys nothing on a runner that starts empty — the
+    # state it depends on is thrown away with the machine — and it is 194 MB of
+    # every 861 MB target directory, which is cache budget spent on nothing.
+    env:
+      CARGO_INCREMENTAL: "0"
+      # CI never opens a debugger on the .so — it checks that it links and runs
+      # the Kotlin tests beside it. The symbols are most of the artefact, so
+      # dropping them here is both a faster build and a cache that fits.
+      CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/apt
         with: { packages: "protobuf-compiler" }
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: "21" }
+      # i686 is in the list because `flutter build apk` builds every ABI it can
+      # and was fetching that target mid-build when it was not declared here.
       - uses: dtolnay/rust-toolchain@stable
-        with: { targets: "aarch64-linux-android, armv7-linux-androideabi, x86_64-linux-android" }
+        with: { targets: "aarch64-linux-android, armv7-linux-androideabi, x86_64-linux-android, i686-linux-android" }
+      # `rust/target`, which the *host* builds use. Kept, and it is not what
+      # makes this job slow — see the cargokit cache below.
       - uses: Swatinem/rust-cache@v2
         with: { workspaces: rust }
+      # The one that matters here. cargokit cross-compiles into
+      # `build/rust_lib_hoppler/`, not `rust/target`, so `rust-cache` above
+      # restored a host-target cache this job never reads — it logged "cache
+      # restored successfully" on every run while rebuilding all four ABIs from
+      # scratch, about five and a half minutes of a thirteen minute job.
+      #
+      # Pull requests only. The whole tree is 4.7 GB against a 10 GB budget for
+      # the repository, and the four target directories are about 900 MB of it
+      # once symbols and incremental state are off. Main builds cold, which is
+      # the right way round: nobody is waiting on it.
+      #
+      # Keyed on the lockfile and the sources, because that is what the
+      # artefacts are a function of. `restore-keys` lets a source-only change
+      # start from the last build rather than from nothing, which is the common
+      # case on a pull request — dependencies stay compiled and only this
+      # crate is redone.
+      - uses: actions/cache@v4
+        if: github.event_name == 'pull_request'
+        with:
+          # All four. A debug build produces armv7 as well, and leaving it out
+          # would have rebuilt it cold every run — while the description quoted
+          # the four-ABI measurement that says so.
+          path: |
+            build/rust_lib_hoppler/build/aarch64-linux-android
+            build/rust_lib_hoppler/build/armv7-linux-androideabi
+            build/rust_lib_hoppler/build/x86_64-linux-android
+            build/rust_lib_hoppler/build/i686-linux-android
+          # Everything the artefacts are a function of. `Cargo.toml` because a
+          # feature change need not move the lockfile, and `build.rs` because it
+          # is what compiles the protos — either one changing without changing
+          # the key is a stale cache restored over inputs that moved.
+          key: cargokit-${{ runner.os }}-${{ hashFiles('rust/Cargo.lock', 'rust/Cargo.toml', 'rust/build.rs') }}-${{ hashFiles('rust/src/**', 'proto/**') }}
+          restore-keys: |
+            cargokit-${{ runner.os }}-${{ hashFiles('rust/Cargo.lock', 'rust/Cargo.toml', 'rust/build.rs') }}-
+            cargokit-${{ runner.os }}-
       - uses: subosito/flutter-action@v2
         with: { flutter-version: "${{ env.FLUTTER_VERSION }}", channel: stable, cache: true }
+      # Every ABI, and `--target-platform` would not change that.
+      #
+      # Tried, and it does not work the way it reads: cargokit adds
+      # `android-x86` and `android-x64` unconditionally for a *debug* build —
+      # deliberately, mirroring what flutter.gradle does so the app runs on an
+      # emulator — so `--target-platform android-arm64` still cross-compiles
+      # three. Narrowing it would mean building release here, which trades four
+      # minutes of cross-compiling for LTO and a signing config, and stops CI
+      # exercising the artefact anybody actually installs.
+      #
+      # So the ABIs stay and the cache above is what makes them cheap. Measured
+      # locally: a warm build after touching one source file is 31 seconds,
+      # against roughly five and a half minutes cold.
       - run: flutter build apk --debug
       # The adapter's radio-free logic (framing, peer-id validation, the
       # sighting decision). BLE itself needs two phones; these do not, and two
