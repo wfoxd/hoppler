@@ -70,10 +70,10 @@ jobs:
       # restored successfully" on every run while rebuilding all four ABIs from
       # scratch, about five and a half minutes of a thirteen minute job.
       #
-      # Pull requests only, and only the ABIs a debug build actually produces.
-      # The whole tree is 4.7 GB against a 10 GB budget for the repository, so
-      # caching all of it would evict everything else to save a job nobody is
-      # waiting on. Main builds cold; that is the right way round.
+      # Pull requests only. The whole tree is 4.7 GB against a 10 GB budget for
+      # the repository, and the four target directories are about 900 MB of it
+      # once symbols and incremental state are off. Main builds cold, which is
+      # the right way round: nobody is waiting on it.
       #
       # Keyed on the lockfile and the sources, because that is what the
       # artefacts are a function of. `restore-keys` lets a source-only change
@@ -83,13 +83,21 @@ jobs:
       - uses: actions/cache@v4
         if: github.event_name == 'pull_request'
         with:
+          # All four. A debug build produces armv7 as well, and leaving it out
+          # would have rebuilt it cold every run — while the description quoted
+          # the four-ABI measurement that says so.
           path: |
             build/rust_lib_hoppler/build/aarch64-linux-android
+            build/rust_lib_hoppler/build/armv7-linux-androideabi
             build/rust_lib_hoppler/build/x86_64-linux-android
             build/rust_lib_hoppler/build/i686-linux-android
-          key: cargokit-${{ runner.os }}-${{ hashFiles('rust/Cargo.lock') }}-${{ hashFiles('rust/src/**', 'proto/**') }}
+          # Everything the artefacts are a function of. `Cargo.toml` because a
+          # feature change need not move the lockfile, and `build.rs` because it
+          # is what compiles the protos — either one changing without changing
+          # the key is a stale cache restored over inputs that moved.
+          key: cargokit-${{ runner.os }}-${{ hashFiles('rust/Cargo.lock', 'rust/Cargo.toml', 'rust/build.rs') }}-${{ hashFiles('rust/src/**', 'proto/**') }}
           restore-keys: |
-            cargokit-${{ runner.os }}-${{ hashFiles('rust/Cargo.lock') }}-
+            cargokit-${{ runner.os }}-${{ hashFiles('rust/Cargo.lock', 'rust/Cargo.toml', 'rust/build.rs') }}-
             cargokit-${{ runner.os }}-
       - uses: subosito/flutter-action@v2
         with: { flutter-version: "${{ env.FLUTTER_VERSION }}", channel: stable, cache: true }
