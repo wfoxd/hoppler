@@ -73,18 +73,22 @@ jobs:
       # restored successfully" on every run while rebuilding all four ABIs from
       # scratch, about five and a half minutes of a thirteen minute job.
       #
-      # Pull requests only. The whole tree is 4.7 GB against a 10 GB budget for
-      # the repository, and the four target directories are about 900 MB of it
-      # once symbols and incremental state are off. Main builds cold, which is
-      # the right way round: nobody is waiting on it.
+      # Saved on main, restored everywhere — and that way round is the whole
+      # point, not a detail.
       #
-      # Keyed on the lockfile and the sources, because that is what the
-      # artefacts are a function of. `restore-keys` lets a source-only change
-      # start from the last build rather than from nothing, which is the common
-      # case on a pull request — dependencies stay compiled and only this
-      # crate is redone.
+      # This was written the other way first, saving on pull requests only, and
+      # it saved nothing at all. GitHub scopes a cache to the branch that wrote
+      # it: a branch can read its own caches and the default branch's, and
+      # nothing else. So every pull request wrote a 308 MB cache that only it
+      # could ever read, then the next one built cold and raced the last one to
+      # reserve the same key — `Failed to save: Unable to reserve cache`, which
+      # is what finally gave it away. Two pull requests measured at 679s and
+      # 600s against an 809s baseline, and every second of that came from the
+      # two environment variables below rather than from the cache.
+      #
+      # Writing on main is what makes one build serve every branch.
       - uses: actions/cache@v4
-        if: github.event_name == 'pull_request'
+        if: github.event_name != 'pull_request'
         with:
           # All four. A debug build produces armv7 as well, and leaving it out
           # would have rebuilt it cold every run — while the description quoted
@@ -98,6 +102,21 @@ jobs:
           # feature change need not move the lockfile, and `build.rs` because it
           # is what compiles the protos — either one changing without changing
           # the key is a stale cache restored over inputs that moved.
+          key: cargokit-${{ runner.os }}-${{ hashFiles('rust/Cargo.lock', 'rust/Cargo.toml', 'rust/build.rs') }}-${{ hashFiles('rust/src/**', 'proto/**') }}
+          restore-keys: |
+            cargokit-${{ runner.os }}-${{ hashFiles('rust/Cargo.lock', 'rust/Cargo.toml', 'rust/build.rs') }}-
+            cargokit-${{ runner.os }}-
+      # Restore-only on a pull request. It cannot usefully save — the entry
+      # would be visible to that one branch and nothing else — and trying is
+      # how the reserve conflicts happened.
+      - uses: actions/cache/restore@v4
+        if: github.event_name == 'pull_request'
+        with:
+          path: |
+            build/rust_lib_hoppler/build/aarch64-linux-android
+            build/rust_lib_hoppler/build/armv7-linux-androideabi
+            build/rust_lib_hoppler/build/x86_64-linux-android
+            build/rust_lib_hoppler/build/i686-linux-android
           key: cargokit-${{ runner.os }}-${{ hashFiles('rust/Cargo.lock', 'rust/Cargo.toml', 'rust/build.rs') }}-${{ hashFiles('rust/src/**', 'proto/**') }}
           restore-keys: |
             cargokit-${{ runner.os }}-${{ hashFiles('rust/Cargo.lock', 'rust/Cargo.toml', 'rust/build.rs') }}-
