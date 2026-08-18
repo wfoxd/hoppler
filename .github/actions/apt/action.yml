@@ -28,6 +28,16 @@ runs:
       env:
         PACKAGES: ${{ inputs.packages }}
       run: |
+        # GitHub runs a composite `run:` with `bash -eo pipefail`, so errexit is
+        # already on before the first line of this script. Off, deliberately:
+        # every apt call below is *expected* to fail sometimes — that is what
+        # the retry is for — and under errexit the loop is unreachable, so the
+        # action would exit on the first failure while claiming to retry.
+        #
+        # Found in review, after a local check that could not see it: the stub
+        # ran under plain `bash`, where the loop works fine. The reproduction is
+        # `bash -eo pipefail`, and that is what a check of this has to use.
+        set +e
         set -uo pipefail
         read -ra packages <<< "$PACKAGES"
 
