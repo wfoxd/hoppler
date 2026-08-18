@@ -46,6 +46,8 @@ use zeroize::Zeroizing;
 use crate::crypto::{dh, kdf, sign};
 use crate::proto::v0::{PersonaBody, SignedPersona};
 
+use self::keystore::{Keystore, KeystoreError};
+
 /// Domain-separation label for the pseudonym KDF. Versioned: changing it is a
 /// wire-protocol break, so it is frozen for compatible builds.
 const PSEUDONYM_LABEL: &[u8] = b"hoppler/pseudonym/v1";
@@ -71,10 +73,10 @@ const BINDING_LABEL: &[u8] = b"hoppler/session-binding/v1";
 const MAX_PERSONA_RECORD_LEN: usize = 4096;
 
 /// Hard cap on a persona name, in bytes.
-const MAX_PERSONA_NAME_LEN: usize = 64;
+pub const MAX_PERSONA_NAME_LEN: usize = 64;
 
 /// Colour is a packed 0xRRGGBB value; the top byte is not meaningful.
-const COLOUR_MASK: u32 = 0x00ff_ffff;
+pub const COLOUR_MASK: u32 = 0x00ff_ffff;
 
 /// Normalise persona fields so a locally-held persona always satisfies the same
 /// bounds `verify_persona_record` enforces on peers — colour masked to 24 bits,
@@ -200,6 +202,90 @@ impl Identity {
         }
     }
 
+    /// Keystore labels for the two seeds.
+    ///
+    /// Versioned like every other label here, so a future change of what a seed
+    /// *is* cannot be read back as the old thing.
+    pub const LAYER1_LABEL: &str = "hoppler/layer1-seed/v1";
+    pub const LAYER2_LABEL: &str = "hoppler/layer2-seed/v1";
+
+    /// Seal both seeds so this identity survives the process.
+    ///
+    /// The only path secret material takes out of this type, and it goes
+    /// straight into the keystore without passing through a caller — which is
+    /// the same reason [`Identity::update_persona`] exists rather than a
+    /// setter that round-trips Layer-1 material. There is deliberately no
+    /// public seed accessor to build this out of.
+    ///
+    /// # Not atomic, and what that costs
+    ///
+    /// Two labels, two writes, no transaction across them. A crash between
+    /// leaves one seed sealed and the other absent, which [`Identity::unsealed`]
+    /// treats as no identity at all rather than as half of one. That is safe
+    /// because the order is seal-then-use: an identity whose sealing did not
+    /// finish was never handed to anything, so nothing was signed with it and
+    /// nothing paired against it. Regenerating loses nothing that existed.
+    pub fn seal_seeds(&self, keystore: &dyn Keystore) -> Result<(), KeystoreError> {
+        keystore.seal(Self::LAYER1_LABEL, &self.layer1.to_seed()[..])?;
+        keystore.seal(Self::LAYER2_LABEL, &self.layer2.to_seed()[..])?;
+        Ok(())
+    }
+
+    /// Rebuild the identity this device sealed, or `None` if it has never
+    /// sealed one.
+    ///
+    /// `None` is what "first launch" means, and it is the only definition of it
+    /// — a flag stored beside the seeds could disagree with them, and the seeds
+    /// are the thing that actually matters.
+    ///
+    /// A seed of the wrong length is refused rather than padded: it is not a
+    /// seed this build wrote, and guessing at it would produce a *different*
+    /// identity that looked like a working one, which is the failure mode with
+    /// no symptom.
+    pub fn unsealed(
+        keystore: &dyn Keystore,
+        persona: Persona,
+    ) -> Result<Option<Self>, KeystoreError> {
+        let (layer1, layer2) = match (
+            keystore.unseal(Self::LAYER1_LABEL),
+            keystore.unseal(Self::LAYER2_LABEL),
+        ) {
+            (Ok(one), Ok(two)) => (one, two),
+            // A real backend failure is checked *before* absence, and the order
+            // is the whole point. Written the other way round, an unreadable
+            // seed beside a missing one read as "first launch", and the caller
+            // generated a new identity and sealed it over the top — destroying,
+            // on a transient permission or IO error, the one key material on
+            // this device that cannot be recreated.
+            (Err(e @ KeystoreError::Backend), _) | (_, Err(e @ KeystoreError::Backend)) => {
+                return Err(e)
+            }
+            // What is left is absence. Both absent is a first launch; one absent
+            // is a sealing that died partway, and the argument above says that
+            // identity was never used.
+            _ => return Ok(None),
+        };
+        let (Ok(one), Ok(two)) = (
+            <[u8; sign::SEED_LEN]>::try_from(&layer1[..]),
+            <[u8; sign::SEED_LEN]>::try_from(&layer2[..]),
+        ) else {
+            // Coarse to the caller, specific in the log. This becomes a fatal
+            // startup error, and "keystore backend error" alone cannot tell a
+            // seed written by an older format from a disk that stopped
+            // answering — which are the same sentence and completely different
+            // afternoons. Lengths only; a seed never appears in a log.
+            log::warn!(
+                "sealed seeds are {} and {} bytes, not {}: this is not state \
+                 this build wrote",
+                layer1.len(),
+                layer2.len(),
+                sign::SEED_LEN
+            );
+            return Err(KeystoreError::Backend);
+        };
+        Ok(Some(Self::from_parts(&one, &two, persona)))
+    }
+
     /// Reconstruct from seeds unsealed from the keystore plus the stored persona.
     pub fn from_parts(
         layer1_seed: &[u8; sign::SEED_LEN],
@@ -223,6 +309,17 @@ impl Identity {
 
     pub fn persona(&self) -> &Persona {
         &self.persona
+    }
+
+    /// What [`Identity::update_persona`] would produce, without producing it.
+    ///
+    /// Exists so a caller can write the new persona down *before* making it
+    /// live: a rename that is announced to every peer and then fails to store
+    /// is the same bug as the ratchet turning before its exchange succeeded —
+    /// the screen and the wire say one thing, the next launch says another, and
+    /// nothing explains the difference.
+    pub fn persona_after(&self, name: impl Into<String>, colour: u32) -> Persona {
+        normalise_persona(name, colour, self.persona.version.saturating_add(1))
     }
 
     /// Replace the displayed persona and bump its version. The Layer-2 key is
@@ -419,6 +516,26 @@ pub fn verify_persona_record(wire: &[u8]) -> Result<VerifiedPersona, IdentityErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The engine stores `persona_after`'s answer and then makes
+    /// `update_persona`'s live. If those ever disagreed, every rename would
+    /// write down one thing and announce another.
+    #[test]
+    fn what_would_be_stored_is_what_goes_live() {
+        let mut id = Identity::generate("Me", 0x0044_88ff);
+        for (name, colour) in [
+            ("Wren", 0x00ff_0000),
+            ("Wren", 0x00ff_0000),
+            ("x", 0),
+            // Past both bounds, so the projection has to normalise exactly as
+            // the mutation does rather than merely pass the arguments through.
+            (&"y".repeat(MAX_PERSONA_NAME_LEN + 10)[..], 0xffff_ffff),
+        ] {
+            let projected = id.persona_after(name, colour);
+            id.update_persona(name, colour);
+            assert_eq!(id.persona(), &projected);
+        }
+    }
 
     #[test]
     fn generate_produces_two_distinct_layers() {

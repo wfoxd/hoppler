@@ -12,7 +12,17 @@
 //! in between.
 
 use rust_lib_hoppler::engine;
+use rust_lib_hoppler::identity::filekeystore::FileKeystore;
+use rust_lib_hoppler::identity::{Identity, Persona};
 use rust_lib_hoppler::store::{Direction, MessageState, NewContact, NewMessage};
+
+fn a_persona() -> Persona {
+    Persona {
+        name: "Wren".into(),
+        colour: 0x0044_88ff,
+        version: 1,
+    }
+}
 
 /// A contact written before a restart is there after it.
 ///
@@ -138,5 +148,204 @@ fn a_database_whose_key_is_gone_is_reset_rather_than_refused() {
         store.list_contacts().unwrap().is_empty(),
         "the old rows came back, which would mean they were readable without \
          the master"
+    );
+}
+
+/// The identity itself, which is the thing a pairing is *of*.
+///
+/// A store that persists while the keys underneath it do not is arguably worse
+/// than neither: the contact rows survive, so the app looks fine, and every one
+/// of them refers to a person this device can no longer prove it is.
+#[test]
+fn an_identity_survives_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("keys");
+
+    let (layer1, layer2) = {
+        let ks = FileKeystore::open(&path).unwrap();
+        assert!(
+            Identity::unsealed(&ks, a_persona()).unwrap().is_none(),
+            "a device that has sealed nothing must read as a first launch"
+        );
+        let identity = Identity::generate("Wren", 0x0044_88ff);
+        identity.seal_seeds(&ks).unwrap();
+        (identity.layer1_public(), identity.layer2_public())
+    };
+
+    let ks = FileKeystore::open(&path).unwrap();
+    let restored = Identity::unsealed(&ks, a_persona())
+        .unwrap()
+        .expect("the identity did not survive: this device is a new person");
+    assert_eq!(restored.layer1_public().0, layer1.0, "Layer-1 changed");
+    assert_eq!(restored.layer2_public().0, layer2.0, "Layer-2 changed");
+}
+
+/// A sealing that died between the two seeds must read as no identity rather
+/// than as half of one — half would be a device holding one key it can prove
+/// and one it invented.
+#[test]
+fn a_half_sealed_identity_is_no_identity() {
+    use rust_lib_hoppler::identity::keystore::Keystore;
+
+    for missing in [Identity::LAYER1_LABEL, Identity::LAYER2_LABEL] {
+        let dir = tempfile::tempdir().unwrap();
+        let ks = FileKeystore::open(dir.path().join("keys")).unwrap();
+        Identity::generate("Wren", 1).seal_seeds(&ks).unwrap();
+        ks.wipe(missing).unwrap();
+
+        assert!(
+            Identity::unsealed(&ks, a_persona()).unwrap().is_none(),
+            "with {missing} gone, half an identity was rebuilt"
+        );
+    }
+}
+
+/// A seed that is not the right length is not a seed this build wrote.
+/// Padding or truncating it would produce a *different* identity that looked
+/// like a working one, which is the failure with no symptom.
+#[test]
+fn a_seed_of_the_wrong_length_is_refused() {
+    use rust_lib_hoppler::identity::keystore::Keystore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let ks = FileKeystore::open(dir.path().join("keys")).unwrap();
+    Identity::generate("Wren", 1).seal_seeds(&ks).unwrap();
+    ks.seal(Identity::LAYER2_LABEL, &[7u8; 16]).unwrap();
+
+    assert!(
+        Identity::unsealed(&ks, a_persona()).is_err(),
+        "a 16-byte seed was stretched into an identity"
+    );
+}
+
+/// A name chosen once is the name next launch, which is the whole point of the
+/// step that is about to ask for one.
+///
+/// Goes through `update_persona`, the call the name screen will make, rather
+/// than through the storage helper underneath it. Written the shorter way
+/// first, and mutation testing said so: deleting the write inside
+/// `update_persona` broke nothing, because the test never went near it.
+///
+/// The only test in this binary that installs the core, since `CORE` is
+/// process-wide.
+#[test]
+fn a_renamed_persona_survives_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_string_lossy().into_owned();
+
+    engine::init_on(path.clone(), engine::Radio::Lan).unwrap();
+    engine::update_persona("Wren".into(), 0x0044_88ff).unwrap();
+
+    // Next launch: a fresh store over the same directory, as `load_identity`
+    // would open it.
+    let store = engine::open_store_for_test(path.clone()).unwrap();
+    assert_eq!(
+        engine::stored_persona_for_test(&store)
+            .unwrap()
+            .map(|p| p.name),
+        Some("Wren".to_string()),
+        "the chosen name did not survive the app being closed"
+    );
+}
+
+/// A keystore that fails must not read as a device that has never sealed
+/// anything.
+///
+/// This is the one that would have cost an identity. Read as "first launch",
+/// the engine generates a new one and seals it *over* the seed that was there
+/// but momentarily unreadable — destroying, on a transient IO error, the only
+/// key material on the device that cannot be recreated.
+#[test]
+fn a_failing_keystore_is_not_mistaken_for_a_first_launch() {
+    use rust_lib_hoppler::identity::keystore::{Keystore, KeystoreError};
+    use std::sync::Mutex;
+
+    /// Layer-1 present and readable; Layer-2 there but refusing.
+    struct HalfBroken(Mutex<Vec<u8>>);
+    impl Keystore for HalfBroken {
+        fn seal(&self, _: &str, _: &[u8]) -> Result<(), KeystoreError> {
+            Ok(())
+        }
+        fn unseal(&self, label: &str) -> Result<zeroize::Zeroizing<Vec<u8>>, KeystoreError> {
+            if label == Identity::LAYER1_LABEL {
+                Ok(zeroize::Zeroizing::new(self.0.lock().unwrap().clone()))
+            } else {
+                Err(KeystoreError::Backend)
+            }
+        }
+        fn wipe(&self, _: &str) -> Result<(), KeystoreError> {
+            Ok(())
+        }
+    }
+
+    let ks = HalfBroken(Mutex::new(vec![3u8; 32]));
+    assert_eq!(
+        Identity::unsealed(&ks, a_persona()).err(),
+        Some(KeystoreError::Backend),
+        "a backend failure read as a first launch, which would have sealed a \
+         new identity over the one that was there"
+    );
+}
+
+/// A corrupt persona record falls back to the default rather than becoming a
+/// live persona. Every invariant the writer holds, checked on the way in.
+#[test]
+fn a_corrupt_persona_is_ignored_rather_than_used() {
+    use rust_lib_hoppler::identity::{COLOUR_MASK, MAX_PERSONA_NAME_LEN};
+
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        ("too short", vec![0u8; 7]),
+        ("version zero", {
+            let mut v = vec![0u8; 8];
+            v.extend_from_slice(b"Wren");
+            v
+        }),
+        ("colour with a top byte", {
+            let mut v = 1u32.to_be_bytes().to_vec();
+            v.extend_from_slice(&(COLOUR_MASK + 1).to_be_bytes());
+            v.extend_from_slice(b"Wren");
+            v
+        }),
+        ("name over the bound", {
+            let mut v = 1u32.to_be_bytes().to_vec();
+            v.extend_from_slice(&1u32.to_be_bytes());
+            v.extend_from_slice(&[b'x'; MAX_PERSONA_NAME_LEN + 1]);
+            v
+        }),
+        // Refused on length before a byte of it is examined, so a corrupt row
+        // cannot choose how much work startup does.
+        ("enormous", {
+            let mut v = 1u32.to_be_bytes().to_vec();
+            v.extend_from_slice(&1u32.to_be_bytes());
+            v.extend_from_slice(&vec![b'x'; 4 * 1024 * 1024]);
+            v
+        }),
+        ("name is not text", {
+            let mut v = 1u32.to_be_bytes().to_vec();
+            v.extend_from_slice(&1u32.to_be_bytes());
+            v.extend_from_slice(&[0xff, 0xfe]);
+            v
+        }),
+    ];
+
+    for (why, bytes) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let store = engine::open_store_for_test(dir.path().to_string_lossy().into_owned()).unwrap();
+        store.settings_set("identity/persona/v1", &bytes).unwrap();
+        assert_eq!(
+            engine::stored_persona_for_test(&store).unwrap(),
+            None,
+            "a persona that is {why} was read back as usable"
+        );
+    }
+
+    // And a good one still reads, so what is refused is the corruption and not
+    // the format.
+    let dir = tempfile::tempdir().unwrap();
+    let store = engine::open_store_for_test(dir.path().to_string_lossy().into_owned()).unwrap();
+    engine::store_persona_for_test(&store, &a_persona()).unwrap();
+    assert_eq!(
+        engine::stored_persona_for_test(&store).unwrap(),
+        Some(a_persona())
     );
 }
