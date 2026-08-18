@@ -1,0 +1,77 @@
+name: apt
+description: Install packages, with a bound on how long a bad mirror can cost.
+
+# Why this exists rather than four copies of `sudo apt-get install`.
+#
+# On 18 Aug 2026 `apt-get update` hung on a GitHub runner for **78 minutes**
+# before anyone noticed, in two pull requests at once, holding up merges that
+# were otherwise green — and then again on a third job the same afternoon.
+# Nothing was wrong with any of the branches: the step has no timeout, so a
+# stalled mirror waits until the job's six-hour limit and the only symptom is a
+# check that never finishes, which from a pull request is indistinguishable
+# from a slow build.
+#
+# The bound is the point. A retry alone would still hang on the first attempt.
+
+inputs:
+  packages:
+    description: Space-separated package names.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      # Through the environment, not interpolated into the script. A composite
+      # action is callable from anywhere, and `${{ }}` pasted into a shell line
+      # is a command substitution waiting for an input somebody else controls.
+      env:
+        PACKAGES: ${{ inputs.packages }}
+      run: |
+        # GitHub runs a composite `run:` with `bash -eo pipefail`, so errexit is
+        # already on before the first line of this script. Off, deliberately:
+        # every apt call below is *expected* to fail sometimes — that is what
+        # the retry is for — and under errexit the loop is unreachable, so the
+        # action would exit on the first failure while claiming to retry.
+        #
+        # Found in review, after a local check that could not see it: the stub
+        # ran under plain `bash`, where the loop works fine. The reproduction is
+        # `bash -eo pipefail`, and that is what a check of this has to use.
+        set +e
+        set -uo pipefail
+        read -ra packages <<< "$PACKAGES"
+
+        # `--kill-after` because `timeout` alone sends SIGTERM and then waits:
+        # a process ignoring it outlives the bound, which is the failure this
+        # action exists to prevent, arrived at by a longer route.
+        run_apt() { sudo timeout --kill-after=30 180 "$@"; }
+
+        timed_out=false
+        for attempt in 1 2 3; do
+          run_apt apt-get update
+          rc=$?
+          if [ "$rc" -eq 0 ]; then
+            run_apt apt-get install -y "${packages[@]}"
+            rc=$?
+            [ "$rc" -eq 0 ] && exit 0
+          fi
+
+          # 124 is timeout giving up; 137 is the SIGKILL that followed.
+          case "$rc" in
+            124|137) timed_out=true; echo "::warning::apt timed out on attempt $attempt; retrying" ;;
+            *)       echo "::warning::apt failed on attempt $attempt (exit $rc); retrying" ;;
+          esac
+          # Retried whatever the reason, because a mirror handing out a 404 is
+          # the same kind of flake as one handing out nothing, and both are
+          # worth one more try. What the reason changes is what we say at the
+          # end — claiming "the network" for a package that does not exist
+          # would send somebody looking in the wrong place.
+          sleep 10
+        done
+
+        if [ "$timed_out" = true ]; then
+          echo "::error::apt timed out three times — the runner's network, not the branch"
+        else
+          echo "::error::apt failed three times, last exit $rc, without ever timing out — read the log above rather than assuming a bad mirror"
+        fi
+        exit 1
