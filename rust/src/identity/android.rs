@@ -15,9 +15,9 @@
 //! by name therefore works only on a thread that entered from Java, and the
 //! core's threads did not.
 //!
-//! So Kotlin calls in with an instance instead, and [`install`] keeps a global
-//! reference to it. Reading the class off a live object works from any thread,
-//! and the reference keeps it alive across the GC.
+//! So Kotlin calls in with an instance instead, and `nativeInstall` below keeps
+//! a global reference to it. Reading the class off a live object works from any
+//! thread, and the reference keeps it alive across the GC.
 
 use std::sync::OnceLock;
 
@@ -30,10 +30,10 @@ use super::wrapped::Hardware;
 
 /// The registered keystore object, and the VM needed to call it.
 ///
-/// Set once, from [`install`]. `OnceLock` rather than a mutable global because
-/// a second registration would mean two views of one key and no way to say
-/// which is current; there is exactly one `HardwareKeystore` and it lives as
-/// long as the process.
+/// Set once, from `nativeInstall` below. `OnceLock` rather than a mutable
+/// global because a second registration would mean two views of one key and no
+/// way to say which is current; there is exactly one `HardwareKeystore` and it
+/// lives as long as the process.
 static REGISTERED: OnceLock<(JavaVM, GlobalRef)> = OnceLock::new();
 
 /// Take the reference Kotlin is offering.
@@ -71,8 +71,9 @@ pub extern "system" fn Java_org_hoppler_hoppler_keystore_HardwareKeystore_native
 
 /// Whether Kotlin has registered itself.
 ///
-/// The engine asks before composing a [`WrappedKeystore`](super::wrapped::WrappedKeystore),
-/// because the alternative to knowing is worse — see `platform_keystore`.
+/// The engine asks before composing a
+/// [`WrappedKeystore`](super::wrapped::WrappedKeystore), because the
+/// alternative to knowing is worse — see `harden` there.
 pub fn is_available() -> bool {
     REGISTERED.get().is_some()
 }

@@ -88,6 +88,12 @@ class HardwareKeystore {
      *
      * `label` is authenticated but not encrypted, which is what stops a blob
      * sealed for one label from opening under another.
+     *
+     * **`secret` is zeroed before this returns, on every path.** It is the copy
+     * JNI made crossing in, and the caller is the core, which keeps its own and
+     * zeroes that itself — so nothing observes the change. Said here anyway,
+     * because a public method that empties its argument is not what anyone
+     * reading the signature would assume.
      */
     fun wrap(label: String, secret: ByteArray): ByteArray? =
         try {

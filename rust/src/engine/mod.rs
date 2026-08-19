@@ -17,7 +17,7 @@
 //! today, which is a real boundary on Android and a weak one on desktop. The
 //! shape it plugs into is
 //! [`WrappedKeystore`](crate::identity::wrapped::WrappedKeystore), and
-//! [`platform_keystore`] is the one place that will choose it.
+//! `platform_keystore` is the one place that chooses it.
 //!
 //! The fake network ([`fake`]) is the Ring-0 implementation, not a test double:
 //! it ships in this build because no real transport exists yet. When T08–T10
@@ -196,7 +196,7 @@ pub fn open_store_for_test(support_dir: String) -> Result<Store, String> {
 /// directory would work, and would be a second place for the answer to "is this
 /// a first launch" to come from.
 ///
-/// `dyn` because the backend is a platform choice — see [`platform_keystore`].
+/// `dyn` because the backend is a platform choice — see `platform_keystore`.
 type Opened = (Store, Arc<dyn Keystore>);
 
 /// The best keystore this platform has.
