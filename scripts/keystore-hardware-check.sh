@@ -90,7 +90,11 @@ BEFORE="$STATE_DIR/$SERIAL.before"
 
 if [ "$PHASE" != "--after" ]; then
   echo "── phase 1: the state this phone is in now ──────────────────────────"
-  if ! a shell pm list packages | grep -q "$PKG"; then
+  # Exact line, not a substring. `pm list packages` prints `package:<id>` and
+  # a plain grep for the id would also match `org.hoppler.hoppler.debug` or any
+  # other suffixed build — reporting "installed" about a different app, whose
+  # storage this script then cannot read.
+  if ! a shell pm list packages | tr -d '\r' | grep -qx "package:$PKG"; then
     echo "not installed. Nothing to migrate, so this phone can only test the"
     echo "fresh-install half. Install and re-run with --after."
     : > "$BEFORE"
@@ -168,8 +172,18 @@ done < "$AFTER"
 while read -r name hash _; do
   [ -n "${name:-}" ] || continue
   case "$name" in [0-9]*) continue ;; esac   # the `ls -i` line, which starts with the inode
-  if awk -v h="$hash" '$2 == h {found=1} END {exit !found}' "$AFTER"; then
+  # Name *and* hash. Matching on the hash alone asks "did any file survive
+  # unchanged", which answers about the set rather than about this entry — a
+  # removed file whose hash reappears elsewhere would be attributed to the
+  # wrong label, and the verdict here is per-secret.
+  if awk -v n="$name" -v h="$hash" '$1 == n && $2 == h {found=1} END {exit !found}' "$AFTER"; then
     bad "$name has the same contents as before — it was not wrapped"
+  elif ! awk -v n="$name" '$1 == n {found=1} END {exit !found}' "$AFTER"; then
+    # Gone entirely, which the wrapped/bare loop above cannot see: it walks
+    # what is there now, and a secret that vanished is not there to walk. This
+    # is the loss the whole check exists to catch — the upgrade read a seed and
+    # left nothing behind — so it is louder than either other verdict.
+    bad "$name is gone — a secret that existed before the upgrade no longer does"
   fi
 done < "$BEFORE"
 
