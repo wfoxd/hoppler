@@ -110,9 +110,17 @@ impl<K: Keystore, H: Hardware> Keystore for WrappedKeystore<K, H> {
     /// arms the other way round. Every unwrap failure is therefore
     /// [`KeystoreError::Backend`], which stops the launch instead.
     ///
-    /// Failures here are real and not hypothetical: Android invalidates keys
-    /// when the lock screen credential is removed, and app data restored onto a
-    /// different device arrives with blobs no local key can open.
+    /// Failures here are real and not hypothetical. Keystore keys do not travel
+    /// with app data, so anything restored onto a different phone arrives as
+    /// blobs no local key can open; the same goes for a keystore entry lost to
+    /// an uninstall or a factory reset while the files survive.
+    ///
+    /// Not, as this said when it was written, a lock screen change. Permanent
+    /// invalidation on that applies to keys created with
+    /// `setUserAuthenticationRequired`, and Hoppler's deliberately is not one —
+    /// binding every unseal to an unlock would mean a device that cannot open
+    /// its own database until somebody authenticates, which R0-F1's
+    /// thirty-second first launch rules out.
     ///
     /// # An unwrapped secret is accepted, and upgraded
     ///
@@ -268,10 +276,10 @@ mod tests {
         );
     }
 
-    /// The one that keeps R0-F1 true. A hardware key that has gone — Android
-    /// drops them when the lock screen credential is removed — must not read as
-    /// "no identity here", because the engine answers that by making a new one
-    /// and sealing it over the top.
+    /// The one that keeps R0-F1 true. A hardware key that has gone — app data
+    /// restored onto a different phone, where keystore keys do not follow —
+    /// must not read as "no identity here", because the engine answers that by
+    /// making a new one and sealing it over the top.
     #[test]
     fn a_broken_hardware_key_is_a_backend_error_not_a_missing_secret() {
         let ks = keystore();
@@ -282,7 +290,7 @@ mod tests {
             ks.unseal("hoppler/layer1-seed/v1").unwrap_err(),
             KeystoreError::Backend,
             "an unreadable identity reported as an absent one is a device that \
-             becomes a different person after a lock screen change"
+             becomes a different person the first time its data moves"
         );
     }
 
