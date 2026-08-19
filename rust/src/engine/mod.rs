@@ -17,7 +17,7 @@
 //! today, which is a real boundary on Android and a weak one on desktop. The
 //! shape it plugs into is
 //! [`WrappedKeystore`](crate::identity::wrapped::WrappedKeystore), and
-//! [`platform_keystore`] is the one place that will choose it.
+//! `platform_keystore` is the one place that chooses it.
 //!
 //! The fake network ([`fake`]) is the Ring-0 implementation, not a test double:
 //! it ships in this build because no real transport exists yet. When T08–T10
@@ -196,27 +196,59 @@ pub fn open_store_for_test(support_dir: String) -> Result<Store, String> {
 /// directory would work, and would be a second place for the answer to "is this
 /// a first launch" to come from.
 ///
-/// `dyn` because the backend is a platform choice — see [`platform_keystore`].
+/// `dyn` because the backend is a platform choice — see `platform_keystore`.
 type Opened = (Store, Arc<dyn Keystore>);
 
 /// The best keystore this platform has.
 ///
 /// One function, so that "what protects the seeds here" has one answer and one
-/// place to read it. Today that answer is the same everywhere and is file
-/// permissions alone — which is the app sandbox, enforced by the kernel against
-/// a separate uid, on Android; and merely "the account you are already logged
-/// in as" on a Linux desktop, where anything running as that user can read
-/// them.
+/// place to read it.
 ///
-/// Android is where it will differ, and this is the line that will change:
-/// the file keystore becomes the inner half of a
-/// [`WrappedKeystore`](crate::identity::wrapped::WrappedKeystore) whose
-/// wrapping key is generated in the Android Keystore and never leaves it, which
-/// is what R0-F1 means by hardware. Desktop has no equivalent to reach for.
+/// **Android** gets the file keystore inside a
+/// [`WrappedKeystore`](crate::identity::wrapped::WrappedKeystore): every secret
+/// is encrypted under a key generated in the Android Keystore, which cannot be
+/// exported and cannot be used on another device. That is R0-F1's "master
+/// secret in platform hardware".
+///
+/// **Linux desktop** gets the file keystore alone — file permissions, which
+/// there means only "the account you are already logged in as", since anything
+/// running as that user can read them. There is no platform key store to reach
+/// for and the file keystore's own module doc says what that is worth.
+///
+/// # Why a missing bridge is fatal on Android rather than a fallback
+///
+/// If Kotlin never registered itself, this could quietly return the bare file
+/// keystore and the app would start. It would also mean a build that says it
+/// keeps the master in hardware and does not, on precisely the devices where
+/// something went wrong, with nothing on screen to say so. The failure is a
+/// wiring mistake inside one APK — the Kotlin and the Rust ship together — so
+/// it is a bug to fix, not a condition to degrade through.
 fn platform_keystore(dir: &Path) -> Result<Arc<dyn Keystore>, String> {
-    Ok(Arc::new(
-        FileKeystore::open(dir.join("keys")).map_err(|e| e.to_string())?,
-    ))
+    let files = FileKeystore::open(dir.join("keys")).map_err(|e| e.to_string())?;
+    harden(files)
+}
+
+/// Put the platform's key in front of the files, where there is one.
+///
+/// Two whole functions rather than a branch inside one, so that neither
+/// platform's version has a case the other must read past — and so the Android
+/// one can name Android types without the desktop build pretending they exist.
+#[cfg(target_os = "android")]
+fn harden(files: FileKeystore) -> Result<Arc<dyn Keystore>, String> {
+    use crate::identity::android::{self, AndroidHardware};
+    use crate::identity::wrapped::WrappedKeystore;
+
+    if !android::is_available() {
+        return Err("the hardware keystore was never registered; \
+                    HardwareKeystore.install() must run before the core opens a store"
+            .to_owned());
+    }
+    Ok(Arc::new(WrappedKeystore::new(files, AndroidHardware)))
+}
+
+#[cfg(not(target_os = "android"))]
+fn harden(files: FileKeystore) -> Result<Arc<dyn Keystore>, String> {
+    Ok(Arc::new(files))
 }
 
 fn open_store(support_dir: String) -> Result<Opened, String> {

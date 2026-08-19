@@ -37,6 +37,8 @@
 //!   malicious low-order peer point; `DhSecret` deliberately has no byte export,
 //!   so §5 hand-rolls Noise on `crypto::dh` (consistent with crypto confinement).
 
+#[cfg(target_os = "android")]
+pub mod android;
 pub mod filekeystore;
 pub mod keystore;
 pub mod wrapped;

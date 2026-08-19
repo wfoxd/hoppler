@@ -9,6 +9,7 @@ import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodChannel
 import org.hoppler.hoppler.ble.BleAdapter
 import org.hoppler.hoppler.ble.BlePermissions
+import org.hoppler.hoppler.keystore.HardwareKeystore
 import org.hoppler.hoppler.nfc.NfcAdapter
 
 class MainActivity : FlutterActivity() {
@@ -57,6 +58,11 @@ class MainActivity : FlutterActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        // Before anything else, and before the Dart entrypoint runs: the core
+        // reaches for this the first time it opens a store, and refuses to
+        // start if it is not there. Registering later would be a race whose
+        // losing side is an app that will not launch.
+        HardwareKeystore.install()
         val adapter = BleAdapter(applicationContext)
         ble = adapter
         val messenger = flutterEngine.dartExecutor.binaryMessenger

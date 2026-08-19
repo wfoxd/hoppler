@@ -29,6 +29,9 @@ zeroize = "1.9.0"
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }
 
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21.1"
+
 [build-dependencies]
 prost-build = "0.14.4"
 

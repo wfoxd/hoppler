@@ -146,6 +146,15 @@ jobs:
       # The adapter's radio-free logic (framing, peer-id validation, the
       # sighting decision). BLE itself needs two phones; these do not, and two
       # of the three defects review found in the adapter were exactly this kind.
+      # The JNI bridge is `#[cfg(target_os = "android")]`, so the `rust` job's
+      # clippy — which runs on the host — has never compiled a line of it. This
+      # is the only job with an NDK, so it is the only place that can. Found a
+      # real error the first time it was run, on a tree `make ci` called green.
+      #
+      # After the APK build deliberately: it is the cheap step of the two, and
+      # putting it second means a genuine build failure is not delayed behind a
+      # lint.
+      - run: make lint-android
       - run: cd android && ./gradlew :app:testDebugUnitTest
 
   linux:
