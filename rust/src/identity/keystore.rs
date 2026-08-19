@@ -1,11 +1,16 @@
 //! Keystore boundary for Layer-1 / Layer-2 secret seeds (tech spec §3).
 //!
-//! The production backend on Android is
-//! [`WrappedKeystore`](super::wrapped::WrappedKeystore) over
-//! [`FileKeystore`](super::filekeystore::FileKeystore): the seeds live in
-//! app-private storage, encrypted under a key generated in the Android Keystore
-//! that cannot be exported. Its device-only "attempted extraction" acceptance
-//! test is the remaining device-gated piece of T05.
+//! Every platform currently gets
+//! [`FileKeystore`](super::filekeystore::FileKeystore) — bytes in a directory,
+//! protected by file permissions and nothing else.
+//!
+//! The backend Android is *going* to get is
+//! [`WrappedKeystore`](super::wrapped::WrappedKeystore) over that same file
+//! keystore, encrypting each secret under a key generated in the Android
+//! Keystore that cannot be exported. The composition exists and is tested; the
+//! wrapping key and its JNI bridge are not built yet, so nothing constructs one
+//! and no build gets that protection today. It, and its device-only "attempted
+//! extraction" acceptance test, are the remaining device-gated piece of T05.
 //!
 //! This module defines the trait every backend implements, plus an in-memory
 //! [`SoftwareKeystore`] used by the core's tests and by desktop dev builds.

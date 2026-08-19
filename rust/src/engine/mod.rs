@@ -202,15 +202,17 @@ type Opened = (Store, Arc<dyn Keystore>);
 /// The best keystore this platform has.
 ///
 /// One function, so that "what protects the seeds here" has one answer and one
-/// place to read it. Today that answer is the same everywhere: bytes in a
-/// directory only this app can read.
+/// place to read it. Today that answer is the same everywhere and is file
+/// permissions alone — which is the app sandbox, enforced by the kernel against
+/// a separate uid, on Android; and merely "the account you are already logged
+/// in as" on a Linux desktop, where anything running as that user can read
+/// them.
 ///
-/// Android is where it will differ. There the file keystore becomes the inner
-/// half of a
+/// Android is where it will differ, and this is the line that will change:
+/// the file keystore becomes the inner half of a
 /// [`WrappedKeystore`](crate::identity::wrapped::WrappedKeystore) whose
 /// wrapping key is generated in the Android Keystore and never leaves it, which
-/// is what R0-F1 means by hardware. Desktop has no equivalent to reach for and
-/// the file keystore's own module doc says plainly what that is worth.
+/// is what R0-F1 means by hardware. Desktop has no equivalent to reach for.
 fn platform_keystore(dir: &Path) -> Result<Arc<dyn Keystore>, String> {
     Ok(Arc::new(
         FileKeystore::open(dir.join("keys")).map_err(|e| e.to_string())?,

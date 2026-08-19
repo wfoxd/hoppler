@@ -60,9 +60,12 @@ pub trait Hardware: Send + Sync {
 
     /// Reverse [`wrap`](Hardware::wrap) for the same label.
     ///
-    /// Every failure is [`KeystoreError::Backend`], including one caused by the
-    /// key being gone. See [`WrappedKeystore::unseal`] for why that matters
-    /// more than it looks.
+    /// Every failure should be [`KeystoreError::Backend`], including one caused
+    /// by the key being gone — see [`WrappedKeystore::unseal`] for why that
+    /// matters more than it looks. `unseal` does not rely on this: it maps
+    /// whatever comes back, because a promise in a trait doc is not a thing the
+    /// caller can check and the cost of an implementor forgetting is a lost
+    /// identity.
     fn unwrap(&self, label: &str, wrapped: &[u8]) -> Result<Zeroizing<Vec<u8>>, KeystoreError>;
 }
 
@@ -138,7 +141,15 @@ impl<K: Keystore, H: Hardware> Keystore for WrappedKeystore<K, H> {
             }
             return Ok(stored);
         };
-        self.hardware.unwrap(label, wrapped)
+        // Mapped rather than propagated. The trait doc asks for `Backend`, but
+        // an implementation is free to get that wrong, and one that answered
+        // `NotFound` for a key it could not use would walk straight into the
+        // failure this method is written to prevent — silently, and only on the
+        // devices whose keys had actually gone. Costing a line here to make it
+        // unreachable is better than a rule an implementor has to remember.
+        self.hardware
+            .unwrap(label, wrapped)
+            .map_err(|_| KeystoreError::Backend)
     }
 
     /// Remove the secret.
@@ -272,6 +283,33 @@ mod tests {
             KeystoreError::Backend,
             "an unreadable identity reported as an absent one is a device that \
              becomes a different person after a lock screen change"
+        );
+    }
+
+    /// The same property, but against the hardware layer itself getting it
+    /// wrong. `Hardware`'s doc asks for `Backend`; an implementation that
+    /// answered `NotFound` for a key it could not use would hand the engine
+    /// "no identity here" for an identity that is right there, and this type
+    /// must not let a doc comment be the only thing standing in the way.
+    #[test]
+    fn a_hardware_that_answers_not_found_still_does_not_lose_the_identity() {
+        struct Confused;
+        impl Hardware for Confused {
+            fn wrap(&self, _: &str, secret: &[u8]) -> Result<Vec<u8>, KeystoreError> {
+                Ok(secret.to_vec())
+            }
+            fn unwrap(&self, _: &str, _: &[u8]) -> Result<Zeroizing<Vec<u8>>, KeystoreError> {
+                Err(KeystoreError::NotFound)
+            }
+        }
+
+        let ks = WrappedKeystore::new(SoftwareKeystore::new(), Confused);
+        ks.seal("hoppler/layer1-seed/v1", &[1u8; 32]).unwrap();
+        assert_eq!(
+            ks.unseal("hoppler/layer1-seed/v1").unwrap_err(),
+            KeystoreError::Backend,
+            "a hardware backend's mistake became the engine's instruction to \
+             generate a new identity"
         );
     }
 
