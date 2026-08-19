@@ -480,6 +480,20 @@ mod tests {
         );
     }
 
+    /// Two faults at once, and the one reported has to be the one actually in
+    /// the way. A stream with no numbers left does not care how long the body
+    /// is: shortening it would change nothing, so blaming the body sends
+    /// somebody to fix the wrong thing.
+    #[test]
+    fn an_exhausted_stream_says_so_even_when_the_body_is_also_bad() {
+        let mut out = Outbox::resumed(u64::MAX, []);
+        assert_eq!(
+            out.queue(vec![0; MAX_BODY + 1]),
+            Err(OutboxError::Exhausted),
+            "reported the body when the stream was the problem"
+        );
+    }
+
     /// The invariant a resend rests on, stated as a test: the numbers handed
     /// back are the ones that were issued, so the rows they name still carry
     /// the `msg_id` the far side saw.
@@ -899,17 +913,23 @@ impl Outbox {
         if self.unacked.len() >= MAX_UNACKED {
             return Err(OutboxError::Full);
         }
-        let envelope = ChatEnvelope::new(self.next_seq, body).map_err(OutboxError::Envelope)?;
-        // Checked, because `Inbox` had exactly this written as `+ 1` and
-        // panicked on the last value in range. A panic in the send path is not
-        // how anyone should meet an edge this far out.
+        // Worked out before the envelope so that an exhausted stream reports
+        // itself as one. Built the other way round, a stream with no numbers
+        // left and an over-long body answered `Envelope(TooLong)` — true, and
+        // not the thing standing in the way, since shortening the body would
+        // change nothing.
         //
-        // The cost is that `u64::MAX` itself is never used: there would be no
-        // number after it, and a counter that cannot advance is worse than one
-        // message short of the end of a range nothing reaches.
+        // Checked at all because `Inbox` had this written as `+ 1` and panicked
+        // on the last value in range, and a panic in the send path is not how
+        // anyone should meet an edge this far out. The cost is that `u64::MAX`
+        // is never issued: there would be no number after it, and a counter
+        // that cannot advance is worse than being one message short of the end
+        // of a range nothing reaches.
         let Some(next) = self.next_seq.checked_add(1) else {
             return Err(OutboxError::Exhausted);
         };
+        let envelope = ChatEnvelope::new(self.next_seq, body).map_err(OutboxError::Envelope)?;
+        // Only now, so a refused body still leaves the number unspent.
         self.next_seq = next;
         self.unacked.insert(envelope.seq);
         Ok(envelope)
