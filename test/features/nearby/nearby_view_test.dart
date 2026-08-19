@@ -108,6 +108,45 @@ void _radioReasonGroup() {
         'Bluetooth is off',
       );
     });
+
+    /// A refusal used to put one line in the activity log and leave the nearby
+    /// area saying "No one nearby" — R0-F2's false claim about the room,
+    /// reached by the one route nothing was watching.
+    test('a refused permission is said where the empty list would be', () {
+      final said = radioReasonFrom(available: false, permissionDenied: true);
+      expect(said, isNotNull);
+      expect(
+        said,
+        contains('permission'),
+        reason: 'the sentence has to name the thing the person can fix',
+      );
+    });
+
+    /// The refusal is the cause: the radio has nothing to report because it was
+    /// never allowed to look. So it outranks the radio's own words, and it
+    /// outranks them even when the radio calls itself available — a permission
+    /// we do not hold makes that report meaningless.
+    test('a refusal outranks what the radio says about itself', () {
+      expect(
+        radioReasonFrom(
+          available: false,
+          reason: 'Bluetooth is off',
+          permissionDenied: true,
+        ),
+        contains('permission'),
+      );
+      expect(
+        radioReasonFrom(available: true, permissionDenied: true),
+        contains('permission'),
+        reason: 'an available radio we may not use is not an available radio',
+      );
+    });
+
+    /// And it stops being said the moment it stops being true, or the screen
+    /// keeps blaming a permission that has since been granted in Settings.
+    test('granting it clears the sentence', () {
+      expect(radioReasonFrom(available: true, permissionDenied: false), isNull);
+    });
   });
 
   /// The empty list has two meanings and needs two sentences.

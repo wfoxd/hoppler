@@ -111,6 +111,15 @@ class _HomePageState extends State<HomePage> {
   /// off" and "nobody is nearby" both look like, and R0-F2 turns on the user
   /// being able to tell those apart.
   String? _radioReason;
+
+  /// Somebody was asked for the Bluetooth permission and said no.
+  ///
+  /// Kept apart from [_radioReason] rather than written into it, because the
+  /// two arrive from different places and would overwrite each other: the core
+  /// pushes `RadioChanged` whenever the radio's state moves, and folding a
+  /// refusal into the same field means the next such event silently erases it.
+  /// `radioReasonFrom` decides which is shown.
+  bool _permissionDenied = false;
   final List<String> _log = [];
   double? _transfer; // 0..1 while a Drop is in flight
 
@@ -251,7 +260,11 @@ class _HomePageState extends State<HomePage> {
           if (_pairing?.deviceId == deviceId) _pairing = null;
           _log.insert(0, 'Pairing failed: $reason');
         case CoreEvent_RadioChanged(:final available, :final reason):
-          _radioReason = radioReasonFrom(available: available, reason: reason);
+          _radioReason = radioReasonFrom(
+            available: available,
+            reason: reason,
+            permissionDenied: _permissionDenied,
+          );
       }
     });
   }
@@ -318,23 +331,45 @@ class _HomePageState extends State<HomePage> {
               // found. Turning *off* asks nothing: withdrawing does not need a
               // permission, and prompting to stop being discoverable would be
               // absurd.
-              if (v && !await ensureRadioPermission()) {
-                // Declined. The switch goes back rather than sitting on while
-                // nothing works — an "on" that discovers nobody is the failure
-                // this app cannot tell apart from an empty room.
+              if (v) {
+                final granted = await ensureRadioPermission();
                 if (!mounted) return;
-                setState(() {
-                  _discovery = false;
-                  _log.insert(
-                    0,
-                    'Discovery needs permission to use Bluetooth. '
-                    'You can grant it in Settings.',
-                  );
-                });
-                return;
+                if (!granted) {
+                  // Declined. The switch goes back rather than sitting on while
+                  // nothing works — an "on" that discovers nobody is the failure
+                  // this app cannot tell apart from an empty room.
+                  //
+                  // And the reason goes where the empty list would be, not only
+                  // into the log. A line in the log scrolls away and is not
+                  // where somebody looks when the list is empty; the nearby
+                  // area is, and leaving it saying "No one nearby" is R0-F2's
+                  // false claim about the room.
+                  setState(() {
+                    _discovery = false;
+                    _permissionDenied = true;
+                    _radioReason = radioReasonFrom(
+                      available: false,
+                      permissionDenied: true,
+                    );
+                  });
+                  return;
+                }
+                // Granted, possibly after a trip to Settings. Clearing it here
+                // is what lets the screen recover without a restart.
+                _permissionDenied = false;
               }
               await setDiscovery(enabled: v);
-              if (mounted) setState(() => _discovery = v);
+              if (mounted) {
+                setState(() {
+                  _discovery = v;
+                  if (!_permissionDenied && _radioReason != null && v) {
+                    // The refusal's sentence is stale the moment the permission
+                    // is held; the core's next `RadioChanged` will say what is
+                    // actually wrong, if anything.
+                    _radioReason = null;
+                  }
+                });
+              }
             },
           ),
           if (_pairing == null && _myCode == null && !_scanning)

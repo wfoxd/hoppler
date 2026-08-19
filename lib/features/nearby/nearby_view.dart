@@ -9,8 +9,33 @@ import 'package:flutter/material.dart';
 ///
 /// A pure function so that rule is testable. It was stated in a comment and
 /// got written the wrong way round one file over, in the same change.
-String? radioReasonFrom({required bool available, String? reason}) =>
-    available ? null : (reason ?? 'The radio is unavailable');
+/// The sentence to put where the nearby list goes, or null when there is none.
+///
+/// # Why a refused permission outranks the radio's own report
+///
+/// Both end in an empty list, and the empty list is the thing R0-F2 says must
+/// never be read as "nobody is nearby". But they are not equally useful to say.
+/// A refusal is the *cause* — the radio has nothing to report because it was
+/// never allowed to look — and it is the only one of the two a person can do
+/// something about. So it wins, and it wins even when the radio is reporting
+/// itself available, because a permission we do not hold makes that report
+/// meaningless.
+///
+/// Before this, a refusal put one line in the activity log and left the nearby
+/// area saying "No one nearby" — which is the false claim about the room that
+/// this whole function exists to prevent, arrived at by the one route nothing
+/// was watching.
+String? radioReasonFrom({
+  required bool available,
+  String? reason,
+  bool permissionDenied = false,
+}) {
+  if (permissionDenied) {
+    return 'Hoppler needs permission to use Bluetooth. You can grant it in '
+        'Settings.';
+  }
+  return available ? null : (reason ?? 'The radio is unavailable');
+}
 
 /// What fills the nearby area: the devices, or the reason there are none.
 ///
