@@ -2,6 +2,7 @@ import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:hoppler/src/rust/api/types.dart';
 
 /// The first thing a new device asks (R0-F1).
 ///
@@ -18,6 +19,18 @@ import 'package:flutter/services.dart';
 /// device with no chosen name should not be discoverable yet, so this stands in
 /// front of everything rather than floating over a list that is already live.
 ///
+/// # The colour is chosen here too
+///
+/// R0-F1 asks for a name *and* a colour, and until now the core drew one and
+/// the screen only showed it. Showing it was the smaller half: the colour is
+/// the thing a person recognises their own device by in a list, and one drawn
+/// at random is as likely as not to be the one they would not have picked.
+///
+/// The drawn colour stays the starting selection rather than the row starting
+/// empty — a screen that refuses to continue until two things are chosen is
+/// twice as long as it needs to be, and the random colour was already good
+/// enough to ship.
+///
 /// # What it does not do
 ///
 /// No skip. A name is one field and takes a moment, and "Me" is precisely the
@@ -26,7 +39,12 @@ import 'package:flutter/services.dart';
 /// unique: nothing here is an account, two people called Sam are two people
 /// called Sam, and the ceremony's colours are what actually distinguishes them.
 class NameView extends StatefulWidget {
-  const NameView({super.key, required this.colour, required this.onChosen});
+  const NameView({
+    super.key,
+    required this.colour,
+    required this.palette,
+    required this.onChosen,
+  });
 
   /// Matches `MAX_PERSONA_NAME_LEN` in `identity/mod.rs`, which truncates
   /// anything longer. Enforced here so a long name is refused while it is being
@@ -41,13 +59,17 @@ class NameView extends StatefulWidget {
   /// by [_ByteLimit] rather than approximated.
   static const maxNameBytes = 64;
 
-  /// The colour the core drew for this device. Shown, not chosen: R0-F1 asks
-  /// for a colour too, and offering one here is a small addition — until then
-  /// this at least stops it being a surprise the first time they see it.
+  /// The colour the core drew for this device, and the starting selection.
   final Color colour;
 
-  /// Called with a trimmed, non-empty name.
-  final Future<void> Function(String name) onChosen;
+  /// The colours on offer, from the core so that nothing has to keep a second
+  /// copy of the palette in step. Each carries its name, which is what labels
+  /// the swatch for anyone who cannot tell two of them apart.
+  final List<PersonaColourDto> palette;
+
+  /// Called with a trimmed, non-empty name and the chosen colour, packed
+  /// 0xRRGGBB as the core stores it.
+  final Future<void> Function(String name, int colour) onChosen;
 
   @override
   State<NameView> createState() => _NameViewState();
@@ -57,6 +79,20 @@ class _NameViewState extends State<NameView> {
   final _controller = TextEditingController();
   bool _saving = false;
   String? _failed;
+  /// The core's draw, as a starting point only.
+  ///
+  /// A `late` initializer rather than `initState`, which is the same thing
+  /// later: it runs on first *read*, which is in `build`, so `widget` is long
+  /// since set. Kept as one line because that is where the field's meaning is.
+  ///
+  /// Not kept in step with [NameView.colour] afterwards, and that is deliberate
+  /// rather than overlooked: a `didUpdateWidget` here would silently discard
+  /// somebody's pick if the parent ever rebuilt with a new draw. It cannot
+  /// today — the persona only changes once a name is chosen, and that is the
+  /// moment this screen is replaced — but "the parent overwrote your choice"
+  /// is a worse failure than a stale prop, so the choice wins if they ever
+  /// disagree.
+  late int _colour = widget.colour.toARGB32() & 0x00ffffff;
 
   bool get _usable => _controller.text.trim().isNotEmpty;
 
@@ -73,7 +109,7 @@ class _NameViewState extends State<NameView> {
       _failed = null;
     });
     try {
-      await widget.onChosen(name);
+      await widget.onChosen(name, _colour);
     } catch (e, stack) {
       // Stays on this screen. The core refuses the name when it cannot store
       // it, and continuing into the app would mean discovering as a name the
@@ -115,7 +151,10 @@ class _NameViewState extends State<NameView> {
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
-                  CircleAvatar(radius: 32, backgroundColor: widget.colour),
+                  CircleAvatar(
+                    radius: 32,
+                    backgroundColor: Color(0xFF000000 | _colour),
+                  ),
                   const SizedBox(height: 24),
                   Text(
                     'What should people call you?',
@@ -156,6 +195,26 @@ class _NameViewState extends State<NameView> {
                     onChanged: (_) => setState(() {}),
                     onSubmitted: (_) => _submit(),
                   ),
+                  const SizedBox(height: 24),
+                  // Wrap, not Row: eight swatches at a large text scale on a
+                  // narrow phone overflow a Row, and an overflow here is a
+                  // colour nobody can reach.
+                  Wrap(
+                    spacing: 12,
+                    runSpacing: 12,
+                    alignment: WrapAlignment.center,
+                    children: [
+                      for (final c in widget.palette)
+                        _Swatch(
+                          name: c.name,
+                          colour: c.value,
+                          selected: c.value == _colour,
+                          onPick: _saving
+                              ? null
+                              : () => setState(() => _colour = c.value),
+                        ),
+                    ],
+                  ),
                   if (_failed != null) ...[
                     const SizedBox(height: 8),
                     Text(
@@ -195,4 +254,63 @@ class _ByteLimit extends TextInputFormatter {
     TextEditingValue oldValue,
     TextEditingValue newValue,
   ) => utf8.encode(newValue.text).length > maxBytes ? oldValue : newValue;
+}
+
+/// One colour to pick, as a circle.
+///
+/// # Why the selected one also has a tick
+///
+/// A ring in the theme's accent colour is the obvious way to show which is
+/// chosen, and it is the wrong one on its own: this is a row of colours, the
+/// people most likely to be helped by a clear indicator are the ones who cannot
+/// separate two of these, and "the one with the differently-coloured outline"
+/// asks them to do the thing they cannot. The tick is a shape, so it survives
+/// any amount of colour blindness and a greyscale screenshot.
+class _Swatch extends StatelessWidget {
+  const _Swatch({
+    required this.name,
+    required this.colour,
+    required this.selected,
+    required this.onPick,
+  });
+
+  final String name;
+  final int colour;
+  final bool selected;
+  final VoidCallback? onPick;
+
+  @override
+  Widget build(BuildContext context) {
+    final fill = Color(0xFF000000 | colour);
+    // Against the swatch, not the page. Half of this palette is light enough
+    // that a white tick on it is invisible, which would put the shape back to
+    // being no shape at all.
+    final tick = ThemeData.estimateBrightnessForColor(fill) == Brightness.dark
+        ? Colors.white
+        : Colors.black;
+    return Semantics(
+      label: name,
+      button: true,
+      selected: selected,
+      // The tick and ring are already in the tree; without this the reader
+      // announces the name and leaves out the only part that says which is
+      // chosen.
+      child: InkWell(
+        onTap: onPick,
+        customBorder: const CircleBorder(),
+        child: Container(
+          width: 44,
+          height: 44,
+          decoration: BoxDecoration(
+            color: fill,
+            shape: BoxShape.circle,
+            border: selected
+                ? Border.all(color: Theme.of(context).colorScheme.onSurface, width: 3)
+                : null,
+          ),
+          child: selected ? Icon(Icons.check, size: 22, color: tick) : null,
+        ),
+      ),
+    );
+  }
 }

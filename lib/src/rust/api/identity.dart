@@ -17,3 +17,13 @@ Future<PersonaDto> updatePersona({required String name, required int colour}) =>
       name: name,
       colour: colour,
     );
+
+/// The colours offered on first launch.
+///
+/// Served from the core rather than listed again in the UI, because there are
+/// already two places that must agree about a colour — what is drawn for a new
+/// device, and what is offered when they change it — and a third copy in Dart
+/// would be the one nobody updates. Any colour is still accepted by
+/// [`update_persona`]; this is the palette, not a whitelist.
+Future<List<PersonaColourDto>> personaColours() =>
+    RustLib.instance.api.crateApiIdentityPersonaColours();
