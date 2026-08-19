@@ -43,8 +43,10 @@ use crate::identity::keystore::Keystore;
 use crate::identity::{Identity, Persona, VerifiedPersona};
 use crate::identity::{COLOUR_MASK, MAX_PERSONA_NAME_LEN};
 use crate::pairing::invite::Invite;
+use crate::session::chat::ChatEnvelope;
 use crate::store::{
-    Direction, MessageState, NewContact, NewMessage, NewTransfer, Store, StoreError, TransferState,
+    Direction, InsertOutcome, MessageState, NewContact, NewMessage, NewTransfer, Store, StoreError,
+    TransferState,
 };
 
 struct Core {
@@ -548,17 +550,29 @@ fn watch_for_an_undelivered_ping(net: Arc<net::Net>) {
 /// event loop (never synchronously during this call). Real transports reply
 /// seconds later; UI must not assume the reply is present when this returns.
 pub fn send_chat(device_id: String, text: String) -> Result<ChatMessageDto, String> {
-    let (dto, msg_id_bytes) = with_core_mut(|core| {
+    let (dto, envelope) = with_core_mut(|core| {
         let now = now_millis();
         let thread = ensure_thread(core, &device_id, now)?;
 
-        let (out_bytes, out_hex) = new_msg_id();
-        let out_bytes_for_state = out_bytes.clone();
         let seq = core.store.next_seq(thread, Direction::Outgoing)?;
+        // The envelope draws the id, so the number the row is stored under and
+        // the number that goes on the wire are the same object rather than two
+        // things that happen to agree. `new_msg_id` used to make one here and
+        // the receiver made another at the far end, which is why a resend could
+        // never be recognised as one.
+        let envelope = ChatEnvelope::new(seq as u64, text.clone().into_bytes())
+            .map_err(|e| StoreError::Db(e.to_string()))?;
+        // Everything below reads the envelope. There is deliberately no second
+        // copy of the id: the row, the value handed back to the caller and the
+        // bytes on the wire are three uses of one value rather than three
+        // things that have to be kept in step. They cannot be checked against
+        // each other from here — the engine is a singleton, so no test can
+        // stand up a second one to watch the wire — so the guarantee has to be
+        // that there is nothing to diverge.
         core.store.add_message(&NewMessage {
             thread_id: thread,
             seq,
-            msg_id: out_bytes,
+            msg_id: envelope.msg_id.to_vec(),
             body: text.clone().into_bytes(),
             direction: Direction::Outgoing,
             // Queued, not Sent: nothing has left the device yet. Writing
@@ -568,14 +582,14 @@ pub fn send_chat(device_id: String, text: String) -> Result<ChatMessageDto, Stri
             created_at: now,
         })?;
         let dto = ChatMessageDto {
-            msg_id: out_hex,
+            msg_id: hex::encode(envelope.msg_id),
             thread_id: thread,
             text: text.clone(),
             outgoing: true,
             created_at: now,
         };
 
-        Ok((dto, out_bytes_for_state))
+        Ok((dto, envelope))
     })?;
 
     // On the wire only after the row exists, so a failed send leaves the
@@ -583,10 +597,10 @@ pub fn send_chat(device_id: String, text: String) -> Result<ChatMessageDto, Stri
     // is promoted to Sent only once the bytes are actually away — a caller
     // that sees Sent can trust it.
     let net = require_net()?;
-    net.send_chat(&device_id, &text, std::time::Instant::now())?;
+    net.send_chat(&device_id, envelope.encode(), std::time::Instant::now())?;
     with_core(|core| {
         core.store
-            .set_message_state(&msg_id_bytes, MessageState::Sent)?;
+            .set_message_state(&envelope.msg_id, MessageState::Sent)?;
         Ok(())
     })?;
     Ok(dto)
@@ -938,35 +952,89 @@ fn on_net_event(net: &Arc<net::Net>, event: net::NetEvent) {
                 reason: why,
             });
         }
-        net::NetEvent::ChatReceived { peer, text } => {
+        net::NetEvent::ChatReceived { peer, envelope } => {
             let _ = net;
-            if let Ok(Some(event)) = store_incoming_chat(&peer, &text) {
+            if let Ok(Some(event)) = store_incoming_chat(&peer, &envelope) {
                 emit(event);
             }
         }
     }
 }
 
-/// Write an inbound chat line and return the event announcing it.
-fn store_incoming_chat(device_id: &str, text: &str) -> Result<Option<CoreEvent>, String> {
+/// The stored `(seq, msg_id)` of a thread's rows, in insertion order.
+///
+/// `pub` with a note, as [`open_store_for_test`]. Neither value reaches
+/// [`ChatMessageDto`]: display order is the rowid, and `seq` is per-sender so
+/// it is not a display key. But both are what a resend, an acknowledgement and
+/// a gap will all be matched on, so "the row says what the wire said" needs to
+/// be assertable from somewhere.
+pub fn thread_rows_for_test(thread_id: i64) -> Result<Vec<(i64, String)>, String> {
+    with_core(|core| {
+        let mut msgs = core.store.messages_for_thread(thread_id)?;
+        msgs.sort_by_key(|m| m.id);
+        Ok(msgs
+            .into_iter()
+            .map(|m| (m.seq, hex::encode(&m.msg_id)))
+            .collect())
+    })
+}
+
+/// Deliver an inbound chat message as the network would, for the contract
+/// tests.
+///
+/// `pub` with a note, following [`open_store_for_test`]: `#[cfg(test)]` items
+/// are invisible to `tests/`, and the property worth testing here — that the
+/// same envelope arriving twice is one message — cannot be reached through the
+/// public API, which has no way to make a message arrive.
+pub fn receive_chat_for_test(
+    device_id: &str,
+    envelope: &ChatEnvelope,
+) -> Result<Option<CoreEvent>, String> {
+    store_incoming_chat(device_id, envelope)
+}
+
+/// Write an inbound chat line and return the event announcing it, or `None` if
+/// we already had it.
+///
+/// # The sender's numbers, not ours
+///
+/// Both identifiers come off the envelope. Inventing them here — which is what
+/// this did — meant the same message arriving twice looked like two different
+/// messages, so a resend after a severance the sender never saw acked put a
+/// second copy on the screen. That is the case `seq` and `msg_id` exist for,
+/// and the case the ratchet cannot catch, because a resend is genuinely fresh
+/// ciphertext it has never seen.
+fn store_incoming_chat(
+    device_id: &str,
+    envelope: &ChatEnvelope,
+) -> Result<Option<CoreEvent>, String> {
     with_core_mut(|core| {
         let now = now_millis();
         let thread = ensure_thread(core, device_id, now)?;
-        let (bytes, hex) = new_msg_id();
-        let seq = core.store.next_seq(thread, Direction::Incoming)?;
-        core.store.add_message(&NewMessage {
+        let outcome = core.store.add_message(&NewMessage {
             thread_id: thread,
-            seq,
-            msg_id: bytes,
-            body: text.as_bytes().to_vec(),
+            // As the sender numbered it. Per-sender numbering is what makes
+            // this safe to store directly (tech spec §8).
+            seq: envelope.seq as i64,
+            msg_id: envelope.msg_id.to_vec(),
+            body: envelope.body.clone(),
             direction: Direction::Incoming,
             state: MessageState::Delivered,
             created_at: now,
         })?;
+        // Announced only if it was new. The outcome used to be discarded, which
+        // was harmless while every arrival carried a freshly-invented id and is
+        // not now: with the sender's id on it, `Duplicate` is exactly the
+        // resend this change exists to recognise, and emitting anyway would put
+        // it on screen while refusing to store it.
+        if outcome == InsertOutcome::Duplicate {
+            log::debug!("dropping a chat message we already have");
+            return Ok(None);
+        }
         Ok(Some(CoreEvent::MessageReceived {
             thread_id: thread,
-            msg_id: hex,
-            text: text.to_string(),
+            msg_id: hex::encode(envelope.msg_id),
+            text: String::from_utf8_lossy(&envelope.body).into_owned(),
         }))
     })
 }
@@ -1183,11 +1251,6 @@ fn needs_name(store: &Store) -> bool {
     // form survives — it is a difference in what happens when the database is
     // unreadable, and asking is the safer of the two answers.
     !matches!(stored_persona(store), Ok(Some(_)))
-}
-
-fn new_msg_id() -> (Vec<u8>, String) {
-    let bytes = rng::random_array::<16>();
-    (bytes.to_vec(), hex::encode(bytes))
 }
 
 fn now_millis() -> i64 {

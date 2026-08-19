@@ -84,7 +84,16 @@ pub enum NetEvent {
     /// happened to nudge back, and never otherwise.
     PingAcked { peer: PeerId },
     /// A chat line arrived.
-    ChatReceived { peer: PeerId, text: String },
+    /// A chat line arrived, as the sender numbered and identified it.
+    ///
+    /// The whole envelope rather than the text, because the two identifiers on
+    /// it are the only things that can tell a resend from a new message. The
+    /// receiver used to invent both, which made every resend a second line on
+    /// somebody's screen — and left the outbox nothing to resend *as*.
+    ChatReceived {
+        peer: PeerId,
+        envelope: crate::session::chat::ChatEnvelope,
+    },
     /// A queued Ping was dropped because the pipe never opened.
     PingUndeliverable { peer: PeerId, why: String },
     /// The radio became usable or unusable, and why.
@@ -689,8 +698,13 @@ impl Net {
         }
     }
 
-    pub fn send_chat(&self, peer: &str, text: &str, now: Instant) -> Result<(), String> {
-        self.send_frame(peer, FrameKind::Chat, text.as_bytes().to_vec(), now)
+    /// Send an already-encoded [`ChatEnvelope`](crate::session::chat::ChatEnvelope).
+    ///
+    /// Takes bytes rather than text so the numbering stays where it is decided.
+    /// A `&str` here would mean this layer inventing a `seq`, which is the
+    /// sender's business and has to survive a restart.
+    pub fn send_chat(&self, peer: &str, envelope: Vec<u8>, now: Instant) -> Result<(), String> {
+        self.send_frame(peer, FrameKind::Chat, envelope, now)
     }
 
     /// One turn of the engine's clock: drop sessions that have gone quiet, then
@@ -1219,12 +1233,19 @@ impl Net {
                     });
                 }
                 FrameKind::Chat => {
-                    // Lossy on purpose: v0 is text, and a peer sending invalid
-                    // UTF-8 should not be able to make us drop a session.
-                    out.push(NetEvent::ChatReceived {
-                        peer: peer.to_string(),
-                        text: String::from_utf8_lossy(&frame.payload).into_owned(),
-                    });
+                    // Decoded here rather than passed on as bytes, so a peer
+                    // cannot make the engine deal with a half-message. A frame
+                    // that is not an envelope is dropped with a line in the log
+                    // and nothing else: it is one bad message, not a reason to
+                    // end a session, and certainly not a reason to show
+                    // somebody an empty line.
+                    match crate::session::chat::ChatEnvelope::decode(&frame.payload) {
+                        Ok(envelope) => out.push(NetEvent::ChatReceived {
+                            peer: peer.to_string(),
+                            envelope,
+                        }),
+                        Err(e) => log::warn!("dropping an unreadable chat frame: {e}"),
+                    }
                 }
                 FrameKind::Ceremony => {
                     out.extend(self.on_ceremony_frame(peer, &frame.payload, now))
