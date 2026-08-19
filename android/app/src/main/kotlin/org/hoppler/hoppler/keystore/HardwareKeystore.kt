@@ -1,6 +1,7 @@
 package org.hoppler.hoppler.keystore
 
 import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyInfo
 import android.security.keystore.KeyProperties
 import android.security.keystore.StrongBoxUnavailableException
 import android.util.Log
@@ -8,6 +9,7 @@ import java.security.KeyStore
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
+import javax.crypto.SecretKeyFactory
 import javax.crypto.spec.GCMParameterSpec
 
 /**
@@ -161,7 +163,7 @@ class HardwareKeystore {
      */
     private fun key(): SecretKey {
         val store = KeyStore.getInstance(PROVIDER).apply { load(null) }
-        (store.getKey(ALIAS, null) as? SecretKey)?.let { return it }
+        (store.getKey(ALIAS, null) as? SecretKey)?.let { return it.also { k -> report(k) } }
         // StrongBox first: a separate chip, so extracting the key means
         // attacking hardware rather than the main SoC. Not every device has one
         // — the Pixel 8 Pro does, plenty of others do not — and asking for it
@@ -172,6 +174,46 @@ class HardwareKeystore {
         } catch (e: StrongBoxUnavailableException) {
             Log.i(TAG, "no StrongBox on this device; using the TEE-backed keystore")
             generate(strongBox = false)
+        }.also { report(it) }
+    }
+
+    /**
+     * Say where the key actually ended up.
+     *
+     * Asking for StrongBox and getting it are different things, and so are
+     * "generated in the Android Keystore" and "generated in hardware" — the
+     * provider is allowed to answer with a software-backed key, and everything
+     * above this line would work identically. R0-F1's claim is about hardware,
+     * so the claim needs a witness, and this is the only one available: the
+     * device saying which it gave us.
+     *
+     * A warning rather than a refusal when it is software. Refusing would mean
+     * an app that will not start on a device whose keystore is unusual, to
+     * protect a property that is already degraded rather than broken — the
+     * secrets are still no worse off than under file permissions alone. Loud
+     * enough that the acceptance run reads it, and `keystore-hardware-check.sh`
+     * fails on it.
+     *
+     * Content-free: a security level, not key material.
+     */
+    private fun report(key: SecretKey) {
+        val level = try {
+            val info = SecretKeyFactory.getInstance(key.algorithm, PROVIDER)
+                .getKeySpec(key, KeyInfo::class.java) as KeyInfo
+            when (info.securityLevel) {
+                KeyProperties.SECURITY_LEVEL_STRONGBOX -> "strongbox"
+                KeyProperties.SECURITY_LEVEL_TRUSTED_ENVIRONMENT -> "tee"
+                KeyProperties.SECURITY_LEVEL_SOFTWARE -> "software"
+                else -> "unknown"
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "could not read the key's security level: ${e.message}")
+            "unreadable"
+        }
+        if (level == "software" || level == "unknown" || level == "unreadable") {
+            Log.w(TAG, "wrapping key backing: $level — NOT hardware")
+        } else {
+            Log.i(TAG, "wrapping key backing: $level")
         }
     }
 
