@@ -163,3 +163,16 @@ pub enum CoreEvent {
         reason: Option<String>,
     },
 }
+
+/// One of the colours a person may pick for themselves (R0-F1).
+///
+/// Carries its name because a row of coloured circles is unusable to somebody
+/// who cannot tell them apart, and roughly one man in twelve cannot tell at
+/// least two of these apart. The name is what the screen reader reads and what
+/// distinguishes the swatches when the colour does not.
+pub struct PersonaColourDto {
+    /// What to call it: "blue", "coral".
+    pub name: String,
+    /// Packed 0xRRGGBB, as [`PersonaDto::colour`].
+    pub value: u32,
+}

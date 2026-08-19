@@ -40,12 +40,17 @@ Future<void> main() async {
       ? RadioChoice.ble
       : RadioChoice.lan;
   final persona = await coreInit(supportDir: dir.path, radio: radio);
-  runApp(HopplerApp(persona: persona));
+  // Only when it is going to be shown. The palette is a constant in the core,
+  // so this is one bridge call, but a launch that is not asking anything has
+  // no reason to make it.
+  final palette = persona.needsName ? await personaColours() : const <PersonaColourDto>[];
+  runApp(HopplerApp(persona: persona, palette: palette));
 }
 
 class HopplerApp extends StatefulWidget {
-  const HopplerApp({super.key, required this.persona});
+  const HopplerApp({super.key, required this.persona, required this.palette});
   final PersonaDto persona;
+  final List<PersonaColourDto> palette;
 
   @override
   State<HopplerApp> createState() => _HopplerAppState();
@@ -74,11 +79,9 @@ class _HopplerAppState extends State<HopplerApp> {
       home: _persona.needsName
           ? NameView(
               colour: Color(0xFF000000 | _persona.colour),
-              onChosen: (name) async {
-                final chosen = await updatePersona(
-                  name: name,
-                  colour: _persona.colour,
-                );
+              palette: widget.palette,
+              onChosen: (name, colour) async {
+                final chosen = await updatePersona(name: name, colour: colour);
                 // Only after the core has stored it. `updatePersona` writes
                 // before it makes the name live and throws if it cannot, so
                 // reaching here means the next launch will agree with this one.

@@ -209,6 +209,33 @@ class NearbyDevice {
           paired == other.paired;
 }
 
+/// One of the colours a person may pick for themselves (R0-F1).
+///
+/// Carries its name because a row of coloured circles is unusable to somebody
+/// who cannot tell them apart, and roughly one man in twelve cannot tell at
+/// least two of these apart. The name is what the screen reader reads and what
+/// distinguishes the swatches when the colour does not.
+class PersonaColourDto {
+  /// What to call it: "blue", "coral".
+  final String name;
+
+  /// Packed 0xRRGGBB, as [`PersonaDto::colour`].
+  final int value;
+
+  const PersonaColourDto({required this.name, required this.value});
+
+  @override
+  int get hashCode => name.hashCode ^ value.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is PersonaColourDto &&
+          runtimeType == other.runtimeType &&
+          name == other.name &&
+          value == other.value;
+}
+
 /// The local persona shown in Discovery and edited in the UI.
 class PersonaDto {
   final String name;

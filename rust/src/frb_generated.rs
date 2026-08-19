@@ -38,7 +38,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.12.0";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -1616484669;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 595831498;
 
 // Section: executor
 
@@ -467,6 +467,38 @@ fn wire__crate__api__pairing__pairing_invite_impl(
             move |context| {
                 transform_result_sse::<_, String>((move || {
                     let output_ok = crate::api::pairing::pairing_invite()?;
+                    Ok(output_ok)
+                })())
+            }
+        },
+    )
+}
+fn wire__crate__api__identity__persona_colours_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "persona_colours",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, ()>((move || {
+                    let output_ok = Result::<_, ()>::Ok(crate::api::identity::persona_colours())?;
                     Ok(output_ok)
                 })())
             }
@@ -1112,6 +1144,20 @@ impl SseDecode for Vec<crate::api::types::NearbyDevice> {
     }
 }
 
+impl SseDecode for Vec<crate::api::types::PersonaColourDto> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut len_ = <i32>::sse_decode(deserializer);
+        let mut ans_ = Vec::with_capacity(len_ as usize);
+        for idx_ in 0..len_ {
+            ans_.push(<crate::api::types::PersonaColourDto>::sse_decode(
+                deserializer,
+            ));
+        }
+        return ans_;
+    }
+}
+
 impl SseDecode for Vec<u8> {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -1183,6 +1229,18 @@ impl SseDecode for Option<i64> {
         } else {
             return None;
         }
+    }
+}
+
+impl SseDecode for crate::api::types::PersonaColourDto {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_name = <String>::sse_decode(deserializer);
+        let mut var_value = <u32>::sse_decode(deserializer);
+        return crate::api::types::PersonaColourDto {
+            name: var_name,
+            value: var_value,
+        };
     }
 }
 
@@ -1286,24 +1344,25 @@ fn pde_ffi_dispatcher_primary_impl(
         11 => wire__crate__api__discovery__nearby_devices_impl(port, ptr, rust_vec_len, data_len),
         12 => wire__crate__api__transfers__offer_drop_impl(port, ptr, rust_vec_len, data_len),
         13 => wire__crate__api__pairing__pairing_invite_impl(port, ptr, rust_vec_len, data_len),
-        14 => wire__crate__api__messaging__ping_impl(port, ptr, rust_vec_len, data_len),
-        15 => wire__crate__api__platform__platform_command_stream_impl(
+        14 => wire__crate__api__identity__persona_colours_impl(port, ptr, rust_vec_len, data_len),
+        15 => wire__crate__api__messaging__ping_impl(port, ptr, rust_vec_len, data_len),
+        16 => wire__crate__api__platform__platform_command_stream_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        16 => wire__crate__api__platform__platform_fact_impl(port, ptr, rust_vec_len, data_len),
-        17 => wire__crate__api__messaging__send_chat_impl(port, ptr, rust_vec_len, data_len),
-        18 => wire__crate__api__discovery__set_discovery_impl(port, ptr, rust_vec_len, data_len),
-        19 => {
+        17 => wire__crate__api__platform__platform_fact_impl(port, ptr, rust_vec_len, data_len),
+        18 => wire__crate__api__messaging__send_chat_impl(port, ptr, rust_vec_len, data_len),
+        19 => wire__crate__api__discovery__set_discovery_impl(port, ptr, rust_vec_len, data_len),
+        20 => {
             wire__crate__api__pairing__stop_showing_invite_impl(port, ptr, rust_vec_len, data_len)
         }
-        20 => {
+        21 => {
             wire__crate__api__messaging__thread_for_device_impl(port, ptr, rust_vec_len, data_len)
         }
-        21 => wire__crate__api__messaging__thread_messages_impl(port, ptr, rust_vec_len, data_len),
-        22 => wire__crate__api__identity__update_persona_impl(port, ptr, rust_vec_len, data_len),
+        22 => wire__crate__api__messaging__thread_messages_impl(port, ptr, rust_vec_len, data_len),
+        23 => wire__crate__api__identity__update_persona_impl(port, ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -1577,6 +1636,27 @@ impl flutter_rust_bridge::IntoIntoDart<crate::api::types::NearbyDevice>
     for crate::api::types::NearbyDevice
 {
     fn into_into_dart(self) -> crate::api::types::NearbyDevice {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::types::PersonaColourDto {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.name.into_into_dart().into_dart(),
+            self.value.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
+    for crate::api::types::PersonaColourDto
+{
+}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::types::PersonaColourDto>
+    for crate::api::types::PersonaColourDto
+{
+    fn into_into_dart(self) -> crate::api::types::PersonaColourDto {
         self
     }
 }
@@ -1931,6 +2011,16 @@ impl SseEncode for Vec<crate::api::types::NearbyDevice> {
     }
 }
 
+impl SseEncode for Vec<crate::api::types::PersonaColourDto> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <i32>::sse_encode(self.len() as _, serializer);
+        for item in self {
+            <crate::api::types::PersonaColourDto>::sse_encode(item, serializer);
+        }
+    }
+}
+
 impl SseEncode for Vec<u8> {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
@@ -1988,6 +2078,14 @@ impl SseEncode for Option<i64> {
         if let Some(value) = self {
             <i64>::sse_encode(value, serializer);
         }
+    }
+}
+
+impl SseEncode for crate::api::types::PersonaColourDto {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <String>::sse_encode(self.name, serializer);
+        <u32>::sse_encode(self.value, serializer);
     }
 }
 

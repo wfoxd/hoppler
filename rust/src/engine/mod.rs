@@ -1233,20 +1233,31 @@ const DEFAULT_NAME: &str = "Me";
 /// enforce, and this is shown to strangers by design (R0-F2 again).
 ///
 /// Five bits of entropy at most, so it is a convenience and never an identity.
-const DEFAULT_COLOURS: [u32; 8] = [
-    0x0044_88ff, // blue
-    0x00e0_5c4a, // coral
-    0x0037_a86b, // green
-    0x00b3_6ae2, // violet
-    0x00e0_9c3a, // amber
-    0x0027_9b9b, // teal
-    0x00d4_5c8a, // rose
-    0x006b_7280, // slate
+/// The palette, with the words for it.
+///
+/// Named rather than a bare list of numbers because the row of swatches on the
+/// first-launch screen has to be usable by somebody who cannot tell two of
+/// these apart, which is roughly one man in twelve. The name is what a screen
+/// reader says and what labels the swatch when the colour cannot.
+const DEFAULT_COLOURS: [(&str, u32); 8] = [
+    ("blue", 0x0044_88ff),
+    ("coral", 0x00e0_5c4a),
+    ("green", 0x0037_a86b),
+    ("violet", 0x00b3_6ae2),
+    ("amber", 0x00e0_9c3a),
+    ("teal", 0x0027_9b9b),
+    ("rose", 0x00d4_5c8a),
+    ("slate", 0x006b_7280),
 ];
+
+/// The palette offered on first launch. See [`DEFAULT_COLOURS`].
+pub fn persona_colours() -> Vec<(&'static str, u32)> {
+    DEFAULT_COLOURS.to_vec()
+}
 
 fn a_starting_colour() -> u32 {
     let pick = rng::random_array::<1>()[0] as usize;
-    DEFAULT_COLOURS[pick % DEFAULT_COLOURS.len()]
+    DEFAULT_COLOURS[pick % DEFAULT_COLOURS.len()].1
 }
 
 /// The identity this device sealed, or a fresh one on first launch.
