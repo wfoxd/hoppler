@@ -79,6 +79,19 @@ class _NameViewState extends State<NameView> {
   final _controller = TextEditingController();
   bool _saving = false;
   String? _failed;
+  /// The core's draw, as a starting point only.
+  ///
+  /// A `late` initializer rather than `initState`, which is the same thing
+  /// later: it runs on first *read*, which is in `build`, so `widget` is long
+  /// since set. Kept as one line because that is where the field's meaning is.
+  ///
+  /// Not kept in step with [NameView.colour] afterwards, and that is deliberate
+  /// rather than overlooked: a `didUpdateWidget` here would silently discard
+  /// somebody's pick if the parent ever rebuilt with a new draw. It cannot
+  /// today — the persona only changes once a name is chosen, and that is the
+  /// moment this screen is replaced — but "the parent overwrote your choice"
+  /// is a worse failure than a stale prop, so the choice wins if they ever
+  /// disagree.
   late int _colour = widget.colour.toARGB32() & 0x00ffffff;
 
   bool get _usable => _controller.text.trim().isNotEmpty;
