@@ -21,18 +21,22 @@
 //!
 //! So this is not what R0-F1 means by "master secret in platform hardware", and
 //! it must not be mistaken for it. It is the layer *underneath* that: somewhere
-//! durable to put bytes, which the Android Keystore backend then wraps. Stated
-//! here rather than in a task doc because the person who needs to know is
-//! whoever is reading this file wondering how strong it is.
+//! durable to put bytes, which
+//! [`WrappedKeystore`](super::wrapped::WrappedKeystore) is built to wrap with a
+//! key the Android Keystore holds. Nothing constructs one yet, so in every
+//! build shipping today what is written here is the whole of the protection.
+//! Stated rather than left to a task doc because the person who needs to know
+//! is whoever is reading this file wondering how strong it is.
 //!
 //! # Why the contents are not encrypted here
 //!
 //! There is nothing to encrypt them with. A key kept beside them protects
 //! nothing, and the only honest alternatives are a passphrase the person types
 //! (which Hoppler does not have, and which R0-F1's thirty-second first launch
-//! rules out) or the platform's own secret store — which is exactly what the
-//! Android backend adds on top. Encrypting with a key stored next door would
-//! *look* like protection while providing none, which is worse than this.
+//! rules out) or the platform's own secret store — which is what
+//! [`WrappedKeystore`](super::wrapped::WrappedKeystore) is for. Encrypting with
+//! a key stored next door would *look* like protection while providing none,
+//! which is worse than this.
 
 use std::fs;
 use std::io::Write;

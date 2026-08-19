@@ -39,6 +39,7 @@
 
 pub mod filekeystore;
 pub mod keystore;
+pub mod wrapped;
 
 use prost::Message;
 use zeroize::Zeroizing;
