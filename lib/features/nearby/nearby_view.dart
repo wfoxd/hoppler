@@ -1,16 +1,42 @@
 import 'package:flutter/material.dart';
 
-/// The sentence to show for a radio report, or null when the radio is fine.
+/// The sentence to put where the nearby list goes, or null when there is none.
 ///
 /// `available` decides; `reason` only supplies the words. Deciding from the
 /// reason instead gets the state backwards in both directions — an unavailable
 /// radio with nothing to say reads as working, and a recovery that arrives
 /// carrying a stale reason leaves the old sentence on screen.
 ///
-/// A pure function so that rule is testable. It was stated in a comment and
-/// got written the wrong way round one file over, in the same change.
-String? radioReasonFrom({required bool available, String? reason}) =>
-    available ? null : (reason ?? 'The radio is unavailable');
+/// `permissionDenied` overrides both, for the reason below.
+///
+/// A pure function so all of that is testable. It was once stated in a comment
+/// and written the wrong way round one file over, in the same change.
+///
+/// # Why a refused permission outranks the radio's own report
+///
+/// Both end in an empty list, and the empty list is the thing R0-F2 says must
+/// never be read as "nobody is nearby". But they are not equally useful to say.
+/// A refusal is the *cause* — the radio has nothing to report because it was
+/// never allowed to look — and it is the only one of the two a person can do
+/// something about. So it wins, and it wins even when the radio is reporting
+/// itself available, because a permission we do not hold makes that report
+/// meaningless.
+///
+/// Before this, a refusal put one line in the activity log and left the nearby
+/// area saying "No one nearby" — which is the false claim about the room that
+/// this whole function exists to prevent, arrived at by the one route nothing
+/// was watching.
+String? radioReasonFrom({
+  required bool available,
+  String? reason,
+  bool permissionDenied = false,
+}) {
+  if (permissionDenied) {
+    return 'Hoppler needs permission to use Bluetooth. You can grant it in '
+        'Settings.';
+  }
+  return available ? null : (reason ?? 'The radio is unavailable');
+}
 
 /// What fills the nearby area: the devices, or the reason there are none.
 ///

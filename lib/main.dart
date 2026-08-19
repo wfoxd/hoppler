@@ -110,7 +110,23 @@ class _HomePageState extends State<HomePage> {
   /// Held apart from [_devices] because an empty list is what "the radio is
   /// off" and "nobody is nearby" both look like, and R0-F2 turns on the user
   /// being able to tell those apart.
-  String? _radioReason;
+  /// What the core last said about the radio, as it said it.
+  ///
+  /// The facts, not the sentence built from them. Storing the rendered string
+  /// is what made the first version of this wrong: with only a sentence in
+  /// hand, "stop blaming the permission" could not be told from "stop showing
+  /// the radio's problem", so turning Discovery on cleared both — hiding a
+  /// genuine "Bluetooth is off" that the core has no reason to repeat, since
+  /// `set_discovery` emits `DiscoveryUpdated` and not `RadioChanged`.
+  bool _radioAvailable = true;
+  String? _radioWhy;
+
+  /// Somebody was asked for the Bluetooth permission and said no.
+  ///
+  /// Its own fact, beside the radio's. The two arrive from different places
+  /// and neither can stand in for the other; [radioReasonFrom] is where they
+  /// are weighed, once, at the point of display.
+  bool _permissionDenied = false;
   final List<String> _log = [];
   double? _transfer; // 0..1 while a Drop is in flight
 
@@ -251,7 +267,8 @@ class _HomePageState extends State<HomePage> {
           if (_pairing?.deviceId == deviceId) _pairing = null;
           _log.insert(0, 'Pairing failed: $reason');
         case CoreEvent_RadioChanged(:final available, :final reason):
-          _radioReason = radioReasonFrom(available: available, reason: reason);
+          _radioAvailable = available;
+          _radioWhy = reason;
       }
     });
   }
@@ -318,20 +335,30 @@ class _HomePageState extends State<HomePage> {
               // found. Turning *off* asks nothing: withdrawing does not need a
               // permission, and prompting to stop being discoverable would be
               // absurd.
-              if (v && !await ensureRadioPermission()) {
-                // Declined. The switch goes back rather than sitting on while
-                // nothing works — an "on" that discovers nobody is the failure
-                // this app cannot tell apart from an empty room.
+              if (v) {
+                final granted = await ensureRadioPermission();
                 if (!mounted) return;
-                setState(() {
-                  _discovery = false;
-                  _log.insert(
-                    0,
-                    'Discovery needs permission to use Bluetooth. '
-                    'You can grant it in Settings.',
-                  );
-                });
-                return;
+                if (!granted) {
+                  // Declined. The switch goes back rather than sitting on while
+                  // nothing works — an "on" that discovers nobody is the failure
+                  // this app cannot tell apart from an empty room.
+                  //
+                  // And the reason goes where the empty list would be, not only
+                  // into the log. A line in the log scrolls away and is not
+                  // where somebody looks when the list is empty; the nearby
+                  // area is, and leaving it saying "No one nearby" is R0-F2's
+                  // false claim about the room.
+                  setState(() {
+                    _discovery = false;
+                    _permissionDenied = true;
+                  });
+                  return;
+                }
+                // Granted, possibly after a trip to Settings. Clearing it here
+                // is what lets the screen recover without a restart — and it is
+                // all that needs clearing, because the radio's own state is
+                // held separately and is still whatever the core last said.
+                _permissionDenied = false;
               }
               await setDiscovery(enabled: v);
               if (mounted) setState(() => _discovery = v);
@@ -391,7 +418,11 @@ class _HomePageState extends State<HomePage> {
                     ),
               nearby: NearbyView<NearbyDevice>(
                 discoveryOn: _discovery,
-                radioReason: _radioReason,
+                radioReason: radioReasonFrom(
+                  available: _radioAvailable,
+                  reason: _radioWhy,
+                  permissionDenied: _permissionDenied,
+                ),
                 devices: _devices,
                 tile: _deviceTile,
               ),

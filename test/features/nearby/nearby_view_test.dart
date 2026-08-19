@@ -108,6 +108,63 @@ void _radioReasonGroup() {
         'Bluetooth is off',
       );
     });
+
+    /// A refusal used to put one line in the activity log and leave the nearby
+    /// area saying "No one nearby" — R0-F2's false claim about the room,
+    /// reached by the one route nothing was watching.
+    test('a refused permission is said where the empty list would be', () {
+      final said = radioReasonFrom(available: false, permissionDenied: true);
+      expect(said, isNotNull);
+      expect(
+        said,
+        contains('permission'),
+        reason: 'the sentence has to name the thing the person can fix',
+      );
+    });
+
+    /// The refusal is the cause: the radio has nothing to report because it was
+    /// never allowed to look. So it outranks the radio's own words, and it
+    /// outranks them even when the radio calls itself available — a permission
+    /// we do not hold makes that report meaningless.
+    test('a refusal outranks what the radio says about itself', () {
+      expect(
+        radioReasonFrom(
+          available: false,
+          reason: 'Bluetooth is off',
+          permissionDenied: true,
+        ),
+        contains('permission'),
+      );
+      expect(
+        radioReasonFrom(available: true, permissionDenied: true),
+        contains('permission'),
+        reason: 'an available radio we may not use is not an available radio',
+      );
+    });
+
+    /// And it stops being said the moment it stops being true, or the screen
+    /// keeps blaming a permission that has since been granted in Settings.
+    test('granting it clears the sentence', () {
+      expect(radioReasonFrom(available: true, permissionDenied: false), isNull);
+    });
+
+    /// Granting the permission must not take a genuine radio fault down with
+    /// it. The first version of this held the rendered sentence instead of the
+    /// two facts, so "stop blaming the permission" was indistinguishable from
+    /// "stop showing the radio's problem" and turning Discovery on cleared
+    /// both — leaving an empty list with nothing said, and no reason for the
+    /// core to repeat itself, since `set_discovery` emits `DiscoveryUpdated`
+    /// rather than `RadioChanged`.
+    test('granting it does not hide the radio still being off', () {
+      expect(
+        radioReasonFrom(
+          available: false,
+          reason: 'Bluetooth is off',
+          permissionDenied: false,
+        ),
+        'Bluetooth is off',
+      );
+    });
   });
 
   /// The empty list has two meanings and needs two sentences.
