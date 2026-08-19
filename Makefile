@@ -35,10 +35,22 @@ lint:             ## All linters, warnings are errors
 NDK := $(lastword $(sort $(wildcard $(or $(ANDROID_HOME),$(HOME)/Android/Sdk)/ndk/*)))
 NDK_BIN := $(NDK)/toolchains/llvm/prebuilt/linux-x86_64/bin
 
+# RANLIB as well as AR, and it is not redundant. sqlcipher builds OpenSSL from
+# source, whose install step runs `$(CROSS_COMPILE)ranlib` —
+# `aarch64-linux-android-ranlib`. Older NDKs ship that triple-prefixed wrapper;
+# r29 does not, so without this the build dies at the last step with
+# `/bin/sh: aarch64-linux-android-ranlib: not found`. cc-rs reads
+# `RANLIB_<target>`, which is what points it at the unprefixed `llvm-ranlib`.
+#
+# This could not be reproduced on the machine it was written on — that SDK's
+# newest NDK is r28, which still has the wrapper. CI runs r29. So it is the
+# runner that has to confirm this, and a green android job is the only evidence
+# that counts for it.
 lint-android:     ## Lint the Rust that only exists on Android
 	@test -n "$(NDK)" || { echo "no NDK under $(or $(ANDROID_HOME),$(HOME)/Android/Sdk)/ndk"; exit 1; }
 	cd rust && CC_aarch64_linux_android=$(NDK_BIN)/aarch64-linux-android31-clang \
 	  AR_aarch64_linux_android=$(NDK_BIN)/llvm-ar \
+	  RANLIB_aarch64_linux_android=$(NDK_BIN)/llvm-ranlib \
 	  CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$(NDK_BIN)/aarch64-linux-android31-clang \
 	  cargo clippy --target aarch64-linux-android -- -D warnings
 
