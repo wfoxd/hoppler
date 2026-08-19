@@ -1,9 +1,10 @@
-//! The chat envelope and the receiver pipeline (T12; tech spec §5, §8, R0-F5).
+//! The chat envelope and both ends of the pipeline (T12; tech spec §5, §8,
+//! R0-F5).
 //!
-//! What a message *is* on the wire, and what a receiver does with one before it
-//! reaches the store. The ratchet next door makes a message unreadable to
-//! anyone else; this decides whether it is new, where it goes, and what is
-//! still missing.
+//! What a message *is* on the wire, what a receiver does with one before it
+//! reaches the store, and what a sender still owes. The ratchet next door makes
+//! a message unreadable to anyone else; this decides whether it is new, where
+//! it goes, what is still missing, and what has to go out again.
 //!
 //! # The two numbers, which are not the same number
 //!
@@ -66,6 +67,16 @@ pub type MsgId = [u8; MSG_ID_LEN];
 /// anything genuinely large is a Drop (R0-F6), which never travels as a chat
 /// line.
 pub const MAX_BODY: usize = 8 * 1024;
+
+/// How many messages may be waiting on an acknowledgement before an [`Outbox`]
+/// stops taking more.
+///
+/// The sender's mirror of [`MAX_AHEAD`], and bounded for a related reason: a
+/// peer that never acknowledges anything would otherwise leave this growing
+/// for as long as somebody keeps typing. The same size, because the two are
+/// the same conversation seen from each end — a run queued during an absence
+/// is exactly what the receiver will have to hold as it arrives.
+pub const MAX_UNACKED: usize = 512;
 
 /// How far past the contiguous run a `seq` may be before an [`Inbox`] stops
 /// tracking it.
@@ -301,6 +312,200 @@ impl Inbox {
 
 #[cfg(test)]
 mod tests {
+    // ── outbox ──────────────────────────────────────────────────────────────
+
+    /// Numbering starts at 1 because 0 is `Inbox::through`'s "nothing yet".
+    #[test]
+    fn numbering_starts_at_one_and_climbs() {
+        let mut out = Outbox::new();
+        assert_eq!(out.queue(b"a".to_vec()).unwrap().seq, 1);
+        assert_eq!(out.queue(b"b".to_vec()).unwrap().seq, 2);
+        assert_eq!(out.next_seq(), 3);
+    }
+
+    /// The store's dedup key has to differ per message or two lines a person
+    /// sent would collapse into one row.
+    #[test]
+    fn every_message_gets_its_own_id() {
+        let mut out = Outbox::new();
+        let a = out.queue(b"same".to_vec()).unwrap();
+        let b = out.queue(b"same".to_vec()).unwrap();
+        assert_ne!(a.msg_id, b.msg_id, "identical text got one id");
+    }
+
+    #[test]
+    fn a_queued_message_is_owed_until_it_is_acked() {
+        let mut out = Outbox::new();
+        let e = out.queue(b"hello".to_vec()).unwrap();
+        assert_eq!(out.unacked(), vec![e.seq]);
+        assert!(out.acked(e.seq));
+        assert!(out.is_empty());
+    }
+
+    /// Reported rather than absorbed: an ack for something never sent means the
+    /// two sides disagree about what exists, and swallowing it hides that.
+    #[test]
+    fn an_ack_for_something_not_owed_says_so() {
+        let mut out = Outbox::new();
+        assert!(!out.acked(7));
+        let e = out.queue(b"x".to_vec()).unwrap();
+        assert!(out.acked(e.seq));
+        assert!(
+            !out.acked(e.seq),
+            "the same ack settled the same message twice"
+        );
+    }
+
+    /// Resend order is `seq` order. Out of order, the far side holds every one
+    /// of them in `ahead` until the lowest happens to turn up — which is the
+    /// reunion case this exists for, made as slow as it can be.
+    #[test]
+    fn the_resend_list_is_in_order() {
+        let mut out = Outbox::new();
+        for _ in 0..5 {
+            out.queue(b"m".to_vec()).unwrap();
+        }
+        out.acked(2);
+        out.acked(4);
+        assert_eq!(out.unacked(), vec![1, 3, 5]);
+    }
+
+    /// The bound refuses rather than dropping the oldest. Dropping would lose
+    /// something a person typed and told them nothing; this can be shown.
+    #[test]
+    fn a_full_outbox_refuses_rather_than_forgetting() {
+        let mut out = Outbox::new();
+        for _ in 0..MAX_UNACKED {
+            out.queue(b"m".to_vec()).unwrap();
+        }
+        assert_eq!(out.queue(b"one more".to_vec()), Err(OutboxError::Full));
+        assert_eq!(out.len(), MAX_UNACKED);
+        assert!(out.unacked().contains(&1), "the first message was dropped");
+    }
+
+    /// The one that matters most here. A refusal that moved the counter would
+    /// leave a number nothing was ever sent under, and `Inbox::pending` shows
+    /// exactly that as a message still on its way — for ever.
+    #[test]
+    fn a_refused_message_does_not_burn_a_number() {
+        let mut out = Outbox::new();
+        out.queue(b"first".to_vec()).unwrap();
+        assert_eq!(
+            out.queue(vec![0; MAX_BODY + 1]),
+            Err(OutboxError::Envelope(EnvelopeError::TooLong))
+        );
+        assert_eq!(out.next_seq(), 2, "the rejected body consumed a seq");
+        assert_eq!(out.queue(b"second".to_vec()).unwrap().seq, 2);
+
+        // And the gap that would have been left is genuinely visible from the
+        // other end, which is why this is worth its own assertion.
+        let mut inbox = Inbox::new();
+        inbox.receive(1);
+        inbox.receive(2);
+        assert_eq!(inbox.pending(), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn a_full_outbox_still_lets_an_ack_make_room() {
+        let mut out = Outbox::new();
+        for _ in 0..MAX_UNACKED {
+            out.queue(b"m".to_vec()).unwrap();
+        }
+        assert!(out.acked(1));
+        assert!(out.queue(b"now there is room".to_vec()).is_ok());
+    }
+
+    #[test]
+    fn resuming_restores_what_was_owed() {
+        let out = Outbox::resumed(10, [3, 7, 9]);
+        assert_eq!(out.next_seq(), 10);
+        assert_eq!(out.unacked(), vec![3, 7, 9]);
+    }
+
+    /// Zero is not a number a message can have, so an outbox restored with it
+    /// would refuse every `queue` for ever with `NoSeq` — a thread that looks
+    /// fine and cannot say anything. The floor makes a zero read as "nothing
+    /// sent yet", which is what it means.
+    #[test]
+    fn resuming_from_zero_can_still_send() {
+        let mut out = Outbox::resumed(0, []);
+        assert_eq!(out.next_seq(), 1);
+        assert_eq!(out.queue(b"first words".to_vec()).unwrap().seq, 1);
+    }
+
+    /// Neither is a number that was ever handed out, and letting one through
+    /// would mean two different messages could wear it.
+    #[test]
+    fn resuming_drops_numbers_that_were_never_issued() {
+        let out = Outbox::resumed(5, [0, 3, 5, 9]);
+        assert_eq!(out.unacked(), vec![3]);
+    }
+
+    /// A store written when the bound was larger. The lowest are kept: they are
+    /// what blocks the far side's run, so sending them is what lets it advance.
+    #[test]
+    fn resuming_over_the_bound_keeps_the_ones_that_unblock_the_far_side() {
+        let many: Vec<u64> = (1..=(MAX_UNACKED as u64 + 10)).collect();
+        let out = Outbox::resumed(MAX_UNACKED as u64 + 20, many);
+        assert_eq!(out.len(), MAX_UNACKED);
+        assert_eq!(out.unacked()[0], 1);
+        assert_eq!(out.unacked()[MAX_UNACKED - 1], MAX_UNACKED as u64);
+    }
+
+    /// `Inbox` shipped this same arithmetic as `+ 1` and panicked on the last
+    /// value in range. Unreachable in practice; a panic in the send path is
+    /// still not how anyone should discover that.
+    ///
+    /// The boundary is one short of the end, deliberately: `u64::MAX` would
+    /// leave nothing to count to next, so it is refused rather than issued.
+    #[test]
+    fn the_end_of_the_range_refuses_instead_of_panicking() {
+        let mut out = Outbox::resumed(u64::MAX - 1, []);
+        assert_eq!(
+            out.queue(b"the last one".to_vec()).unwrap().seq,
+            u64::MAX - 1
+        );
+        assert_eq!(out.queue(b"one past".to_vec()), Err(OutboxError::Exhausted));
+    }
+
+    /// And the exhausted error is not the full one. They are different faults
+    /// and the message a person is shown has to say which.
+    #[test]
+    fn running_out_of_numbers_is_not_reported_as_a_full_outbox() {
+        let mut out = Outbox::resumed(u64::MAX, []);
+        assert_eq!(out.queue(b"x".to_vec()), Err(OutboxError::Exhausted));
+        assert!(
+            out.is_empty(),
+            "nothing was waiting, so 'full' would be a lie"
+        );
+    }
+
+    /// Two faults at once, and the one reported has to be the one actually in
+    /// the way. A stream with no numbers left does not care how long the body
+    /// is: shortening it would change nothing, so blaming the body sends
+    /// somebody to fix the wrong thing.
+    #[test]
+    fn an_exhausted_stream_says_so_even_when_the_body_is_also_bad() {
+        let mut out = Outbox::resumed(u64::MAX, []);
+        assert_eq!(
+            out.queue(vec![0; MAX_BODY + 1]),
+            Err(OutboxError::Exhausted),
+            "reported the body when the stream was the problem"
+        );
+    }
+
+    /// The invariant a resend rests on, stated as a test: the numbers handed
+    /// back are the ones that were issued, so the rows they name still carry
+    /// the `msg_id` the far side saw.
+    #[test]
+    fn the_resend_list_names_the_numbers_that_were_issued() {
+        let mut out = Outbox::new();
+        let sent: Vec<u64> = (0..3)
+            .map(|_| out.queue(b"m".to_vec()).unwrap().seq)
+            .collect();
+        assert_eq!(out.unacked(), sent);
+    }
+
     use super::*;
 
     fn envelope(seq: u64, body: &str) -> ChatEnvelope {
@@ -573,5 +778,181 @@ mod tests {
         // The proof that it is bounded: this returns rather than running for
         // the rest of the afternoon.
         assert_eq!(restored.pending().len() as u64, MAX_AHEAD - 2);
+    }
+}
+
+/// Why a message could not be queued.
+#[derive(Debug, PartialEq, Eq)]
+pub enum OutboxError {
+    /// The body did not make a valid envelope.
+    Envelope(EnvelopeError),
+    /// [`MAX_UNACKED`] messages are already waiting.
+    Full,
+    /// The stream has no numbers left.
+    ///
+    /// Its own variant rather than folding into [`OutboxError::Full`], which
+    /// would tell somebody that five hundred messages are waiting when none
+    /// are. Unreachable — it is eighteen quintillion messages to one person —
+    /// but an error that misdescribes the fault is worse than an error nobody
+    /// sees, because the one person who ever sees it has no other information.
+    Exhausted,
+}
+
+impl std::fmt::Display for OutboxError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OutboxError::Envelope(e) => write!(f, "{e}"),
+            OutboxError::Full => {
+                write!(
+                    f,
+                    "{MAX_UNACKED} messages are already waiting to be delivered"
+                )
+            }
+            OutboxError::Exhausted => write!(f, "this conversation is out of sequence numbers"),
+        }
+    }
+}
+
+impl std::error::Error for OutboxError {}
+
+/// One direction of one thread's outgoing messages: what number comes next, and
+/// what has gone out without being acknowledged.
+///
+/// The mirror of [`Inbox`], and one per thread, because `seq` is per-sender.
+///
+/// # Why this holds numbers and not messages
+///
+/// A message's body and `msg_id` are in the store the moment it is queued, and
+/// that is what makes them survive the app being closed. Holding a second copy
+/// here would be a second answer to "what did we send", able to disagree with
+/// the first after a crash between the two writes — and it would put a
+/// conversation's worth of bodies in memory to no end. So this holds the
+/// decision, and the store holds the messages.
+///
+/// # What a resend must not do
+///
+/// Give the message a new `seq` or a new `msg_id`. The ratchet will encrypt it
+/// afresh — new number, new key, and it is right to, since cryptographically it
+/// has never sent this — so the *only* thing that tells the far side it already
+/// has this message is the pair of identifiers that stayed the same. Reassign
+/// either and a resend becomes a duplicate on somebody's screen.
+///
+/// That is why [`Outbox::unacked`] hands back the `seq` numbers rather than
+/// rebuilding envelopes: there is nothing here to rebuild them from, which is
+/// the point. The caller reads the rows the numbers name.
+#[derive(Clone, Debug)]
+pub struct Outbox {
+    /// Always at least 1. `seq` 0 is what [`Inbox::through`] uses for "nothing
+    /// yet", so it is never a message.
+    next_seq: u64,
+    /// Sent, not yet acknowledged, in `seq` order — which is resend order, and
+    /// the reason this is a `BTreeSet`. A `HashSet` would resend a reunion's
+    /// backlog in an arbitrary order, and the far side would hold every one of
+    /// them in `ahead` until the lowest happened to turn up.
+    unacked: BTreeSet<u64>,
+}
+
+impl Default for Outbox {
+    fn default() -> Self {
+        Self {
+            next_seq: 1,
+            unacked: BTreeSet::new(),
+        }
+    }
+}
+
+impl Outbox {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Restore one from the store: the next number to hand out, and what was
+    /// still waiting.
+    ///
+    /// Both bounds re-applied, as in [`Inbox::resumed`] and for the same
+    /// reason — what comes back has been through the store and possibly
+    /// through a different build. `seq` 0 is dropped because it is not a
+    /// message, and anything at or above `next_seq` because it has not been
+    /// handed out; either would mean two different messages could end up
+    /// wearing one number.
+    ///
+    /// Over [`MAX_UNACKED`], the *lowest* numbers are kept. They are the ones
+    /// blocking the far side's contiguous run, so delivering them is what lets
+    /// it advance; keeping the newest instead would leave a hole at the front
+    /// that nothing later can close. The rest are still in the store — this
+    /// bounds what is resent, not what exists.
+    pub fn resumed(next_seq: u64, unacked: impl IntoIterator<Item = u64>) -> Self {
+        let next_seq = next_seq.max(1);
+        Self {
+            next_seq,
+            unacked: unacked
+                .into_iter()
+                .filter(|seq| *seq > 0 && *seq < next_seq)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .take(MAX_UNACKED)
+                .collect(),
+        }
+    }
+
+    /// The number the next message will get.
+    pub fn next_seq(&self) -> u64 {
+        self.next_seq
+    }
+
+    /// Take a message for sending: assign it a number and an id, and remember
+    /// that it is owed.
+    ///
+    /// # Nothing is consumed by a refusal
+    ///
+    /// Both refusals happen before `next_seq` moves, and that is not tidiness.
+    /// A rejected message that burned a number would leave a gap the far side
+    /// can never fill — [`Inbox::pending`] would show it as a message still on
+    /// its way, for ever, because nothing was ever sent under it.
+    pub fn queue(&mut self, body: Vec<u8>) -> Result<ChatEnvelope, OutboxError> {
+        if self.unacked.len() >= MAX_UNACKED {
+            return Err(OutboxError::Full);
+        }
+        // Worked out before the envelope so that an exhausted stream reports
+        // itself as one. Built the other way round, a stream with no numbers
+        // left and an over-long body answered `Envelope(TooLong)` — true, and
+        // not the thing standing in the way, since shortening the body would
+        // change nothing.
+        //
+        // Checked at all because `Inbox` had this written as `+ 1` and panicked
+        // on the last value in range, and a panic in the send path is not how
+        // anyone should meet an edge this far out. The cost is that `u64::MAX`
+        // is never issued: there would be no number after it, and a counter
+        // that cannot advance is worse than being one message short of the end
+        // of a range nothing reaches.
+        let Some(next) = self.next_seq.checked_add(1) else {
+            return Err(OutboxError::Exhausted);
+        };
+        let envelope = ChatEnvelope::new(self.next_seq, body).map_err(OutboxError::Envelope)?;
+        // Only now, so a refused body still leaves the number unspent.
+        self.next_seq = next;
+        self.unacked.insert(envelope.seq);
+        Ok(envelope)
+    }
+
+    /// The far side confirmed it has this one. Returns whether it was owed, so
+    /// an acknowledgement for something already settled — or never sent — is
+    /// visible rather than silently absorbed.
+    pub fn acked(&mut self, seq: u64) -> bool {
+        self.unacked.remove(&seq)
+    }
+
+    /// Everything still owed, lowest first: the resend list when a pipe opens.
+    pub fn unacked(&self) -> Vec<u64> {
+        self.unacked.iter().copied().collect()
+    }
+
+    /// How many are waiting.
+    pub fn len(&self) -> usize {
+        self.unacked.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.unacked.is_empty()
     }
 }
