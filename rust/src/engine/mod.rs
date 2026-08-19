@@ -12,12 +12,12 @@
 //! ever was: an in-memory keystore meant no master was found on the next
 //! launch, and the database was deleted unread.
 //!
-//! Two things remain owed. The *identity* is still regenerated on every launch
-//! — the seeds are not sealed yet, so the device is a new person each time even
-//! though its store now persists. And R0-F1's "master secret in platform
-//! hardware" needs the Android Keystore backend; file permissions are what
-//! stands in for it today, which is a real boundary on Android and a weak one
-//! on desktop. Both are written up where they live.
+//! One thing remains owed: R0-F1's "master secret in platform hardware" needs
+//! the Android Keystore backend. File permissions are what stands in for it
+//! today, which is a real boundary on Android and a weak one on desktop. The
+//! shape it plugs into is
+//! [`WrappedKeystore`](crate::identity::wrapped::WrappedKeystore), and
+//! [`platform_keystore`] is the one place that will choose it.
 //!
 //! The fake network ([`fake`]) is the Ring-0 implementation, not a test double:
 //! it ships in this build because no real transport exists yet. When T08–T10
@@ -195,7 +195,27 @@ pub fn open_store_for_test(support_dir: String) -> Result<Store, String> {
 /// view of what this device has sealed: a second `FileKeystore` over the same
 /// directory would work, and would be a second place for the answer to "is this
 /// a first launch" to come from.
-type Opened = (Store, Arc<FileKeystore>);
+///
+/// `dyn` because the backend is a platform choice — see [`platform_keystore`].
+type Opened = (Store, Arc<dyn Keystore>);
+
+/// The best keystore this platform has.
+///
+/// One function, so that "what protects the seeds here" has one answer and one
+/// place to read it. Today that answer is the same everywhere: bytes in a
+/// directory only this app can read.
+///
+/// Android is where it will differ. There the file keystore becomes the inner
+/// half of a
+/// [`WrappedKeystore`](crate::identity::wrapped::WrappedKeystore) whose
+/// wrapping key is generated in the Android Keystore and never leaves it, which
+/// is what R0-F1 means by hardware. Desktop has no equivalent to reach for and
+/// the file keystore's own module doc says plainly what that is worth.
+fn platform_keystore(dir: &Path) -> Result<Arc<dyn Keystore>, String> {
+    Ok(Arc::new(
+        FileKeystore::open(dir.join("keys")).map_err(|e| e.to_string())?,
+    ))
+}
 
 fn open_store(support_dir: String) -> Result<Opened, String> {
     let dir = PathBuf::from(support_dir);
@@ -209,7 +229,7 @@ fn open_store(support_dir: String) -> Result<Opened, String> {
     //
     // Which means the reset below has, until this line changed, run on every
     // single launch and never once in the situation it was written for.
-    let keystore = Arc::new(FileKeystore::open(dir.join("keys")).map_err(|e| e.to_string())?);
+    let keystore = platform_keystore(&dir)?;
 
     // Record whether a master already existed *before* open (open seals a fresh
     // one on first use). A stale DB is safe to reset only when no master
@@ -234,7 +254,7 @@ fn open_store(support_dir: String) -> Result<Opened, String> {
 
 fn install(
     store: Store,
-    keystore: Arc<FileKeystore>,
+    keystore: Arc<dyn Keystore>,
     transport: Option<Arc<dyn crate::transport::Transport>>,
     local_id: &str,
     events: std::sync::mpsc::Receiver<crate::transport::TransportEvent>,

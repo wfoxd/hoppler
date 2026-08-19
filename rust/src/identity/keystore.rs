@@ -1,10 +1,11 @@
 //! Keystore boundary for Layer-1 / Layer-2 secret seeds (tech spec §3).
 //!
-//! The production backend is a native plugin over the Secure Enclave (iOS) /
-//! StrongBox (Android), where the master secret is non-exportable and the OS
-//! performs unsealing. That plugin — and its device-only "attempted
-//! extraction" acceptance test — is the remaining device-gated piece of T05,
-//! tracked alongside the platform-adapter work.
+//! The production backend on Android is
+//! [`WrappedKeystore`](super::wrapped::WrappedKeystore) over
+//! [`FileKeystore`](super::filekeystore::FileKeystore): the seeds live in
+//! app-private storage, encrypted under a key generated in the Android Keystore
+//! that cannot be exported. Its device-only "attempted extraction" acceptance
+//! test is the remaining device-gated piece of T05.
 //!
 //! This module defines the trait every backend implements, plus an in-memory
 //! [`SoftwareKeystore`] used by the core's tests and by desktop dev builds.
@@ -12,12 +13,14 @@
 //! enclave guards a master key that wraps these seeds (the enclave's own curve
 //! is not Ed25519, so it cannot hold the signing key directly).
 //!
-//! Trait-shape limit to revisit with the hardware backend: [`Keystore::unseal`]
-//! returns the raw seed, so even a hardware backend can only wrap/unwrap it and
-//! the seed lands in process RAM at unseal time. A future backend that keeps
-//! the seed sealed would need operation methods (sign-in-enclave,
-//! derive-in-enclave) rather than export — deferred until that backend exists
-//! to shape the API against.
+//! Trait-shape limit, now settled rather than open: [`Keystore::unseal`]
+//! returns the raw seed, so the hardware backend wraps and unwraps it and the
+//! seed lands in process RAM at unseal time. Keeping it sealed throughout would
+//! need operation methods (sign-in-enclave, derive-in-enclave) instead of
+//! export — and the enclave's own curve is not Ed25519, so it could not hold
+//! the signing key even then. What wrapping buys is stated exactly in
+//! [`wrapped`](super::wrapped): storage read anywhere but the running app is
+//! useless.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
