@@ -251,21 +251,42 @@ pub struct Ceremony {
     stage: Stage,
 }
 
+/// What the middle stage carries: a live transport, who the far side proved to
+/// be, the transcript the SAS came from, and where each human has got to.
+///
+/// Its own struct behind a `Box` rather than fields on the variant. `Opening`
+/// is a pointer and `Closed` is nothing, so an inline payload here sets the
+/// size of every `Stage` — and it grew past what clippy tolerates the moment
+/// the SAS went from two colours to three. Boxing the whole thing rather than
+/// the one field that grew, because the next thing to grow would trip it again.
+struct Confirming {
+    transport: Box<TransportState>,
+    persona: VerifiedPersona,
+    transcript: Vec<u8>,
+    sas: Sas,
+    we_confirmed: bool,
+    they_confirmed: bool,
+    /// Set once we have sent ours.
+    ///
+    /// A second lock with no reachable path today, and recorded as one rather
+    /// than left to be found: a peer's repeat confirmation is already refused
+    /// by `they_confirmed` in [`Ceremony::read`], so nothing gets as far as
+    /// asking this. Removing it therefore breaks no test — the mutant survives
+    /// — and that is the expected result, not a hole for somebody to fill by
+    /// deleting the field.
+    ///
+    /// Kept because the guard it duplicates is one branch in a state machine
+    /// that a later change could reasonably relax, and the cost of being wrong
+    /// here is re-emitting a long-term identity on a peer's say-so.
+    we_proved: bool,
+}
+
 enum Stage {
     /// Handshaking. The scanner is here after sending message 1; the shower
     /// from the start.
     Opening(Box<HandshakeState>),
     /// Verified, waiting on two humans.
-    Confirming {
-        transport: Box<TransportState>,
-        persona: VerifiedPersona,
-        transcript: Vec<u8>,
-        sas: Sas,
-        we_confirmed: bool,
-        they_confirmed: bool,
-        /// Set once we have sent ours, so a peer cannot make us send it twice.
-        we_proved: bool,
-    },
+    Confirming(Box<Confirming>),
     /// Finished, either way. Holding no keys.
     Closed,
 }
@@ -314,7 +335,7 @@ impl Ceremony {
     /// The SAS, once there is one.
     pub fn sas(&self) -> Option<Sas> {
         match &self.stage {
-            Stage::Confirming { sas, .. } => Some(*sas),
+            Stage::Confirming(c) => Some(c.sas),
             _ => None,
         }
     }
@@ -324,13 +345,13 @@ impl Ceremony {
     /// Emits our confirmation, and our Layer-1 proof too if the other side has
     /// already confirmed. That ordering is the point: see the module header.
     pub fn confirm(&mut self, us: &Identity) -> Result<Vec<Step>, CeremonyError> {
-        let Stage::Confirming { we_confirmed, .. } = &mut self.stage else {
+        let Stage::Confirming(c) = &mut self.stage else {
             return Err(CeremonyError::OutOfOrder);
         };
-        if *we_confirmed {
+        if c.we_confirmed {
             return Err(CeremonyError::OutOfOrder);
         }
-        *we_confirmed = true;
+        c.we_confirmed = true;
         let mut steps = vec![Step::Send(self.seal(FrameKind::Confirm, &[])?)];
         steps.extend(self.prove_if_ready(us)?);
         Ok(steps)
@@ -340,7 +361,7 @@ impl Ceremony {
     pub fn read(&mut self, us: &Identity, message: &[u8]) -> Result<Vec<Step>, CeremonyError> {
         match &mut self.stage {
             Stage::Opening(_) => self.read_handshake(us, message),
-            Stage::Confirming { .. } => self.read_frame(us, message),
+            Stage::Confirming(_) => self.read_frame(us, message),
             Stage::Closed => Err(CeremonyError::OutOfOrder),
         }
     }
@@ -445,7 +466,7 @@ impl Ceremony {
         let transcript = state.get_handshake_hash().to_vec();
         let transport = state.into_transport_mode().map_err(noise)?;
         let sas = sas::derive(&transcript, &self.nonce);
-        self.stage = Stage::Confirming {
+        self.stage = Stage::Confirming(Box::new(Confirming {
             transport: Box::new(transport),
             persona,
             transcript,
@@ -453,7 +474,7 @@ impl Ceremony {
             we_confirmed: false,
             they_confirmed: false,
             we_proved: false,
-        };
+        }));
         Ok(())
     }
 
@@ -463,16 +484,16 @@ impl Ceremony {
         let (kind, payload) = self.open(message)?;
         match kind {
             FrameKind::Confirm => {
-                let Stage::Confirming { they_confirmed, .. } = &mut self.stage else {
+                let Stage::Confirming(c) = &mut self.stage else {
                     return Err(CeremonyError::OutOfOrder);
                 };
-                if *they_confirmed {
+                if c.they_confirmed {
                     // A second confirmation is not additional consent. Refusing
                     // it keeps `prove_if_ready` from being re-entered by a peer
                     // that simply repeats itself.
                     return Err(CeremonyError::OutOfOrder);
                 }
-                *they_confirmed = true;
+                c.they_confirmed = true;
                 let mut steps = vec![Step::PeerConfirmed];
                 steps.extend(self.prove_if_ready(us)?);
                 Ok(steps)
@@ -488,22 +509,15 @@ impl Ceremony {
     /// site: two callers reach it — our own confirmation and the peer's — and
     /// whichever arrives second is the one that fires.
     fn prove_if_ready(&mut self, us: &Identity) -> Result<Vec<Step>, CeremonyError> {
-        let Stage::Confirming {
-            transcript,
-            we_confirmed,
-            they_confirmed,
-            we_proved,
-            ..
-        } = &mut self.stage
-        else {
+        let Stage::Confirming(c) = &mut self.stage else {
             return Err(CeremonyError::OutOfOrder);
         };
-        if !(*we_confirmed && *they_confirmed) || *we_proved {
+        if !(c.we_confirmed && c.they_confirmed) || c.we_proved {
             return Ok(Vec::new());
         }
-        *we_proved = true;
+        c.we_proved = true;
         let l1_pub = us.layer1_public();
-        let message = l1_proof_message(transcript, &l1_pub, &us.layer2_public());
+        let message = l1_proof_message(&c.transcript, &l1_pub, &us.layer2_public());
         let proof = L1Proof {
             l1_pub: l1_pub.0.to_vec(),
             signature: us.sign_with_layer1(&message).0.to_vec(),
@@ -513,37 +527,28 @@ impl Ceremony {
     }
 
     fn read_l1(&mut self, payload: &[u8]) -> Result<Vec<Step>, CeremonyError> {
-        let Stage::Confirming {
-            transcript,
-            persona,
-            we_confirmed,
-            they_confirmed,
-            ..
-        } = &self.stage
-        else {
+        let Stage::Confirming(c) = &self.stage else {
             return Err(CeremonyError::OutOfOrder);
         };
         // The ordering rule, enforced on the receiving side too. A peer that
         // sends its Layer-1 key early is not doing us a favour — accepting it
         // would pair us with someone neither person has confirmed.
-        if !(*we_confirmed && *they_confirmed) {
+        if !(c.we_confirmed && c.they_confirmed) {
             return Err(CeremonyError::OutOfOrder);
         }
 
-        let l1_pub = verify_l1_proof(transcript, &persona.l2_pub, payload)?;
+        let l1_pub = verify_l1_proof(&c.transcript, &c.persona.l2_pub, payload)?;
 
-        let sas = self.sas().expect("confirming");
-        let Stage::Confirming {
-            transport, persona, ..
-        } = std::mem::replace(&mut self.stage, Stage::Closed)
-        else {
+        // Taken by value now the checks have passed, so the stage closes and
+        // its keys go with it. Read through the borrow above until this point.
+        let Stage::Confirming(c) = std::mem::replace(&mut self.stage, Stage::Closed) else {
             return Err(CeremonyError::OutOfOrder);
         };
         Ok(vec![Step::Paired(Box::new(Paired {
-            persona,
+            persona: c.persona,
             l1_pub,
-            sas,
-            transport: *transport,
+            sas: c.sas,
+            transport: *c.transport,
         }))])
     }
 
@@ -553,27 +558,27 @@ impl Ceremony {
         if payload.len() > MAX_CEREMONY_FRAME {
             return Err(CeremonyError::Malformed);
         }
-        let Stage::Confirming { transport, .. } = &mut self.stage else {
+        let Stage::Confirming(c) = &mut self.stage else {
             return Err(CeremonyError::OutOfOrder);
         };
         let mut plain = Vec::with_capacity(KIND_LEN + payload.len());
         plain.push(kind as u8);
         plain.extend_from_slice(payload);
         let mut out = vec![0u8; MAX_NOISE_MESSAGE];
-        let n = transport.write_message(&plain, &mut out).map_err(noise)?;
+        let n = c.transport.write_message(&plain, &mut out).map_err(noise)?;
         out.truncate(n);
         Ok(out)
     }
 
     fn open(&mut self, message: &[u8]) -> Result<(FrameKind, Vec<u8>), CeremonyError> {
-        let Stage::Confirming { transport, .. } = &mut self.stage else {
+        let Stage::Confirming(c) = &mut self.stage else {
             return Err(CeremonyError::OutOfOrder);
         };
         if message.len() > MAX_CEREMONY_CIPHERTEXT {
             return Err(CeremonyError::Malformed);
         }
         let mut buf = vec![0u8; MAX_NOISE_MESSAGE];
-        let n = transport.read_message(message, &mut buf).map_err(noise)?;
+        let n = c.transport.read_message(message, &mut buf).map_err(noise)?;
         buf.truncate(n);
         let (kind, payload) = buf.split_first().ok_or(CeremonyError::Malformed)?;
         if payload.len() > MAX_CEREMONY_FRAME {

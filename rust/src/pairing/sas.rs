@@ -1,4 +1,4 @@
-//! The short authentication string: **two colours and a word** (tech spec §6,
+//! The short authentication string: **three colours and a word** (tech spec §6,
 //! R0-F4).
 //!
 //! # What it is defending against
@@ -21,22 +21,37 @@
 //! device that pressed confirm on the user's behalf would be authenticating
 //! nothing at all.
 //!
-//! # How much it is worth: 16 bits
+//! # How much it is worth: 20 bits
 //!
-//! Two colours from a palette of [`PALETTE_LEN`] and one word from a list of
-//! [`words::WORDS`] give 4 + 4 + 8 = [`SAS_BITS`] bits. An attacker relaying a
-//! ceremony has to produce two transcripts whose renderings collide, gets one
-//! attempt in front of two people who are looking at their screens, and
-//! succeeds with probability 1 in 65,536.
+//! Three colours from a palette of [`PALETTE_LEN`] and one word from a list of
+//! [`words::WORDS`] give 4 + 4 + 4 + 8 = [`SAS_BITS`] bits. An attacker
+//! relaying a ceremony has to produce two transcripts whose renderings collide,
+//! gets one attempt in front of two people who are looking at their screens,
+//! and succeeds with probability 1 in 1,048,576.
 //!
-//! **That is below the ~20 bits usually recommended for a compared
-//! authentication string**, and it is a property of the human format rather
-//! than of this code: the spec asks for two colours and a word, and two colours
-//! and a word is what that comes to. Raising it means changing what people see
-//! — a third colour would take it to 20 bits — which is a spec decision and is
-//! flagged for T22 rather than made here. It is recorded in this comment
-//! because the number is the sort of thing that otherwise gets assumed to be
-//! fine.
+//! This was two colours and a word — 16 bits, 1 in 65,536 — which is below the
+//! ~20 bits usually recommended for a compared authentication string and
+//! matches nothing in common use; Bluetooth's numeric comparison is six digits,
+//! about 20 bits. The strength is a property of the human format rather than of
+//! this code, so raising it meant changing what people see, which is why it was
+//! a spec decision and not one taken here. Tech spec §6 was amended on 20 Aug
+//! 2026 and this followed.
+//!
+//! # Why a third colour rather than a longer word list or a second word
+//!
+//! A 512-word list buys one bit for twice the vocabulary. A second word buys
+//! eight, and is noticeably more to read aloud. A third colour buys four, costs
+//! one swatch, and still says in one breath: "amber, teal, rose — lantern".
+//!
+//! The palette deliberately did *not* grow, which would have been the cheapest
+//! bits of all. See below: it is capped by what a person can actually compare,
+//! not by what a screen can display.
+//!
+//! The real limit is not arithmetic. A string nobody troubles to compare is
+//! worth no bits at all, so every element added has to be paid for out of the
+//! same fifteen seconds R0-F4 allows — and the measurement says there is room:
+//! two phones over NFC reached the colours in 495 ms, leaving essentially the
+//! whole budget to the humans.
 //!
 //! # Why colours have names
 //!
@@ -61,14 +76,30 @@ use super::words;
 /// the codebase: changing what people compare is a compatibility break, because
 /// two builds that disagree show two different words and every ceremony between
 /// them fails at the human step.
-const SAS_LABEL: &[u8] = b"hoppler/sas/v1";
+///
+/// Bumped to v2 with the third colour, and the reason is worth stating because
+/// it is not merely convention. Adding a colour on its own left the first two
+/// derived from the same nibbles as before, so a v1 phone and a v2 phone
+/// showed *the same first two colours* and differed only after them. Two people
+/// glancing at "blue · navy · …" on both screens could reasonably call that a
+/// match — a partial agreement invites a false confirmation in a way total
+/// disagreement never does. The new label makes the two unrelated, so a
+/// mismatched pair of builds fails the way every other mismatch does.
+const SAS_LABEL: &[u8] = b"hoppler/sas/v2";
 
 /// Colours in the palette.
 pub const PALETTE_LEN: usize = 16;
 
+/// How many colours one SAS shows.
+///
+/// Named rather than written as a literal in four places, because it is a
+/// security parameter: it is one of the two numbers [`SAS_BITS`] is computed
+/// from, and the test below fails if they stop agreeing.
+pub const SAS_COLOURS: usize = 3;
+
 /// Entropy of one rendered SAS, in bits. Asserted against the palette and word
 /// list sizes below, so it cannot drift away from what it describes.
-pub const SAS_BITS: u32 = 16;
+pub const SAS_BITS: u32 = 20;
 
 /// One palette entry: what to paint, and what to call it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,17 +190,22 @@ pub const PALETTE: [SasColour; PALETTE_LEN] = [
 pub struct Sas {
     /// Shown in this order. The order carries information — "teal then amber"
     /// is not "amber then teal" — so a UI must not sort them.
-    pub colours: [SasColour; 2],
+    pub colours: [SasColour; SAS_COLOURS],
     pub word: &'static str,
 }
 
 impl Sas {
-    /// The spoken form, for a UI that wants one string: `"red · teal · lantern"`.
+    /// The spoken form, for a UI that wants one string:
+    /// `"red · teal · rose · lantern"`.
+    ///
+    /// Built by joining rather than by naming each colour, so adding or
+    /// removing one is a change to [`SAS_COLOURS`] and nothing else — the
+    /// previous version listed `colours[0]` and `colours[1]` by hand and would
+    /// have silently dropped the third.
     pub fn spoken(&self) -> String {
-        format!(
-            "{} · {} · {}",
-            self.colours[0].name, self.colours[1].name, self.word
-        )
+        let mut parts: Vec<&str> = self.colours.iter().map(|c| c.name).collect();
+        parts.push(self.word);
+        parts.join(" · ")
     }
 }
 
@@ -190,20 +226,30 @@ impl Sas {
 pub fn derive(transcript: &[u8], ceremony_nonce: &[u8]) -> Sas {
     let okm = kdf::derive_32(transcript, ceremony_nonce, SAS_LABEL);
 
-    // One byte, split. The two colours come from the two nibbles of `okm[0]`
-    // and the word from `okm[1]`, so every one of the 65,536 renderings is
-    // equally likely — no modulo, because both ranges divide their byte
-    // exactly. That is what `PALETTE_LEN == 16` and 256 words are *for*; the
-    // test below fails if either stops being true.
-    let first = (okm[0] >> 4) as usize;
-    let second = (okm[0] & 0x0f) as usize;
-    let word = okm[1] as usize;
+    // One nibble per colour, one whole byte for the word, so every one of the
+    // 1,048,576 renderings is equally likely — no modulo, because both ranges
+    // divide their source exactly. That is what `PALETTE_LEN == 16` and 256
+    // words are *for*; the test below fails if either stops being true.
+    //
+    // Taken from consecutive nibbles rather than a byte each, so that adding a
+    // colour costs four bits of key material instead of eight and the word's
+    // byte stays whole. `derive_32` gives far more than is needed either way.
+    let mut colours = [PALETTE[0]; SAS_COLOURS];
+    for (i, slot) in colours.iter_mut().enumerate() {
+        let byte = okm[i / 2];
+        let nibble = if i % 2 == 0 { byte >> 4 } else { byte & 0x0f };
+        *slot = PALETTE[nibble as usize];
+    }
+    // After the colours, on whatever byte they finished in or before. Written
+    // as a division rather than a constant so the word does not silently start
+    // sharing a byte with a colour if `SAS_COLOURS` changes.
+    let word = okm[SAS_COLOURS.div_ceil(2)] as usize;
 
     Sas {
-        // Repeats are allowed and deliberate: "green, green, kettle" is a
-        // perfectly checkable SAS, and rejecting equal pairs would mean
-        // rejection sampling for a fifteen-sixteenths-of-a-bit gain.
-        colours: [PALETTE[first], PALETTE[second]],
+        // Repeats are allowed and deliberate: "green, green, green, kettle" is
+        // a perfectly checkable SAS, and rejecting repeats would mean rejection
+        // sampling for a fraction of a bit.
+        colours,
         word: words::WORDS[word],
     }
 }
@@ -218,12 +264,88 @@ mod tests {
         // `SAS_BITS` is quoted in the module header and will be quoted in a
         // security review. Growing the palette or the word list without
         // updating it would leave a documented number that is simply wrong.
-        let bits = PALETTE_LEN.ilog2() * 2 + words::WORDS.len().ilog2();
+        let bits = PALETTE_LEN.ilog2() * SAS_COLOURS as u32 + words::WORDS.len().ilog2();
         assert_eq!(bits, SAS_BITS);
         // Both must be exact powers of two, or the byte-splitting above stops
         // being uniform and some renderings become likelier than others.
         assert!(PALETTE_LEN.is_power_of_two());
         assert!(words::WORDS.len().is_power_of_two());
+    }
+
+    /// Twenty bits is the whole point of the change, and the number is quoted
+    /// in the spec and will be quoted in a review. This is the arithmetic
+    /// spelled out, so the constant cannot drift from what it claims.
+    #[test]
+    fn the_rendering_is_worth_twenty_bits() {
+        assert_eq!(SAS_BITS, 20);
+        assert_eq!(SAS_COLOURS, 3);
+        assert_eq!(PALETTE_LEN, 16);
+        assert_eq!(words::WORDS.len(), 256);
+    }
+
+    /// Every colour has to come from somewhere different, or a "third colour"
+    /// that always repeats the first buys no bits at all while looking like it
+    /// does — the failure this change exists to avoid, arrived at by accident.
+    #[test]
+    fn the_colours_are_drawn_from_distinct_bits() {
+        // Positions that never vary across many transcripts would mean a slot
+        // fed by nothing, or by the same nibble as another.
+        let mut seen = vec![HashSet::new(); SAS_COLOURS];
+        for i in 0..512u32 {
+            let mut transcript = [0u8; 32];
+            transcript[..4].copy_from_slice(&i.to_le_bytes());
+            let sas = derive(&transcript, &[0u8; 32]);
+            for (slot, names) in sas.colours.iter().zip(seen.iter_mut()) {
+                names.insert(slot.name);
+            }
+        }
+        for (i, names) in seen.iter().enumerate() {
+            assert_eq!(
+                names.len(),
+                PALETTE_LEN,
+                "colour {i} only ever took {} of {PALETTE_LEN} values",
+                names.len()
+            );
+        }
+    }
+
+    /// The word must not share a byte with a colour, or the two would move
+    /// together and the rendering would be worth less than it claims.
+    #[test]
+    fn the_word_varies_independently_of_the_colours() {
+        let mut pairs = HashSet::new();
+        for i in 0..512u32 {
+            let mut transcript = [0u8; 32];
+            transcript[..4].copy_from_slice(&i.to_le_bytes());
+            let sas = derive(&transcript, &[0u8; 32]);
+            pairs.insert((sas.colours[SAS_COLOURS - 1].name, sas.word));
+        }
+        // If the last colour and the word came from one byte there would be at
+        // most 256 combinations; independent, hundreds of distinct pairs show
+        // up in 512 draws.
+        assert!(
+            pairs.len() > 400,
+            "only {} distinct (last colour, word) pairs — they share a source",
+            pairs.len()
+        );
+    }
+
+    /// `spoken` is what a person reads out. Dropping a colour from it would
+    /// leave the screen at 20 bits and the spoken comparison at 16, which is
+    /// the weaker of the two and the one people actually use over a phone call.
+    #[test]
+    fn every_colour_reaches_the_spoken_form() {
+        let sas = derive(&[1u8; 32], &[2u8; 32]);
+        let spoken = sas.spoken();
+        for colour in sas.colours {
+            assert!(
+                spoken.contains(colour.name),
+                "{spoken:?} is missing {}",
+                colour.name
+            );
+        }
+        assert!(spoken.contains(sas.word));
+        assert_eq!(spoken.matches(" · ").count(), SAS_COLOURS);
     }
 
     #[test]
@@ -278,7 +400,12 @@ mod tests {
         // fails at the human step with nothing to explain why. This test
         // failing is how that is meant to be found out.
         let sas = derive(&[0xABu8; 32], &[0xCDu8; 32]);
-        assert_eq!(sas.spoken(), "blue · navy · yeast");
+        assert_eq!(sas.spoken(), "red · lime · blue · helmet");
+
+        // Three colours, said plainly, because the count is the security
+        // parameter and a vector that still passed with two would be a golden
+        // vector for the wrong format.
+        assert_eq!(sas.colours.len(), 3);
     }
 
     /// Every colour distinct as a value, and distinct as a *name* — the name is
