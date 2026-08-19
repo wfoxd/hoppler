@@ -147,6 +147,24 @@ void _radioReasonGroup() {
     test('granting it clears the sentence', () {
       expect(radioReasonFrom(available: true, permissionDenied: false), isNull);
     });
+
+    /// Granting the permission must not take a genuine radio fault down with
+    /// it. The first version of this held the rendered sentence instead of the
+    /// two facts, so "stop blaming the permission" was indistinguishable from
+    /// "stop showing the radio's problem" and turning Discovery on cleared
+    /// both — leaving an empty list with nothing said, and no reason for the
+    /// core to repeat itself, since `set_discovery` emits `DiscoveryUpdated`
+    /// rather than `RadioChanged`.
+    test('granting it does not hide the radio still being off', () {
+      expect(
+        radioReasonFrom(
+          available: false,
+          reason: 'Bluetooth is off',
+          permissionDenied: false,
+        ),
+        'Bluetooth is off',
+      );
+    });
   });
 
   /// The empty list has two meanings and needs two sentences.

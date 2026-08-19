@@ -1,15 +1,16 @@
 import 'package:flutter/material.dart';
 
-/// The sentence to show for a radio report, or null when the radio is fine.
+/// The sentence to put where the nearby list goes, or null when there is none.
 ///
 /// `available` decides; `reason` only supplies the words. Deciding from the
 /// reason instead gets the state backwards in both directions — an unavailable
 /// radio with nothing to say reads as working, and a recovery that arrives
 /// carrying a stale reason leaves the old sentence on screen.
 ///
-/// A pure function so that rule is testable. It was stated in a comment and
-/// got written the wrong way round one file over, in the same change.
-/// The sentence to put where the nearby list goes, or null when there is none.
+/// `permissionDenied` overrides both, for the reason below.
+///
+/// A pure function so all of that is testable. It was once stated in a comment
+/// and written the wrong way round one file over, in the same change.
 ///
 /// # Why a refused permission outranks the radio's own report
 ///

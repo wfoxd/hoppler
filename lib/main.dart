@@ -110,15 +110,22 @@ class _HomePageState extends State<HomePage> {
   /// Held apart from [_devices] because an empty list is what "the radio is
   /// off" and "nobody is nearby" both look like, and R0-F2 turns on the user
   /// being able to tell those apart.
-  String? _radioReason;
+  /// What the core last said about the radio, as it said it.
+  ///
+  /// The facts, not the sentence built from them. Storing the rendered string
+  /// is what made the first version of this wrong: with only a sentence in
+  /// hand, "stop blaming the permission" could not be told from "stop showing
+  /// the radio's problem", so turning Discovery on cleared both — hiding a
+  /// genuine "Bluetooth is off" that the core has no reason to repeat, since
+  /// `set_discovery` emits `DiscoveryUpdated` and not `RadioChanged`.
+  bool _radioAvailable = true;
+  String? _radioWhy;
 
   /// Somebody was asked for the Bluetooth permission and said no.
   ///
-  /// Kept apart from [_radioReason] rather than written into it, because the
-  /// two arrive from different places and would overwrite each other: the core
-  /// pushes `RadioChanged` whenever the radio's state moves, and folding a
-  /// refusal into the same field means the next such event silently erases it.
-  /// `radioReasonFrom` decides which is shown.
+  /// Its own fact, beside the radio's. The two arrive from different places
+  /// and neither can stand in for the other; [radioReasonFrom] is where they
+  /// are weighed, once, at the point of display.
   bool _permissionDenied = false;
   final List<String> _log = [];
   double? _transfer; // 0..1 while a Drop is in flight
@@ -260,11 +267,8 @@ class _HomePageState extends State<HomePage> {
           if (_pairing?.deviceId == deviceId) _pairing = null;
           _log.insert(0, 'Pairing failed: $reason');
         case CoreEvent_RadioChanged(:final available, :final reason):
-          _radioReason = radioReasonFrom(
-            available: available,
-            reason: reason,
-            permissionDenied: _permissionDenied,
-          );
+          _radioAvailable = available;
+          _radioWhy = reason;
       }
     });
   }
@@ -347,29 +351,17 @@ class _HomePageState extends State<HomePage> {
                   setState(() {
                     _discovery = false;
                     _permissionDenied = true;
-                    _radioReason = radioReasonFrom(
-                      available: false,
-                      permissionDenied: true,
-                    );
                   });
                   return;
                 }
                 // Granted, possibly after a trip to Settings. Clearing it here
-                // is what lets the screen recover without a restart.
+                // is what lets the screen recover without a restart — and it is
+                // all that needs clearing, because the radio's own state is
+                // held separately and is still whatever the core last said.
                 _permissionDenied = false;
               }
               await setDiscovery(enabled: v);
-              if (mounted) {
-                setState(() {
-                  _discovery = v;
-                  if (!_permissionDenied && _radioReason != null && v) {
-                    // The refusal's sentence is stale the moment the permission
-                    // is held; the core's next `RadioChanged` will say what is
-                    // actually wrong, if anything.
-                    _radioReason = null;
-                  }
-                });
-              }
+              if (mounted) setState(() => _discovery = v);
             },
           ),
           if (_pairing == null && _myCode == null && !_scanning)
@@ -426,7 +418,11 @@ class _HomePageState extends State<HomePage> {
                     ),
               nearby: NearbyView<NearbyDevice>(
                 discoveryOn: _discovery,
-                radioReason: _radioReason,
+                radioReason: radioReasonFrom(
+                  available: _radioAvailable,
+                  reason: _radioWhy,
+                  permissionDenied: _permissionDenied,
+                ),
                 devices: _devices,
                 tile: _deviceTile,
               ),
