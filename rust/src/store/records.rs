@@ -775,7 +775,7 @@ impl Store {
     /// from a duplicate that cost nothing.
     pub fn commit_received(
         &self,
-        ratchet: &[u8],
+        ratchet: Option<&[u8]>,
         inbox: &InboxPosition,
         message: &NewMessage,
         now: i64,
@@ -793,7 +793,18 @@ impl Store {
         // passes whether or not there is a transaction at all. That is the
         // shape of test this project keeps catching — one that asserts a
         // property the code happens not to be exercising.
-        self.write_ratchet(thread_id, ratchet, now)?;
+        // `None` for a thread that has no ratchet, which is every unpaired
+        // one: R0-F5's stranger chat rides the session's own encryption and the
+        // Double Ratchet belongs to a paired thread (tech spec §5). Modelling
+        // that as an absence rather than an empty blob keeps "no ratchet here"
+        // distinct from "a ratchet that serialises to nothing", and stops a
+        // caller with nothing to save from having to invent something.
+        //
+        // The transaction is unchanged and still the point: where there *is* a
+        // ratchet, it advances with the message that advanced it or not at all.
+        if let Some(ratchet) = ratchet {
+            self.write_ratchet(thread_id, ratchet, now)?;
+        }
         self.write_inbox(thread_id, inbox)?;
         let outcome = self.add_message(message)?;
         tx.commit()?;
@@ -1858,7 +1869,7 @@ mod tests {
             through: 4,
             ahead: vec![7, 9],
         };
-        s.commit_received(b"state one", &inbox, &an_incoming(thread, 1, 1), 3000)
+        s.commit_received(Some(b"state one"), &inbox, &an_incoming(thread, 1, 1), 3000)
             .unwrap();
 
         assert_eq!(
@@ -1882,10 +1893,15 @@ mod tests {
             through: 2,
             ahead: vec![5],
         };
-        s.commit_received(b"state one", &first, &an_incoming(thread, 1, 1), 3000)
+        s.commit_received(Some(b"state one"), &first, &an_incoming(thread, 1, 1), 3000)
             .unwrap();
-        s.commit_received(b"state two", &second, &an_incoming(thread, 2, 2), 3001)
-            .unwrap();
+        s.commit_received(
+            Some(b"state two"),
+            &second,
+            &an_incoming(thread, 2, 2),
+            3001,
+        )
+        .unwrap();
 
         assert_eq!(
             s.ratchet_state(thread).unwrap().unwrap()[..],
@@ -1915,16 +1931,26 @@ mod tests {
             through: 1,
             ahead: vec![],
         };
-        s.commit_received(b"state one", &before, &an_incoming(thread, 1, 1), 3000)
-            .unwrap();
+        s.commit_received(
+            Some(b"state one"),
+            &before,
+            &an_incoming(thread, 1, 1),
+            3000,
+        )
+        .unwrap();
 
         let impossible = InboxPosition {
             through: u64::MAX,
             ahead: vec![],
         };
         assert!(
-            s.commit_received(b"state two", &impossible, &an_incoming(thread, 2, 2), 3001)
-                .is_err(),
+            s.commit_received(
+                Some(b"state two"),
+                &impossible,
+                &an_incoming(thread, 2, 2),
+                3001
+            )
+            .is_err(),
             "an inbox position that cannot be stored was accepted"
         );
 
@@ -1950,7 +1976,12 @@ mod tests {
         let thread = a_thread(&s);
         let nowhere = InboxPosition::default();
         assert!(s
-            .commit_received(b"state", &nowhere, &an_incoming(thread + 999, 1, 1), 3000)
+            .commit_received(
+                Some(b"state"),
+                &nowhere,
+                &an_incoming(thread + 999, 1, 1),
+                3000
+            )
             .is_err());
     }
 
@@ -1967,7 +1998,7 @@ mod tests {
             through: 1,
             ahead: vec![],
         };
-        s.commit_received(b"state one", &first, &an_incoming(thread, 1, 1), 3000)
+        s.commit_received(Some(b"state one"), &first, &an_incoming(thread, 1, 1), 3000)
             .unwrap();
 
         let moved = InboxPosition {
@@ -1975,7 +2006,7 @@ mod tests {
             ahead: vec![3],
         };
         assert_eq!(
-            s.commit_received(b"state two", &moved, &an_incoming(thread, 1, 1), 3001)
+            s.commit_received(Some(b"state two"), &moved, &an_incoming(thread, 1, 1), 3001)
                 .unwrap(),
             InsertOutcome::Duplicate,
         );
@@ -2071,7 +2102,7 @@ mod tests {
             through: 1,
             ahead: vec![],
         };
-        s.commit_received(b"state one", &good, &an_incoming(thread, 1, 1), 3000)
+        s.commit_received(Some(b"state one"), &good, &an_incoming(thread, 1, 1), 3000)
             .unwrap();
 
         let too_many = InboxPosition {
@@ -2079,8 +2110,13 @@ mod tests {
             ahead: (2..=MAX_AHEAD + 2).collect(),
         };
         assert!(
-            s.commit_received(b"state two", &too_many, &an_incoming(thread, 2, 2), 3001)
-                .is_err(),
+            s.commit_received(
+                Some(b"state two"),
+                &too_many,
+                &an_incoming(thread, 2, 2),
+                3001
+            )
+            .is_err(),
             "an inbox the read side would refuse was written anyway"
         );
         // And the refusal rolls the whole commit back, rather than leaving the
@@ -2099,13 +2135,69 @@ mod tests {
             ahead: (2..MAX_AHEAD + 2).collect(),
         };
         s.commit_received(
-            b"state two",
+            Some(b"state two"),
             &at_the_bound,
             &an_incoming(thread, 2, 2),
             3002,
         )
         .unwrap();
         assert_eq!(s.inbox_position(thread).unwrap().unwrap(), at_the_bound);
+    }
+
+    /// An unpaired thread has no ratchet — R0-F5's stranger chat rides the
+    /// session's own encryption — so `None` has to mean nothing was written,
+    /// not an empty blob written. The difference matters later: a row that
+    /// exists says "this thread has ratchet state", and one that decodes to
+    /// nothing would be indistinguishable from a corrupted save.
+    #[test]
+    fn committing_without_a_ratchet_leaves_no_ratchet_row() {
+        let (s, _d) = store();
+        let thread = a_thread(&s);
+        let inbox = InboxPosition {
+            through: 1,
+            ahead: vec![],
+        };
+
+        s.commit_received(None, &inbox, &an_incoming(thread, 1, 1), 3000)
+            .unwrap();
+
+        assert!(
+            s.ratchet_state(thread).unwrap().is_none(),
+            "a thread with no ratchet got one anyway"
+        );
+        // And the rest of the commit still happened.
+        assert_eq!(s.inbox_position(thread).unwrap().unwrap(), inbox);
+        assert_eq!(s.messages_for_thread(thread).unwrap().len(), 1);
+    }
+
+    /// And a later commit that *does* carry one still saves it, so a thread
+    /// that gains a ratchet on pairing is not stuck without one.
+    #[test]
+    fn a_thread_can_gain_a_ratchet_after_committing_without_one() {
+        let (s, _d) = store();
+        let thread = a_thread(&s);
+        let inbox = InboxPosition {
+            through: 1,
+            ahead: vec![],
+        };
+        s.commit_received(None, &inbox, &an_incoming(thread, 1, 1), 3000)
+            .unwrap();
+
+        let later = InboxPosition {
+            through: 2,
+            ahead: vec![],
+        };
+        s.commit_received(
+            Some(b"now paired"),
+            &later,
+            &an_incoming(thread, 2, 2),
+            3001,
+        )
+        .unwrap();
+        assert_eq!(
+            s.ratchet_state(thread).unwrap().map(|v| v.to_vec()),
+            Some(b"now paired".to_vec())
+        );
     }
 
     #[test]
