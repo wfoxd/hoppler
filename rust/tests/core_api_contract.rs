@@ -28,11 +28,12 @@ use rust_lib_hoppler::api::transfers::offer_drop;
 use rust_lib_hoppler::api::types::CoreEvent;
 use rust_lib_hoppler::discovery::Discovery;
 use rust_lib_hoppler::engine::{
-    has_session, init_with_transport, receive_chat_for_test, thread_rows_for_test,
+    has_session, init_with_transport, mark_sent_for_test, queued_for_resend_for_test,
+    receive_chat_for_test, resend_queued_for_test, thread_rows_for_test,
 };
 use rust_lib_hoppler::identity::Identity;
 use rust_lib_hoppler::pairing::invite::Invite;
-use rust_lib_hoppler::session::chat::{ChatEnvelope, MAX_AHEAD};
+use rust_lib_hoppler::session::chat::{ChatEnvelope, MAX_AHEAD, MAX_UNACKED};
 use rust_lib_hoppler::transport::loopback::LoopbackNet;
 use rust_lib_hoppler::transport::{Transport, TransportError, TransportEvent};
 
@@ -375,6 +376,95 @@ fn an_arriving_message_keeps_the_senders_identifiers() {
         thread_rows_for_test(thread).unwrap(),
         vec![(7, hex::encode(envelope.msg_id))],
         "the row was renumbered or re-identified on the way in"
+    );
+}
+
+fn rows_ids(thread: i64) -> Vec<String> {
+    thread_rows_for_test(thread)
+        .unwrap()
+        .into_iter()
+        .map(|(_, id)| id)
+        .collect()
+}
+
+/// R0-F5: "queued messages deliver on reunion with no user action". Nothing
+/// did — a message written while the peer was away stayed `Queued` for ever,
+/// because the only thing that ever sent one was the call that created it.
+#[test]
+fn a_reunion_sends_what_was_queued_while_the_peer_was_away() {
+    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _h = fresh();
+
+    // No session, so each send writes its row and fails on the wire.
+    for text in ["one", "two", "three"] {
+        let _ = send_chat("peer".into(), text.to_string());
+    }
+    let thread = thread_for_device("peer".into()).unwrap().unwrap();
+    assert_eq!(thread_rows_for_test(thread).unwrap().len(), 3);
+
+    // What the reunion would put on the wire. Checked apart from the sending,
+    // because the sending needs a transport and a peer and the *decision* is
+    // where the rules are — every one of them survived a mutant while the test
+    // only watched the store, which is true whether anything is sent or not.
+    let owed = queued_for_resend_for_test("peer").unwrap();
+    assert_eq!(
+        owed.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(),
+        vec![1, 2, 3],
+        "the backlog was renumbered or came out of order"
+    );
+    // Under the identifiers the rows already carry, or the far side sees three
+    // new messages rather than three it may already have.
+    assert_eq!(
+        owed.iter().map(|(_, id)| id.clone()).collect::<Vec<_>>(),
+        rows_ids(thread),
+        "the resend drew fresh message ids"
+    );
+
+    let _ = resend_queued_for_test("peer");
+    let rows = thread_rows_for_test(thread).unwrap();
+    assert_eq!(rows.len(), 3, "the resend duplicated or dropped rows");
+}
+
+/// Only what never got away. Without an acknowledgement protocol a `Sent`
+/// message cannot be told from a delivered one, and resending every message
+/// ever sent on every reunion would be worse than the gap it covers.
+#[test]
+fn a_reunion_does_not_resend_what_already_went() {
+    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _h = fresh();
+
+    let _ = send_chat("peer".into(), "queued".into());
+    let thread = thread_for_device("peer".into()).unwrap().unwrap();
+    assert_eq!(queued_for_resend_for_test("peer").unwrap().len(), 1);
+
+    mark_sent_for_test(thread).unwrap();
+    assert!(
+        queued_for_resend_for_test("peer").unwrap().is_empty(),
+        "a message already away was queued up again"
+    );
+}
+
+/// The queue is bounded. Somebody typing to a person who is not there fills it,
+/// and the honest answer is to refuse: dropping the oldest would lose something
+/// they wrote and tell them nothing, and holding everything makes the queue a
+/// peer's absence can grow without limit.
+#[test]
+fn a_full_queue_refuses_rather_than_forgetting_what_was_typed() {
+    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _h = fresh();
+
+    for i in 0..MAX_UNACKED {
+        let _ = send_chat("peer".into(), format!("message {i}"));
+    }
+    let thread = thread_for_device("peer".into()).unwrap().unwrap();
+    assert_eq!(thread_rows_for_test(thread).unwrap().len(), MAX_UNACKED);
+
+    let refused = send_chat("peer".into(), "one too many".into());
+    assert!(refused.is_err(), "the bound was not enforced");
+    assert_eq!(
+        thread_rows_for_test(thread).unwrap().len(),
+        MAX_UNACKED,
+        "the refused message was written anyway"
     );
 }
 
