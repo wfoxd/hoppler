@@ -25,10 +25,14 @@ use rust_lib_hoppler::api::pairing::{
     begin_pairing, confirm_pairing, pairing_invite, stop_showing_invite,
 };
 use rust_lib_hoppler::api::transfers::offer_drop;
+use rust_lib_hoppler::api::types::CoreEvent;
 use rust_lib_hoppler::discovery::Discovery;
-use rust_lib_hoppler::engine::{has_session, init_with_transport};
+use rust_lib_hoppler::engine::{
+    has_session, init_with_transport, receive_chat_for_test, thread_rows_for_test,
+};
 use rust_lib_hoppler::identity::Identity;
 use rust_lib_hoppler::pairing::invite::Invite;
+use rust_lib_hoppler::session::chat::ChatEnvelope;
 use rust_lib_hoppler::transport::loopback::LoopbackNet;
 use rust_lib_hoppler::transport::{Transport, TransportError, TransportEvent};
 
@@ -321,6 +325,108 @@ fn a_chat_with_no_session_still_stores_the_outgoing_row() {
     // transition is covered where it belongs — `store::records` already tests
     // `messages_by_state` — and a real assertion arrives with the resend queue
     // in T12/T16, which is the first caller that needs to read it.
+}
+
+/// The defect this slice removes. A sender that never saw an ack resends the
+/// same message, and the ratchet is right to accept it — cryptographically it
+/// has never seen those bytes. Only the envelope's `msg_id` can say the person
+/// already has it, and until this change the receiver invented its own, so the
+/// resend became a second line on somebody's screen.
+#[test]
+fn the_same_message_arriving_twice_is_one_message() {
+    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _h = fresh();
+
+    let envelope = ChatEnvelope::new(1, b"are you there?".to_vec()).unwrap();
+    let first = receive_chat_for_test("peer", &envelope).unwrap();
+    assert!(first.is_some(), "the first arrival was not announced");
+
+    let again = receive_chat_for_test("peer", &envelope).unwrap();
+    assert!(again.is_none(), "a resend was announced as a new message");
+
+    let thread = thread_for_device("peer".into()).unwrap().unwrap();
+    let msgs = thread_messages(thread).unwrap();
+    assert_eq!(msgs.len(), 1, "the resend was stored as a second line");
+    assert_eq!(msgs[0].text, "are you there?");
+}
+
+/// And the sender's numbering is what gets stored, not a count of what we
+/// happen to have seen. A receiver that renumbered from 1 would agree with
+/// itself and with nobody else — and every later resend, acknowledgement and
+/// gap is matched on these two values.
+#[test]
+fn an_arriving_message_keeps_the_senders_identifiers() {
+    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _h = fresh();
+
+    let envelope = ChatEnvelope::new(7, b"seventh".to_vec()).unwrap();
+    let event = receive_chat_for_test("peer", &envelope).unwrap().unwrap();
+    let CoreEvent::MessageReceived { msg_id, .. } = event else {
+        panic!("expected a message event");
+    };
+    assert_eq!(
+        msg_id,
+        hex::encode(envelope.msg_id),
+        "the receiver announced an id the sender never sent"
+    );
+
+    let thread = thread_for_device("peer".into()).unwrap().unwrap();
+    assert_eq!(
+        thread_rows_for_test(thread).unwrap(),
+        vec![(7, hex::encode(envelope.msg_id))],
+        "the row was renumbered or re-identified on the way in"
+    );
+}
+
+/// `seq` is chosen by whoever is sending, and `decode` takes any `u64`. Cast
+/// into the store's `i64`, anything above `i64::MAX` lands *negative* — sorting
+/// before every real message — so one frame from a stranger could reorder a
+/// conversation permanently. It is refused instead, and refused quietly: an
+/// unusable message is not a reason to tear down a session.
+#[test]
+fn a_seq_too_large_for_the_store_is_refused_rather_than_wrapped() {
+    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _h = fresh();
+
+    let good = ChatEnvelope::new(1, b"first".to_vec()).unwrap();
+    receive_chat_for_test("peer", &good).unwrap().unwrap();
+
+    let huge = ChatEnvelope::new(u64::MAX, b"from the future".to_vec()).unwrap();
+    assert!(
+        receive_chat_for_test("peer", &huge).unwrap().is_none(),
+        "a seq that cannot be stored was announced anyway"
+    );
+
+    let thread = thread_for_device("peer".into()).unwrap().unwrap();
+    let rows = thread_rows_for_test(thread).unwrap();
+    assert_eq!(rows.len(), 1, "the unstorable message was written anyway");
+    assert!(
+        rows.iter().all(|(seq, _)| *seq > 0),
+        "a negative seq reached the store: {rows:?}"
+    );
+}
+
+/// The id the caller is handed has to be the id in the store, because that is
+/// what an acknowledgement or a state change will look the row up by. Two
+/// separately-drawn ids would agree on nothing and fail silently: the message
+/// would send, and its delivery state would never move again.
+#[test]
+fn an_outgoing_message_is_stored_under_the_id_its_sender_was_given() {
+    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _h = fresh();
+
+    // The wire send fails — there is no session — but the row is written
+    // first, which is the part under test.
+    let _ = send_chat("peer".into(), "hello".into());
+    let thread = thread_for_device("peer".into()).unwrap().unwrap();
+    let rows = thread_rows_for_test(thread).unwrap();
+    let shown = thread_messages(thread).unwrap();
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].1, shown[0].msg_id,
+        "the caller was told one id and the store kept another"
+    );
 }
 
 #[test]

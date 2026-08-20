@@ -19,6 +19,7 @@ use rust_lib_hoppler::engine::net::{Net, NetEvent, CEREMONY_DEADLINE, PING_DEADL
 use rust_lib_hoppler::identity::Identity;
 use rust_lib_hoppler::pairing::invite::Invite;
 use rust_lib_hoppler::pairing::sas::Sas;
+use rust_lib_hoppler::session::chat::ChatEnvelope;
 use rust_lib_hoppler::session::table::IDLE_TIMEOUT;
 use rust_lib_hoppler::transport::loopback::LoopbackNet;
 use rust_lib_hoppler::transport::{Transport, TransportEvent};
@@ -154,17 +155,54 @@ fn chat_crosses_a_real_session() {
     alice.net.reach(&bob.id).unwrap();
     settle(&alice, &bob, now);
 
-    alice
-        .net
-        .send_chat(&bob.id, "hello over noise", now)
-        .unwrap();
+    // Numbered and identified by the sender, and both have to survive the trip
+    // — they are the only things that can tell a resend from a new message.
+    let sent = ChatEnvelope::new(1, b"hello over noise".to_vec()).unwrap();
+    alice.net.send_chat(&bob.id, sent.encode(), now).unwrap();
     let (_, b_events) = settle(&alice, &bob, now);
     assert!(
         b_events.contains(&NetEvent::ChatReceived {
             peer: alice.id.clone(),
-            text: "hello over noise".into(),
+            envelope: sent.clone(),
         }),
-        "chat did not arrive: {b_events:?}"
+        "chat did not arrive as it was sent: {b_events:?}"
+    );
+}
+
+/// A peer can put anything in a chat frame. One unreadable message is one
+/// unreadable message: it must not end the session, and it must not surface as
+/// an empty line on somebody's screen.
+#[test]
+fn a_chat_frame_that_is_not_an_envelope_is_dropped_and_the_session_survives() {
+    let air = air();
+    let now = Instant::now();
+    let alice = node(&air, "alice", "Alice", now);
+    let bob = node(&air, "bob", "Bob", now);
+    bob.net.discovery().set_enabled(true, now).unwrap();
+    alice.net.discovery().start_scanning().unwrap();
+    settle(&alice, &bob, now);
+    alice.net.reach(&bob.id).unwrap();
+    settle(&alice, &bob, now);
+
+    alice.net.send_chat(&bob.id, vec![0xff; 8], now).unwrap();
+    let (_, b_events) = settle(&alice, &bob, now);
+    assert!(
+        !b_events
+            .iter()
+            .any(|e| matches!(e, NetEvent::ChatReceived { .. })),
+        "garbage surfaced as a message: {b_events:?}"
+    );
+
+    // And the session is still there: a good message straight after arrives.
+    let good = ChatEnvelope::new(1, b"still here".to_vec()).unwrap();
+    alice.net.send_chat(&bob.id, good.encode(), now).unwrap();
+    let (_, b_events) = settle(&alice, &bob, now);
+    assert!(
+        b_events.contains(&NetEvent::ChatReceived {
+            peer: alice.id.clone(),
+            envelope: good,
+        }),
+        "one bad frame took the session with it: {b_events:?}"
     );
 }
 
