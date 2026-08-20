@@ -378,6 +378,34 @@ fn an_arriving_message_keeps_the_senders_identifiers() {
     );
 }
 
+/// `seq` is chosen by whoever is sending, and `decode` takes any `u64`. Cast
+/// into the store's `i64`, anything above `i64::MAX` lands *negative* — sorting
+/// before every real message — so one frame from a stranger could reorder a
+/// conversation permanently. It is refused instead, and refused quietly: an
+/// unusable message is not a reason to tear down a session.
+#[test]
+fn a_seq_too_large_for_the_store_is_refused_rather_than_wrapped() {
+    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _h = fresh();
+
+    let good = ChatEnvelope::new(1, b"first".to_vec()).unwrap();
+    receive_chat_for_test("peer", &good).unwrap().unwrap();
+
+    let huge = ChatEnvelope::new(u64::MAX, b"from the future".to_vec()).unwrap();
+    assert!(
+        receive_chat_for_test("peer", &huge).unwrap().is_none(),
+        "a seq that cannot be stored was announced anyway"
+    );
+
+    let thread = thread_for_device("peer".into()).unwrap().unwrap();
+    let rows = thread_rows_for_test(thread).unwrap();
+    assert_eq!(rows.len(), 1, "the unstorable message was written anyway");
+    assert!(
+        rows.iter().all(|(seq, _)| *seq > 0),
+        "a negative seq reached the store: {rows:?}"
+    );
+}
+
 /// The id the caller is handed has to be the id in the store, because that is
 /// what an acknowledgement or a state change will look the row up by. Two
 /// separately-drawn ids would agree on nothing and fail silently: the message

@@ -560,7 +560,22 @@ pub fn send_chat(device_id: String, text: String) -> Result<ChatMessageDto, Stri
         // things that happen to agree. `new_msg_id` used to make one here and
         // the receiver made another at the far end, which is why a resend could
         // never be recognised as one.
-        let envelope = ChatEnvelope::new(seq as u64, text.clone().into_bytes())
+        // Checked, not cast. `next_seq` returns the store's `i64`, and a
+        // negative one — a corrupt row, or a column somebody widened by hand —
+        // would wrap into an enormous `u64` and go out as a sequence number no
+        // peer could ever follow. Better to refuse to send than to send a
+        // message that permanently breaks the far side's ordering.
+        //
+        // No test covers this and none can through the public API: `next_seq`
+        // is `max(seq) + 1` over rows this code wrote, so reaching it means the
+        // database already disagrees with the code that filled it. Recorded so
+        // the surviving mutant reads as what it is — a guard against a state
+        // nothing here can produce — rather than as a hole to close by deleting
+        // the conversion. Its twin on the receiving side *is* reachable, since
+        // the peer picks that number, and is tested.
+        let seq_out = u64::try_from(seq)
+            .map_err(|_| StoreError::Db(format!("thread {thread} has a negative seq {seq}")))?;
+        let envelope = ChatEnvelope::new(seq_out, text.clone().into_bytes())
             .map_err(|e| StoreError::Db(e.to_string()))?;
         // Everything below reads the envelope. There is deliberately no second
         // copy of the id: the row, the value handed back to the caller and the
@@ -1011,11 +1026,20 @@ fn store_incoming_chat(
     with_core_mut(|core| {
         let now = now_millis();
         let thread = ensure_thread(core, device_id, now)?;
+        // The peer chooses this number and `decode` accepts any `u64`, so the
+        // conversion is checked and a message that will not fit is dropped.
+        // Cast instead, anything above `i64::MAX` lands as a *negative* seq —
+        // which sorts before every real message, and would let one frame from
+        // a stranger reorder a conversation permanently.
+        let Ok(seq) = i64::try_from(envelope.seq) else {
+            log::warn!("dropping a chat message whose seq will not fit the store");
+            return Ok(None);
+        };
         let outcome = core.store.add_message(&NewMessage {
             thread_id: thread,
             // As the sender numbered it. Per-sender numbering is what makes
             // this safe to store directly (tech spec §8).
-            seq: envelope.seq as i64,
+            seq,
             msg_id: envelope.msg_id.to_vec(),
             body: envelope.body.clone(),
             direction: Direction::Incoming,

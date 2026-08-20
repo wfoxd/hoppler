@@ -83,7 +83,6 @@ pub enum NetEvent {
     /// the two together made a tap look answered only when the other person
     /// happened to nudge back, and never otherwise.
     PingAcked { peer: PeerId },
-    /// A chat line arrived.
     /// A chat line arrived, as the sender numbered and identified it.
     ///
     /// The whole envelope rather than the text, because the two identifiers on
