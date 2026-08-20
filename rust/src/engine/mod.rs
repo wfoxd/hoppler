@@ -43,7 +43,7 @@ use crate::identity::keystore::Keystore;
 use crate::identity::{Identity, Persona, VerifiedPersona};
 use crate::identity::{COLOUR_MASK, MAX_PERSONA_NAME_LEN};
 use crate::pairing::invite::Invite;
-use crate::session::chat::{ChatEnvelope, Delivery, Inbox};
+use crate::session::chat::{ChatEnvelope, Delivery, Inbox, Outbox, MAX_UNACKED, MSG_ID_LEN};
 use crate::store::{
     Direction, InboxPosition, InsertOutcome, MessageState, NewContact, NewMessage, NewTransfer,
     Store, StoreError, TransferState,
@@ -560,6 +560,20 @@ pub fn send_chat(device_id: String, text: String) -> Result<ChatMessageDto, Stri
         // things that happen to agree. `new_msg_id` used to make one here and
         // the receiver made another at the far end, which is why a resend could
         // never be recognised as one.
+        // Bounded, and refused rather than dropped. Somebody typing to a
+        // person who is not there fills this up, and the honest answer is to
+        // say so: silently discarding the oldest would lose something they
+        // wrote and tell them nothing, and holding everything makes the queue a
+        // peer's absence can grow without limit.
+        let queued =
+            core.store
+                .count_in_state(thread, Direction::Outgoing, MessageState::Queued)?;
+        if queued >= MAX_UNACKED {
+            return Err(StoreError::Db(format!(
+                "{MAX_UNACKED} messages are already waiting to be delivered"
+            )));
+        }
+
         // Checked, not cast. `next_seq` returns the store's `i64`, and a
         // negative one — a corrupt row, or a column somebody widened by hand —
         // would wrap into an enormous `u64` and go out as a sequence number no
@@ -827,6 +841,140 @@ pub fn offer_drop(device_id: String, name: String, size: u64) -> Result<String, 
 // ── internals ─────────────────────────────────────────────────────────────────
 
 /// The radio plane, or a reason there is none.
+/// Resend a thread's queued messages, for the contract tests.
+///
+/// `pub` with a note, as [`open_store_for_test`]: reunion is a transport event
+/// no test can stage through the public API, and "the backlog goes out in
+/// order, and only once" is the whole of R0-F5's reunion promise.
+pub fn resend_queued_for_test(device_id: &str) -> Result<(), String> {
+    resend_queued(device_id)
+}
+
+/// What a reunion would send, as `(seq, hex msg_id)`, for the contract tests.
+///
+/// `pub` with a note, as [`open_store_for_test`]. The sending needs a transport
+/// and a peer; the *decision* — which messages, in what order, under which
+/// identifiers — is the part with the rules in it. Every one of those rules
+/// survived a mutant until this existed, because a test that watches only the
+/// store passes whether anything was sent or not.
+pub fn queued_for_resend_for_test(device_id: &str) -> Result<Vec<(u64, String)>, String> {
+    let owed = with_core(|core| queued_for_resend(core, device_id))?;
+    Ok(owed
+        .into_iter()
+        .map(|(_, e)| (e.seq, hex::encode(e.msg_id)))
+        .collect())
+}
+
+/// Mark every queued message on a thread as sent, for the contract tests.
+///
+/// `pub` with a note, as [`open_store_for_test`]: reaching `Sent` needs a
+/// transport, and "a reunion does not resend what already went" is a rule about
+/// that state.
+pub fn mark_sent_for_test(thread_id: i64) -> Result<(), String> {
+    with_core(|core| {
+        for m in
+            core.store
+                .messages_in_state(thread_id, Direction::Outgoing, MessageState::Queued)?
+        {
+            core.store
+                .set_message_state(&m.msg_id, MessageState::Sent)?;
+        }
+        Ok(())
+    })
+}
+
+/// Send everything this thread still owes, oldest first.
+///
+/// # What counts as owed
+///
+/// `Queued` — written, never away. `Sent` is deliberately excluded: without an
+/// acknowledgement protocol we cannot tell a delivered message from a lost one,
+/// and resending every message ever sent on every reunion would be worse than
+/// the gap it covers. Narrowing that to "sent but unacknowledged" is what an
+/// ack lands with.
+///
+/// # Why the outbox rather than the rows directly
+///
+/// The store can already answer "what is queued", and for a while this did
+/// exactly that. What it cannot answer on its own is the two rules that make a
+/// resend safe: send them in `seq` order, and never hold more than
+/// [`MAX_UNACKED`]. Both live in [`Outbox`], resumed here from the rows —
+/// which is the arrangement its own doc describes, the store holding the
+/// messages and the outbox holding the decision.
+///
+/// Order is the one that bites. Out of order, every message sits in the far
+/// side's `ahead` set until the lowest happens to arrive, so a reunion's whole
+/// backlog stays invisible until its first message lands.
+fn queued_for_resend(
+    core: &Core,
+    device_id: &str,
+) -> Result<Vec<(Vec<u8>, ChatEnvelope)>, StoreError> {
+    let Some(contact) = contact_id_for_device(core, device_id)? else {
+        return Ok(Vec::new());
+    };
+    let Some(thread) = core.store.thread_for_contact(contact)? else {
+        return Ok(Vec::new());
+    };
+    // Scoped in SQL. Direction is part of it even though `Queued` is only ever
+    // written by the send path, so state already implies it — "the outgoing
+    // messages this thread still owes" is what the function means, and saying
+    // so costs nothing here.
+    let queued = core
+        .store
+        .messages_in_state(thread, Direction::Outgoing, MessageState::Queued)?;
+    if queued.is_empty() {
+        return Ok(Vec::new());
+    }
+    let next = core.store.next_seq(thread, Direction::Outgoing)?;
+    let outbox = Outbox::resumed(
+        u64::try_from(next).unwrap_or(1),
+        queued.iter().filter_map(|m| u64::try_from(m.seq).ok()),
+    );
+    // Rebuilt from the row, not from anything held in memory: the `seq` and
+    // `msg_id` the far side already saw are in the row, and a resend that
+    // invented either would arrive as a new message rather than a repeat.
+    Ok(outbox
+        .unacked()
+        .into_iter()
+        .filter_map(|seq| {
+            let m = queued
+                .iter()
+                .find(|m| u64::try_from(m.seq).ok() == Some(seq))?;
+            let msg_id: [u8; MSG_ID_LEN] = m.msg_id.clone().try_into().ok()?;
+            Some((
+                m.msg_id.clone(),
+                ChatEnvelope {
+                    seq,
+                    msg_id,
+                    body: m.body.clone(),
+                },
+            ))
+        })
+        .collect())
+}
+
+fn resend_queued(device_id: &str) -> Result<(), String> {
+    let pending = with_core(|core| queued_for_resend(core, device_id))?;
+
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let net = require_net()?;
+    log::info!("resending {} queued messages on reunion", pending.len());
+    for (msg_id, envelope) in pending {
+        // One at a time, and the state moves per message: a send that fails
+        // half way leaves the ones that got away marked `Sent` and the rest
+        // still `Queued`, so the next reunion picks up exactly where this
+        // stopped rather than starting again.
+        net.send_chat(device_id, envelope.encode(), std::time::Instant::now())?;
+        with_core(|core| {
+            core.store.set_message_state(&msg_id, MessageState::Sent)?;
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
 fn require_net() -> Result<Arc<net::Net>, String> {
     with_core(|core| Ok(core.net.clone()))?
         .ok_or_else(|| "no radio available on this device".to_string())
@@ -853,6 +1001,19 @@ fn on_net_event(net: &Arc<net::Net>, event: net::NetEvent) {
             }
             if let Ok(devices) = nearby_devices() {
                 emit(CoreEvent::DiscoveryUpdated { devices });
+            }
+            // R0-F5: "queued messages deliver on reunion with no user action".
+            // This is the reunion. Reported rather than propagated — a resend
+            // that fails is a resend to try again on the next one, and taking
+            // the session down over it would make the next one further away.
+            //
+            // The call itself is the one part of this with no test on it: a
+            // `SessionOpened` is a transport event, and nothing reaches this
+            // arm from the public API. What it calls is covered — see
+            // `queued_for_resend_for_test` — so the untested step is the wiring
+            // rather than the rules.
+            if let Err(why) = resend_queued(&peer) {
+                log::warn!("could not resend to {peer}: {why}");
             }
         }
         net::NetEvent::SessionClosed { .. } => {

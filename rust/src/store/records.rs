@@ -655,6 +655,49 @@ impl Store {
         rows.map(|r| r?).collect()
     }
 
+    /// How many of a thread's messages are in one state, without loading them.
+    ///
+    /// `messages_by_state` returns whole rows — bodies included, up to 8 KB
+    /// each and across every thread — which is a lot of copying to answer "how
+    /// many". The send path asks this on every message, so it counts in SQL.
+    pub fn count_in_state(
+        &self,
+        thread_id: i64,
+        direction: Direction,
+        state: MessageState,
+    ) -> Result<usize, StoreError> {
+        let n: i64 = self.conn.query_row(
+            "SELECT count(*) FROM messages
+             WHERE thread_id = ?1 AND direction = ?2 AND state = ?3",
+            params![thread_id, direction.to_i64(), state.to_i64()],
+            |r| r.get(0),
+        )?;
+        Ok(usize::try_from(n).unwrap_or(usize::MAX))
+    }
+
+    /// A thread's messages in one state and direction, oldest first.
+    ///
+    /// Scoped in SQL rather than filtered afterwards: the resend path wants one
+    /// thread's backlog, and fetching every thread's to throw most of it away
+    /// is work that grows with the whole store.
+    pub fn messages_in_state(
+        &self,
+        thread_id: i64,
+        direction: Direction,
+        state: MessageState,
+    ) -> Result<Vec<Message>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, thread_id, seq, msg_id, body, direction, state, created_at
+             FROM messages WHERE thread_id = ?1 AND direction = ?2 AND state = ?3
+             ORDER BY created_at, id",
+        )?;
+        let rows = stmt.query_map(
+            params![thread_id, direction.to_i64(), state.to_i64()],
+            map_message,
+        )?;
+        rows.map(|r| r?).collect()
+    }
+
     /// The next `seq` to assign for one sender's stream in a thread (max seq in
     /// that direction + 1). Per-sender because incoming and outgoing number
     /// independently (tech spec §8).
