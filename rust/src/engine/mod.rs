@@ -43,10 +43,10 @@ use crate::identity::keystore::Keystore;
 use crate::identity::{Identity, Persona, VerifiedPersona};
 use crate::identity::{COLOUR_MASK, MAX_PERSONA_NAME_LEN};
 use crate::pairing::invite::Invite;
-use crate::session::chat::ChatEnvelope;
+use crate::session::chat::{ChatEnvelope, Delivery, Inbox};
 use crate::store::{
-    Direction, InsertOutcome, MessageState, NewContact, NewMessage, NewTransfer, Store, StoreError,
-    TransferState,
+    Direction, InboxPosition, InsertOutcome, MessageState, NewContact, NewMessage, NewTransfer,
+    Store, StoreError, TransferState,
 };
 
 struct Core {
@@ -1035,24 +1035,57 @@ fn store_incoming_chat(
             log::warn!("dropping a chat message whose seq will not fit the store");
             return Ok(None);
         };
-        let outcome = core.store.add_message(&NewMessage {
-            thread_id: thread,
-            // As the sender numbered it. Per-sender numbering is what makes
-            // this safe to store directly (tech spec §8).
-            seq,
-            msg_id: envelope.msg_id.to_vec(),
-            body: envelope.body.clone(),
-            direction: Direction::Incoming,
-            state: MessageState::Delivered,
-            created_at: now,
-        })?;
-        // Announced only if it was new. The outcome used to be discarded, which
-        // was harmless while every arrival carried a freshly-invented id and is
-        // not now: with the sender's id on it, `Duplicate` is exactly the
-        // resend this change exists to recognise, and emitting anyway would put
-        // it on screen while refusing to store it.
+        // Where the thread had got to, restored from the store. A fresh
+        // `Inbox` on every launch would forget everything already delivered,
+        // so the first message after a restart would look new however many
+        // times it had arrived before.
+        let position = core.store.inbox_position(thread)?.unwrap_or_default();
+        let mut inbox = Inbox::resumed(position.through, position.ahead);
+
+        match inbox.receive(envelope.seq) {
+            Delivery::Accepted => {}
+            Delivery::Duplicate => {
+                log::debug!("dropping a chat message we already have");
+                return Ok(None);
+            }
+            Delivery::TooFarAhead => {
+                // Refused rather than accepted with an enormous gap behind it.
+                // Tracking that gap is memory a peer could ask for by picking a
+                // number, and closing over it silently is the loss R0-F5 exists
+                // to prevent — so the honest answer is to take neither.
+                log::warn!("refusing a chat message too far ahead of the conversation");
+                return Ok(None);
+            }
+        }
+
+        let outcome = core.store.commit_received(
+            // No ratchet on this path yet: an unpaired thread has none, and a
+            // paired one will land with the ratchet that decrypted it.
+            None,
+            &InboxPosition {
+                through: inbox.through(),
+                ahead: inbox.ahead(),
+            },
+            &NewMessage {
+                thread_id: thread,
+                // As the sender numbered it. Per-sender numbering is what makes
+                // this safe to store directly (tech spec §8).
+                seq,
+                msg_id: envelope.msg_id.to_vec(),
+                body: envelope.body.clone(),
+                direction: Direction::Incoming,
+                state: MessageState::Delivered,
+                created_at: now,
+            },
+            now,
+        )?;
+        // Both checks, and not the same check twice. The inbox refuses a `seq`
+        // it has already seen; the store refuses a `msg_id` it already holds. A
+        // sender that reused a number for different content would pass the
+        // first, and one that resent after we lost our position would pass the
+        // second — neither covers the other's case.
         if outcome == InsertOutcome::Duplicate {
-            log::debug!("dropping a chat message we already have");
+            log::debug!("dropping a chat message the store already had");
             return Ok(None);
         }
         Ok(Some(CoreEvent::MessageReceived {

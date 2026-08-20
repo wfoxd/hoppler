@@ -32,7 +32,7 @@ use rust_lib_hoppler::engine::{
 };
 use rust_lib_hoppler::identity::Identity;
 use rust_lib_hoppler::pairing::invite::Invite;
-use rust_lib_hoppler::session::chat::ChatEnvelope;
+use rust_lib_hoppler::session::chat::{ChatEnvelope, MAX_AHEAD};
 use rust_lib_hoppler::transport::loopback::LoopbackNet;
 use rust_lib_hoppler::transport::{Transport, TransportError, TransportEvent};
 
@@ -376,6 +376,92 @@ fn an_arriving_message_keeps_the_senders_identifiers() {
         vec![(7, hex::encode(envelope.msg_id))],
         "the row was renumbered or re-identified on the way in"
     );
+}
+
+/// The gap R0-F5 says must not be closed over silently. A peer that jumps
+/// further ahead than the inbox will track is refused rather than accepted
+/// with an unbounded hole behind it — the hole is memory a peer could ask for
+/// by picking a number, and quietly forgetting it is the loss the requirement
+/// exists to prevent.
+#[test]
+fn a_message_too_far_ahead_is_refused_rather_than_leaving_a_hole() {
+    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _h = fresh();
+
+    let first = ChatEnvelope::new(1, b"here".to_vec()).unwrap();
+    receive_chat_for_test("peer", &first).unwrap().unwrap();
+
+    let far = ChatEnvelope::new(1 + MAX_AHEAD + 1, b"much later".to_vec()).unwrap();
+    assert!(
+        receive_chat_for_test("peer", &far).unwrap().is_none(),
+        "a message beyond the window was accepted"
+    );
+
+    // Just inside is fine, so what is refused is the bound and not the shape.
+    let edge = ChatEnvelope::new(1 + MAX_AHEAD, b"at the edge".to_vec()).unwrap();
+    assert!(receive_chat_for_test("peer", &edge).unwrap().is_some());
+
+    let thread = thread_for_device("peer".into()).unwrap().unwrap();
+    let rows = thread_rows_for_test(thread).unwrap();
+    assert_eq!(rows.len(), 2, "the refused message was stored: {rows:?}");
+}
+
+/// Out-of-order arrival is held, and the run closes when the missing one turns
+/// up — which is what a reunion looks like when a queued backlog lands.
+#[test]
+fn a_gap_closes_when_the_missing_message_arrives() {
+    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _h = fresh();
+
+    for seq in [3u64, 1, 2] {
+        let e = ChatEnvelope::new(seq, format!("number {seq}").into_bytes()).unwrap();
+        assert!(
+            receive_chat_for_test("peer", &e).unwrap().is_some(),
+            "message {seq} was refused"
+        );
+    }
+
+    let thread = thread_for_device("peer".into()).unwrap().unwrap();
+    let rows = thread_rows_for_test(thread).unwrap();
+    assert_eq!(rows.len(), 3);
+
+    // And now that the run is contiguous, every one of them is a duplicate.
+    for seq in 1..=3u64 {
+        let e = ChatEnvelope::new(seq, format!("number {seq}").into_bytes()).unwrap();
+        assert!(
+            receive_chat_for_test("peer", &e).unwrap().is_none(),
+            "message {seq} was accepted twice"
+        );
+    }
+}
+
+/// The inbox dedups on `seq`, the store on `msg_id`, and the code claims
+/// neither covers the other's case. This is that claim as a test: a *new*
+/// `seq` carrying an id we already hold gets past the inbox and has to be
+/// stopped by the store. Without the second check it would be announced as a
+/// new message and then quietly not stored — on screen, and gone on the next
+/// launch.
+#[test]
+fn an_id_we_already_hold_is_refused_even_under_a_new_seq() {
+    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _h = fresh();
+
+    let first = ChatEnvelope::new(1, b"once".to_vec()).unwrap();
+    receive_chat_for_test("peer", &first).unwrap().unwrap();
+
+    // Same id, next number: past the inbox, into the store's UNIQUE.
+    let recycled = ChatEnvelope {
+        seq: 2,
+        msg_id: first.msg_id,
+        body: b"again".to_vec(),
+    };
+    assert!(
+        receive_chat_for_test("peer", &recycled).unwrap().is_none(),
+        "a message id we already hold was announced under a new seq"
+    );
+
+    let thread = thread_for_device("peer".into()).unwrap().unwrap();
+    assert_eq!(thread_rows_for_test(thread).unwrap().len(), 1);
 }
 
 /// `seq` is chosen by whoever is sending, and `decode` takes any `u64`. Cast

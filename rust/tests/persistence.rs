@@ -86,7 +86,7 @@ fn a_conversation_survives_a_restart() {
         let thread = store.pair_contact(contact, &[8u8; 32], 2000).unwrap();
         store
             .commit_received(
-                b"ratchet state",
+                Some(b"ratchet state"),
                 &Default::default(),
                 &NewMessage {
                     thread_id: thread,
