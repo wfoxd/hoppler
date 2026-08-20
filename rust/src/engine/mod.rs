@@ -565,12 +565,9 @@ pub fn send_chat(device_id: String, text: String) -> Result<ChatMessageDto, Stri
         // say so: silently discarding the oldest would lose something they
         // wrote and tell them nothing, and holding everything makes the queue a
         // peer's absence can grow without limit.
-        let queued = core
-            .store
-            .messages_by_state(MessageState::Queued)?
-            .into_iter()
-            .filter(|m| m.thread_id == thread && m.direction == Direction::Outgoing)
-            .count();
+        let queued =
+            core.store
+                .count_in_state(thread, Direction::Outgoing, MessageState::Queued)?;
         if queued >= MAX_UNACKED {
             return Err(StoreError::Db(format!(
                 "{MAX_UNACKED} messages are already waiting to be delivered"
@@ -875,11 +872,12 @@ pub fn queued_for_resend_for_test(device_id: &str) -> Result<Vec<(u64, String)>,
 /// that state.
 pub fn mark_sent_for_test(thread_id: i64) -> Result<(), String> {
     with_core(|core| {
-        for m in core.store.messages_by_state(MessageState::Queued)? {
-            if m.thread_id == thread_id {
-                core.store
-                    .set_message_state(&m.msg_id, MessageState::Sent)?;
-            }
+        for m in
+            core.store
+                .messages_in_state(thread_id, Direction::Outgoing, MessageState::Queued)?
+        {
+            core.store
+                .set_message_state(&m.msg_id, MessageState::Sent)?;
         }
         Ok(())
     })
@@ -917,18 +915,13 @@ fn queued_for_resend(
     let Some(thread) = core.store.thread_for_contact(contact)? else {
         return Ok(Vec::new());
     };
-    let queued: Vec<_> = core
+    // Scoped in SQL. Direction is part of it even though `Queued` is only ever
+    // written by the send path, so state already implies it — "the outgoing
+    // messages this thread still owes" is what the function means, and saying
+    // so costs nothing here.
+    let queued = core
         .store
-        .messages_by_state(MessageState::Queued)?
-        .into_iter()
-        // Direction as well as state, and the mutant that drops it survives:
-        // `Queued` is only ever written by the send path, so state already
-        // implies direction and nothing incoming can reach here. Kept because
-        // "the outgoing messages this thread still owes" is what the function
-        // means, and a filter that says so is worth more than one byte of work
-        // saved — but recorded, so the survivor is not mistaken for a gap.
-        .filter(|m| m.thread_id == thread && m.direction == Direction::Outgoing)
-        .collect();
+        .messages_in_state(thread, Direction::Outgoing, MessageState::Queued)?;
     if queued.is_empty() {
         return Ok(Vec::new());
     }
