@@ -960,10 +960,14 @@ impl Store {
         }
         let through = u64::try_from(through)
             .map_err(|_| StoreError::Db(format!("inbox position {through} is negative")))?;
-        let ahead = packed
-            .chunks_exact(8)
-            .map(|c| u64::from_be_bytes(c.try_into().expect("8 bytes")))
-            .collect();
+        // `as_chunks` rather than `chunks_exact`, which is what clippy started
+        // asking for in a newer stable than this was written against. It is the
+        // better shape anyway: the chunk arrives as `[u8; 8]` already, so the
+        // `try_into().expect("8 bytes")` that used to sit here — a panic that
+        // could never fire, on a length the iterator had just guaranteed — is
+        // gone rather than merely unreachable.
+        let (chunks, _remainder) = packed.as_chunks::<8>();
+        let ahead = chunks.iter().copied().map(u64::from_be_bytes).collect();
         Ok(Some(InboxPosition { through, ahead }))
     }
 

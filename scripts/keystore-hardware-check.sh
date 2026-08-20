@@ -62,7 +62,13 @@ a() { "$ADB" -s "$SERIAL" "$@"; }
 
 # `run-as` puts us inside the app's uid; without it the directory is unreadable
 # and that is the point of it.
-appfiles() { a shell run-as "$PKG" "$@"; }
+#
+# One argument, quoted whole. `adb shell` joins its arguments with spaces and
+# hands the result to the device's shell, so a `sh -c "..."` written as separate
+# arguments arrives with its quoting gone: the first version of this globbed `*`
+# in the device's `/` and reported `system_ext tmp vendor` as the contents of the
+# keystore. Everything remote therefore goes through one already-quoted string.
+appfiles() { a shell "run-as $PKG sh -c '$1'"; }
 
 if ! a shell true >/dev/null 2>&1; then
   echo "device $SERIAL is not reachable — unlock it and re-check \`adb devices\`" >&2
@@ -78,11 +84,7 @@ snapshot() {
   # sha256 of each secret, plus whether it carries the wrapped marker. Hashes
   # rather than contents: this file is written to the host, and a bare seed is
   # the store master.
-  appfiles sh -c "cd $KEYS_DIR 2>/dev/null || exit 0; for f in *; do
-      [ -e \"\$f\" ] || continue
-      printf '%s %s %s\n' \"\$f\" \"\$(sha256sum \"\$f\" | cut -d' ' -f1)\" \\
-        \"\$(head -c 5 \"\$f\" | od -An -c | tr -d ' \n')\"
-    done"
+  appfiles "cd $KEYS_DIR 2>/dev/null || exit 0; for f in *; do [ -e \"\$f\" ] || continue; printf \"%s %s %s\n\" \"\$f\" \"\$(sha256sum \"\$f\" | cut -d\" \" -f1)\" \"\$(head -c 5 \"\$f\" | od -An -c | tr -d \" \n\")\"; done"
 }
 
 mkdir -p "$STATE_DIR"
@@ -94,7 +96,20 @@ if [ "$PHASE" != "--after" ]; then
   # a plain grep for the id would also match `org.hoppler.hoppler.debug` or any
   # other suffixed build — reporting "installed" about a different app, whose
   # storage this script then cannot read.
-  if ! a shell pm list packages | tr -d '\r' | grep -qx "package:$PKG"; then
+  #
+  # Captured first, and `grep` without `-q`, because of `pipefail` above.
+  # `grep -q` stops reading the moment it matches; the process upstream then
+  # dies of SIGPIPE, and `pipefail` turns that into a failed pipeline — so a
+  # package that *is* installed reports as absent. It reported exactly that on
+  # a Pixel with Hoppler installed. Racy as well as wrong: whether the upstream
+  # process has already finished writing decides it.
+  # `-F` as well as `-x`: the id is full of dots and grep would read each one
+  # as "any character", so `package:orgXhopplerXhoppler` would count. Which is
+  # the substring bug this line was written to fix, arriving by a different
+  # door — an exact match against a pattern is not an exact match against a
+  # string.
+  packages=$(a shell pm list packages | tr -d '\r')
+  if ! printf '%s\n' "$packages" | grep -Fx "package:$PKG" >/dev/null; then
     echo "not installed. Nothing to migrate, so this phone can only test the"
     echo "fresh-install half. Install and re-run with --after."
     : > "$BEFORE"
@@ -118,8 +133,7 @@ if [ "$PHASE" != "--after" ]; then
   fi
   # The inode is the witness for "the database survived". Captured before, so
   # a change afterwards is visible.
-  appfiles sh -c "ls -i $APP_DIR/hoppler.db 2>/dev/null" \
-    | tee -a "$BEFORE"
+  appfiles "ls -i $APP_DIR/hoppler.db 2>/dev/null" | tee -a "$BEFORE"
   echo
   echo "── next ─────────────────────────────────────────────────────────────"
   echo "  flutter install -d $SERIAL      # or: adb -s $SERIAL install -r <apk>"
@@ -189,7 +203,7 @@ done < "$BEFORE"
 
 # 3. The identity survived: same database, still there.
 before_inode=$(grep "hoppler.db" "$BEFORE" | awk '{print $1}')
-after_inode=$(appfiles sh -c "ls -i $APP_DIR/hoppler.db 2>/dev/null" | awk '{print $1}')
+after_inode=$(appfiles "ls -i $APP_DIR/hoppler.db 2>/dev/null" | awk '{print $1}')
 if [ -z "$after_inode" ]; then
   bad "hoppler.db is gone — the master was not recovered"
 elif [ -n "$before_inode" ] && [ "$before_inode" != "$after_inode" ]; then
@@ -200,7 +214,10 @@ elif [ -n "$before_inode" ]; then
 fi
 
 # 4. Anything the core refused.
-if a logcat -d | grep -qi "hardware keystore was never registered"; then
+# Same shape as the package check above, and the same reason for the same fix:
+# with `pipefail`, `grep -q` matching would kill `logcat` with SIGPIPE and the
+# pipeline would report failure — hiding the very error this is looking for.
+if a logcat -d | grep -Fi "hardware keystore was never registered" >/dev/null; then
   bad "the JNI bridge did not register — the core refused to open a store"
 fi
 
