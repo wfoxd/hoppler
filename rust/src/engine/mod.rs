@@ -455,7 +455,7 @@ pub fn nearby_devices() -> Result<Vec<NearbyDevice>, String> {
     if !net.discovery().is_on() {
         return Ok(Vec::new());
     }
-    Ok(net
+    let mut devices: Vec<NearbyDevice> = net
         .discovery()
         .sightings()
         .into_iter()
@@ -473,9 +473,53 @@ pub fn nearby_devices() -> Result<Vec<NearbyDevice>, String> {
                 name,
                 colour,
                 paired,
+                present: true,
             }
         })
-        .collect())
+        .collect();
+
+    // Everyone paired, whether the radio can see them or not.
+    //
+    // R0-F2 says Discovery off leaves "connections with paired people
+    // unaffected", and until now turning it off removed the peer from the other
+    // phone entirely — measured on two handsets: the Samsung went dark and Wren
+    // vanished from the Pixel seconds after they had paired.
+    //
+    // The consequence was worse than the absence. A tile is the only way into a
+    // conversation, so a peer who was not visible could not be written to at
+    // all — which makes R0-F5's "messages composed out of range are queued
+    // locally and delivered at the next direct encounter" unreachable, since
+    // nothing can compose them.
+    for (device_id, name, colour) in paired_contacts()? {
+        if devices.iter().any(|d| d.device_id == device_id) {
+            continue;
+        }
+        devices.push(NearbyDevice {
+            device_id,
+            name,
+            colour,
+            paired: true,
+            present: false,
+        });
+    }
+    Ok(devices)
+}
+
+/// Every paired contact, as the nearby list wants them.
+///
+/// Keyed by the same device id a sighting uses, so a contact who *is* visible
+/// is recognised as the one already in the list rather than added twice.
+fn paired_contacts() -> Result<Vec<(String, String, u32)>, String> {
+    with_core(|core| {
+        let mut out = Vec::new();
+        for c in core.store.list_contacts()? {
+            if core.store.pairing_for_contact(c.id)?.is_none() {
+                continue;
+            }
+            out.push((hex::encode(c.pseudonym), c.name, c.colour));
+        }
+        Ok(out)
+    })
 }
 
 // ── sessions / threads ────────────────────────────────────────────────────────

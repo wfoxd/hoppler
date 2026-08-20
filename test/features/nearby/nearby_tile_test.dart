@@ -16,8 +16,18 @@ class _StubPingService implements PingService {
   Future<void> ping(String deviceId) async {}
 }
 
-NearbyDevice _device({required String name, int colour = 0x0088ff}) =>
-    NearbyDevice(deviceId: 'dev-1', name: name, colour: colour, paired: false);
+NearbyDevice _device({
+  required String name,
+  int colour = 0x0088ff,
+  bool paired = false,
+  bool present = true,
+}) => NearbyDevice(
+  deviceId: 'dev-1',
+  name: name,
+  colour: colour,
+  paired: paired,
+  present: present,
+);
 
 void main() {
   Future<List<String>> pump(WidgetTester tester, NearbyDevice device) async {
@@ -63,6 +73,40 @@ void main() {
   // Colour arrives with the persona, so an unknown device has none. Left alone
   // that renders as flat black, which looks like a broken avatar rather than a
   // missing one.
+  /// R0-F2 leaves "connections with paired people unaffected" by Discovery, so
+  /// a paired person stays listed when the radio cannot see them. The tile then
+  /// has to say which, or it claims somebody is in the room who is not.
+  ///
+  /// Measured on two phones: the Samsung went dark and Wren vanished from the
+  /// Pixel seconds after they paired, leaving no way to write to her at all.
+  testWidgets('a paired device that is away says so', (tester) async {
+    await pump(
+      tester,
+      _device(name: 'Wren', paired: true, present: false),
+    );
+    expect(find.textContaining('away'), findsOneWidget);
+    expect(
+      find.text('paired'),
+      findsNothing,
+      reason: 'an absent peer read exactly like one standing next to you',
+    );
+  });
+
+  /// And presence is not paired-ness. Both are shown, and confusing them makes
+  /// the tile lie in one direction or the other.
+  testWidgets('a paired device that is here does not say away', (tester) async {
+    await pump(tester, _device(name: 'Wren', paired: true, present: true));
+    expect(find.text('paired'), findsOneWidget);
+    expect(find.textContaining('away'), findsNothing);
+  });
+
+  testWidgets('an unpaired device that is here still says nearby', (
+    tester,
+  ) async {
+    await pump(tester, _device(name: 'Wren'));
+    expect(find.text('nearby'), findsOneWidget);
+  });
+
   testWidgets('an unknown device is not drawn as flat black', (tester) async {
     await pump(tester, _device(name: '', colour: 0));
 

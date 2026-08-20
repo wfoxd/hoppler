@@ -28,6 +28,18 @@ pub struct NearbyDevice {
     pub name: String,
     pub colour: u32,
     pub paired: bool,
+    /// Whether the radio can see them right now.
+    ///
+    /// A paired person stays in the list when they stop being visible — R0-F2
+    /// says Discovery off leaves "connections with paired people unaffected",
+    /// and a tile is the only way to reach a conversation. Without this the
+    /// only way to write to somebody was to be in the same room as them, which
+    /// is the opposite of what queued messages are for.
+    ///
+    /// Distinct from [`NearbyDevice::paired`] because they answer different
+    /// questions — "may I write to them" and "will it arrive now" — and the UI
+    /// needs both to say anything true.
+    pub present: bool,
 }
 
 /// One colour of a pairing SAS: what to paint, and what to call it.

@@ -49,8 +49,22 @@ class NearbyTile extends StatelessWidget {
             : Colors.grey.shade400,
       ),
       title: Text(isKnown ? device.name : 'Unknown device'),
+      // Three things to say, not two. A paired person stays listed when the
+      // radio cannot see them — that is what makes writing to them possible at
+      // all — so the tile has to distinguish "here" from "listed but away", or
+      // it claims someone is in the room who is not.
+      //
+      // Away is said plainly rather than dressed up: a message written now will
+      // wait, and somebody deciding whether to type is better served by the
+      // truth than by a tile that looks the same either way.
       subtitle: Text(
-        isKnown ? (device.paired ? 'paired' : 'nearby') : 'Ping to connect',
+        !isKnown
+            ? 'Ping to connect'
+            : !device.present
+            ? 'paired — away, messages will wait'
+            : device.paired
+            ? 'paired'
+            : 'nearby',
       ),
       trailing: Row(
         mainAxisSize: MainAxisSize.min,

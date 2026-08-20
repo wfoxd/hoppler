@@ -1201,11 +1201,13 @@ impl SseDecode for crate::api::types::NearbyDevice {
         let mut var_name = <String>::sse_decode(deserializer);
         let mut var_colour = <u32>::sse_decode(deserializer);
         let mut var_paired = <bool>::sse_decode(deserializer);
+        let mut var_present = <bool>::sse_decode(deserializer);
         return crate::api::types::NearbyDevice {
             device_id: var_deviceId,
             name: var_name,
             colour: var_colour,
             paired: var_paired,
+            present: var_present,
         };
     }
 }
@@ -1624,6 +1626,7 @@ impl flutter_rust_bridge::IntoDart for crate::api::types::NearbyDevice {
             self.name.into_into_dart().into_dart(),
             self.colour.into_into_dart().into_dart(),
             self.paired.into_into_dart().into_dart(),
+            self.present.into_into_dart().into_dart(),
         ]
         .into_dart()
     }
@@ -2058,6 +2061,7 @@ impl SseEncode for crate::api::types::NearbyDevice {
         <String>::sse_encode(self.name, serializer);
         <u32>::sse_encode(self.colour, serializer);
         <bool>::sse_encode(self.paired, serializer);
+        <bool>::sse_encode(self.present, serializer);
     }
 }
 

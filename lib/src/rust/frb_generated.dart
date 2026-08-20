@@ -1080,13 +1080,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   NearbyDevice dco_decode_nearby_device(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 4)
-      throw Exception('unexpected arr length: expect 4 but see ${arr.length}');
+    if (arr.length != 5)
+      throw Exception('unexpected arr length: expect 5 but see ${arr.length}');
     return NearbyDevice(
       deviceId: dco_decode_String(arr[0]),
       name: dco_decode_String(arr[1]),
       colour: dco_decode_u_32(arr[2]),
       paired: dco_decode_bool(arr[3]),
+      present: dco_decode_bool(arr[4]),
     );
   }
 
@@ -1509,11 +1510,13 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_name = sse_decode_String(deserializer);
     var var_colour = sse_decode_u_32(deserializer);
     var var_paired = sse_decode_bool(deserializer);
+    var var_present = sse_decode_bool(deserializer);
     return NearbyDevice(
       deviceId: var_deviceId,
       name: var_name,
       colour: var_colour,
       paired: var_paired,
+      present: var_present,
     );
   }
 
@@ -1941,6 +1944,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_String(self.name, serializer);
     sse_encode_u_32(self.colour, serializer);
     sse_encode_bool(self.paired, serializer);
+    sse_encode_bool(self.present, serializer);
   }
 
   @protected

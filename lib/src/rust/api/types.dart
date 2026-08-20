@@ -187,16 +187,34 @@ class NearbyDevice {
   final int colour;
   final bool paired;
 
+  /// Whether the radio can see them right now.
+  ///
+  /// A paired person stays in the list when they stop being visible — R0-F2
+  /// says Discovery off leaves "connections with paired people unaffected",
+  /// and a tile is the only way to reach a conversation. Without this the
+  /// only way to write to somebody was to be in the same room as them, which
+  /// is the opposite of what queued messages are for.
+  ///
+  /// Distinct from [`NearbyDevice::paired`] because they answer different
+  /// questions — "may I write to them" and "will it arrive now" — and the UI
+  /// needs both to say anything true.
+  final bool present;
+
   const NearbyDevice({
     required this.deviceId,
     required this.name,
     required this.colour,
     required this.paired,
+    required this.present,
   });
 
   @override
   int get hashCode =>
-      deviceId.hashCode ^ name.hashCode ^ colour.hashCode ^ paired.hashCode;
+      deviceId.hashCode ^
+      name.hashCode ^
+      colour.hashCode ^
+      paired.hashCode ^
+      present.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -206,7 +224,8 @@ class NearbyDevice {
           deviceId == other.deviceId &&
           name == other.name &&
           colour == other.colour &&
-          paired == other.paired;
+          paired == other.paired &&
+          present == other.present;
 }
 
 /// One of the colours a person may pick for themselves (R0-F1).

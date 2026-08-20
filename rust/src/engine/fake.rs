@@ -47,6 +47,9 @@ pub fn nearby() -> Vec<NearbyDevice> {
             name: p.name.to_owned(),
             colour: p.colour,
             paired: p.paired,
+            // The fake network's peers are the ones it is pretending are in
+            // the room, so they are all present by construction.
+            present: true,
         })
         .collect()
 }
