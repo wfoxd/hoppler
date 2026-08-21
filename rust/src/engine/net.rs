@@ -653,7 +653,8 @@ impl Net {
                     // and a stranger's failed attempt is not their news.
                     if code_already_answered {
                         log::info!(
-                            "ignoring a ceremony message from {peer}: already answering someone"
+                            "ignoring a ceremony message from {peer}: \
+                             the code on screen is already being answered"
                         );
                         return Vec::new();
                     }
