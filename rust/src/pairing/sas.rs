@@ -24,7 +24,7 @@
 //! # How much it is worth: 20 bits
 //!
 //! Three colours from a palette of [`PALETTE_LEN`] and one word from a list of
-//! [`words::WORDS`] give 4 + 4 + 4 + 8 = [`SAS_BITS`] bits. An attacker
+//! The `words::WORDS` list gives 4 + 4 + 4 + 8 = [`SAS_BITS`] bits. An attacker
 //! relaying a ceremony has to produce two transcripts whose renderings collide,
 //! gets one attempt in front of two people who are looking at their screens,
 //! and succeeds with probability 1 in 1,048,576.

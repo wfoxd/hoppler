@@ -20,8 +20,8 @@ export 'package:protobuf/protobuf.dart' show GeneratedMessageGenericExtensions;
 /// One chat message, as it travels inside an established session (T12, R0-F5).
 ///
 /// This rides sealed: the Double Ratchet encrypts these bytes and the frame
-/// carries [ratchet header][ciphertext]. Nothing here is visible to anyone
-/// watching the wire, which is why the fields can be as plain as they are.
+/// carries a ratchet header followed by ciphertext. Nothing here is visible to
+/// anyone watching the wire, which is why the fields can be as plain as they are.
 ///
 /// # Why there is no thread_id
 ///
