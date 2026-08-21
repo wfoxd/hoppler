@@ -338,6 +338,17 @@ impl Store {
             }
         }
         let tx = self.conn.unchecked_transaction()?;
+        self.fold_contact(from, into)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The folding itself. Assumes a transaction is already open — SQLite has
+    /// no nested transactions, so this cannot open its own, and every caller
+    /// must supply one. Same rule as [`Store::write_pairing`], and for the same
+    /// reason: `record_pairing` folds and writes as one act, and half of that
+    /// is worse than neither.
+    fn fold_contact(&self, from: i64, into: i64) -> Result<(), StoreError> {
         match (
             self.thread_for_contact(from)?,
             self.thread_for_contact(into)?,
@@ -368,7 +379,6 @@ impl Store {
         }
         self.conn
             .execute("DELETE FROM contacts WHERE id = ?1", params![from])?;
-        tx.commit()?;
         Ok(())
     }
 
@@ -456,6 +466,27 @@ impl Store {
     ) -> Result<i64, StoreError> {
         self.require_contact(contact_id)?;
         let tx = self.conn.unchecked_transaction()?;
+        // A Layer-1 key already on file under a different contact is not a
+        // collision — `pairings.l1_pub` is UNIQUE precisely because that key
+        // *is* the person, so finding it means we are holding one person as two
+        // rows. Left alone the insert below fails, and two phones showed what
+        // that costs: both of them ran the whole ceremony, showed matching
+        // colours, took both confirmations and then logged
+        // `UNIQUE constraint failed: pairings.l1_pub` — a pairing that happened
+        // between two people and not in the app.
+        //
+        // Folded into the row we were asked to pair, not the other way round.
+        // The caller resolved `contact_id` from the device they are talking to,
+        // so it is the row the rest of the engine can still find; keeping the
+        // older row instead would delete the one just resolved and leave the
+        // next lookup to open a third. The old row's history moves across and
+        // its pairing goes with it (ON DELETE CASCADE), which is what frees the
+        // key for the insert below.
+        if let Some(owner) = self.contact_by_l1(l1_pub)? {
+            if owner.id != contact_id {
+                self.fold_contact(owner.id, contact_id)?;
+            }
+        }
         self.conn.execute(
             "UPDATE contacts SET l2_pub = ?1, name = ?2, colour = ?3, persona_version = ?4
              WHERE id = ?5",
@@ -1277,46 +1308,6 @@ mod tests {
         assert_eq!(s.contact_by_l1(&[1u8; 32]).unwrap().unwrap().id, other);
     }
 
-    /// A pairing that fails partway leaves nothing behind.
-    ///
-    /// The four writes a ceremony produces are one fact, so they are one
-    /// transaction. Without that, a failure after the persona update leaves a
-    /// contact wearing a name and a Layer-2 key that came from a ceremony which
-    /// did not finish — not dangerous, since every paired lookup joins
-    /// `pairings`, but a row asserting something that never happened, which is
-    /// what this schema was rewritten to stop.
-    ///
-    /// Forced through the one constraint that can fail late: a Layer-1 key
-    /// another contact already holds.
-    #[test]
-    fn a_pairing_that_fails_leaves_the_contact_untouched() {
-        let (s, _d) = store();
-        let taken = s.add_contact(&a_contact()).unwrap();
-        s.pair_contact(taken, &[9u8; 32], 1000).unwrap();
-
-        let other = s
-            .add_contact(&NewContact {
-                pseudonym: [2u8; 32],
-                l2_pub: [0u8; 32],
-                name: "Unknown".into(),
-                ..a_contact()
-            })
-            .unwrap();
-
-        assert!(s
-            .record_pairing(other, &[7u8; 32], "Ada", 0x00_ff_00, 4, &[9u8; 32], 2000)
-            .is_err());
-
-        let after = s.contact_by_id(other).unwrap().unwrap();
-        assert_eq!(after.name, "Unknown", "the name survived a failed pairing");
-        assert_eq!(
-            after.l2_pub, [0u8; 32],
-            "the Layer-2 key was written anyway"
-        );
-        assert!(s.pairing_for_contact(other).unwrap().is_none());
-        assert!(s.thread_for_contact(other).unwrap().is_none());
-    }
-
     /// The happy path writes all four things.
     #[test]
     fn recording_a_pairing_writes_identity_persona_pairing_and_thread() {
@@ -1920,6 +1911,78 @@ mod tests {
             .threads_in_state(Direction::Outgoing, MessageState::Queued)
             .unwrap();
         assert_eq!(owed, vec![owing], "the gate would dial the wrong people");
+    }
+
+    /// Pairing with someone already on file under another row.
+    ///
+    /// Two phones did the whole ceremony — colours matched, both people
+    /// confirmed — and got `UNIQUE constraint failed: pairings.l1_pub`, because
+    /// each held the other as two contacts and the pairing belonged to the one
+    /// they were no longer talking to. The Layer-1 key is the person, so the
+    /// second row is the answer, not an obstacle: fold it in and pair.
+    #[test]
+    fn pairing_someone_already_on_file_folds_the_two_rows() {
+        let (s, _d) = store();
+        let l1 = [4u8; 32];
+
+        // How they are known from an earlier encounter, with history.
+        let old = s.add_contact(&a_contact()).unwrap();
+        let old_thread = s
+            .record_pairing(old, &[2u8; 32], "Wanda", 1, 1, &l1, 10)
+            .unwrap();
+        s.add_message(&NewMessage {
+            thread_id: old_thread,
+            seq: 1,
+            msg_id: b"m1".to_vec(),
+            body: b"from before".to_vec(),
+            direction: Direction::Incoming,
+            state: MessageState::Delivered,
+            created_at: 11,
+        })
+        .unwrap();
+
+        // The row today's device id resolves to, which is not that one.
+        let current = s
+            .add_contact(&NewContact {
+                pseudonym: [9u8; 32],
+                l2_pub: [8u8; 32],
+                name: "Wanda".into(),
+                ..a_contact()
+            })
+            .unwrap();
+
+        let thread = s
+            .record_pairing(current, &[2u8; 32], "Wanda", 1, 2, &l1, 20)
+            .expect("pairing someone we already knew was refused");
+
+        // One person, one row — the one the caller is talking to.
+        assert!(
+            s.contact_by_id(old).unwrap().is_none(),
+            "the stale row survived"
+        );
+        assert_eq!(
+            s.contact_by_l1(&l1).unwrap().map(|c| c.id),
+            Some(current),
+            "the key did not move to the contact we paired"
+        );
+        // And the conversation came with them, rather than being cascaded away
+        // with the row that used to hold it.
+        let msgs = s.messages_for_thread(thread).unwrap();
+        assert_eq!(msgs.len(), 1, "history was lost in the fold");
+        assert_eq!(msgs[0].body, b"from before");
+
+        // All four writes landed, which is what `a_pairing_that_fails_leaves_
+        // the_contact_untouched` used to guard from the other side. Its way in
+        // was a Layer-1 key another contact held — the one thing that could
+        // still fail after the persona update — and folding is now the answer
+        // to that, so the failure it forced no longer exists. The guarantee
+        // moves here rather than going quiet.
+        let after = s.contact_by_id(current).unwrap().unwrap();
+        assert_eq!(after.name, "Wanda");
+        assert_eq!(after.l2_pub, [2u8; 32], "the Layer-2 key was not written");
+        assert_eq!(after.persona_version, 2, "the newer persona was not taken");
+        assert!(s.pairing_for_contact(current).unwrap().is_some());
+        assert_eq!(s.thread_for_contact(current).unwrap(), Some(thread));
     }
 
     #[test]
