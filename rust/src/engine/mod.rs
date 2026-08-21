@@ -961,6 +961,48 @@ pub fn mark_sent_for_test(thread_id: i64) -> Result<(), String> {
     })
 }
 
+/// Open a session with sighted devices we cannot yet name, when we have a
+/// reason to care who they are.
+///
+/// The reason is a paired contact that is not accounted for by a sighting we
+/// have already identified. Without one this does nothing, which is the point:
+/// reaching every stranger on sight would be a handshake nobody asked for, paid
+/// for in radio time and battery (N4).
+fn reach_unidentified() {
+    let Ok(net) = require_net() else {
+        return;
+    };
+    let unnamed: Vec<String> = net
+        .discovery()
+        .sightings()
+        .into_iter()
+        .filter(|s| s.persona.is_none())
+        .map(|s| s.peer)
+        .collect();
+    if unnamed.is_empty() {
+        return;
+    }
+    // Nothing owed, nobody to place: leave them alone.
+    let waiting = with_core(|core| {
+        let paired = core
+            .store
+            .list_contacts()?
+            .into_iter()
+            .filter(|c| matches!(core.store.pairing_for_contact(c.id), Ok(Some(_))))
+            .count();
+        Ok(paired > 0)
+    })
+    .unwrap_or(false);
+    if !waiting {
+        return;
+    }
+    for peer in unnamed {
+        // Best effort, and quiet about it: a peer that will not answer is the
+        // ordinary case, not an error worth a line each time round the loop.
+        let _ = net.reach(&peer);
+    }
+}
+
 /// Send everything this thread still owes, oldest first.
 ///
 /// # What counts as owed
@@ -1063,6 +1105,28 @@ fn require_net() -> Result<Arc<net::Net>, String> {
 fn on_net_event(net: &Arc<net::Net>, event: net::NetEvent) {
     match event {
         net::NetEvent::PeersChanged => {
+            // Ask a stranger who they are, if we are waiting on anyone.
+            //
+            // Two things need this and neither could happen without it.
+            //
+            // R0-F2's identifiers rotate and are unlinkable, so a sighting
+            // cannot be matched to a contact by looking at it — only a session
+            // proves who is there. Until one opens, a paired person standing in
+            // the room appears twice: once as "Unknown device" and once as
+            // "paired — away". A Samsung showed exactly that, for as long as
+            // nobody pressed anything.
+            //
+            // And R0-F5's "delivered at the next direct encounter" waits on
+            // `SessionOpened`, which nothing but a Ping ever produced. A
+            // message queued for someone out of range would sit there while
+            // they stood next to you, because no part of the app was curious
+            // enough to ask.
+            //
+            // Only when something is owed: an unprompted session with every
+            // passing stranger is radio time, battery (N4) and a handshake
+            // nobody asked for. Having a paired contact we cannot place, or a
+            // message waiting, is the whole of the reason to be curious.
+            reach_unidentified();
             if let Ok(devices) = nearby_devices() {
                 emit(CoreEvent::DiscoveryUpdated { devices });
             }
