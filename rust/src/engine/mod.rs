@@ -490,8 +490,20 @@ pub fn nearby_devices() -> Result<Vec<NearbyDevice>, String> {
     // all — which makes R0-F5's "messages composed out of range are queued
     // locally and delivered at the next direct encounter" unreachable, since
     // nothing can compose them.
-    for (device_id, name, colour) in paired_contacts()? {
-        if devices.iter().any(|d| d.device_id == device_id) {
+    // Matched on the contact, not on the handle. Somebody visible is listed
+    // under their rotating device id and the same person out of range under
+    // their pseudonym, so comparing the strings never matches and shows them
+    // twice — which is how this was written first, and what a phone showed.
+    let present: std::collections::HashSet<i64> = devices
+        .iter()
+        .filter_map(|d| {
+            with_core(|core| contact_id_for_device(core, &d.device_id))
+                .ok()
+                .flatten()
+        })
+        .collect();
+    for (contact_id, device_id, name, colour) in paired_contacts()? {
+        if present.contains(&contact_id) {
             continue;
         }
         devices.push(NearbyDevice {
@@ -509,14 +521,14 @@ pub fn nearby_devices() -> Result<Vec<NearbyDevice>, String> {
 ///
 /// Keyed by the same device id a sighting uses, so a contact who *is* visible
 /// is recognised as the one already in the list rather than added twice.
-fn paired_contacts() -> Result<Vec<(String, String, u32)>, String> {
+fn paired_contacts() -> Result<Vec<(i64, String, String, u32)>, String> {
     with_core(|core| {
         let mut out = Vec::new();
         for c in core.store.list_contacts()? {
             if core.store.pairing_for_contact(c.id)?.is_none() {
                 continue;
             }
-            out.push((hex::encode(c.pseudonym), c.name, c.colour));
+            out.push((c.id, hex::encode(c.pseudonym), c.name, c.colour));
         }
         Ok(out)
     })
@@ -670,12 +682,34 @@ pub fn send_chat(device_id: String, text: String) -> Result<ChatMessageDto, Stri
     // is promoted to Sent only once the bytes are actually away — a caller
     // that sees Sent can trust it.
     let net = require_net()?;
-    net.send_chat(&device_id, envelope.encode(), std::time::Instant::now())?;
-    with_core(|core| {
-        core.store
-            .set_message_state(&envelope.msg_id, MessageState::Sent)?;
-        Ok(())
-    })?;
+    match net.send_chat(&device_id, envelope.encode(), std::time::Instant::now()) {
+        Ok(()) => {
+            with_core(|core| {
+                core.store
+                    .set_message_state(&envelope.msg_id, MessageState::Sent)?;
+                Ok(())
+            })?;
+        }
+        // Out of range is not a failure to write a message, and telling
+        // somebody it was would be false: the row is already `Queued`, and
+        // `resend_queued` delivers it the next time a session opens. R0-F5
+        // promises exactly that — "messages composed out of range are queued
+        // locally and delivered at the next direct encounter" — so reporting an
+        // error here made the app contradict the requirement to the one person
+        // who could see both. It did, on a phone: writing to a paired peer who
+        // had gone gave "Error: no session with …".
+        //
+        // Not swallowed. The row stays `Queued`, which is the difference
+        // between this and a send that succeeded, and the reason goes to the
+        // log for whoever is holding a device wondering why nothing arrived.
+        Err(why) => {
+            log::info!("holding a message for {device_id} until we meet again: {why}");
+            // Ask for a session, as a Ping does. If they are actually reachable
+            // this opens one within a moment and the resend follows; if they
+            // are not, nothing is lost and the message waits.
+            let _ = net.reach(&device_id);
+        }
+    }
     Ok(dto)
 }
 
@@ -1365,6 +1399,23 @@ fn is_paired(device_id: &str, sighting: Option<&VerifiedPersona>) -> bool {
 }
 
 /// The peer's durable identity, if a session has authenticated one.
+/// A handle that is a pseudonym written out, or nothing.
+///
+/// Length tells them apart: a rotating device id is 16 hex characters and a
+/// pseudonym is 64, so no device id can be mistaken for one.
+///
+/// The explicit check is redundant and its mutant survives — `try_into` into a
+/// `[u8; 32]` rejects every other length by itself, which is what actually
+/// makes this safe. Kept because the rule this function exists to enforce is
+/// "64 means pseudonym", and a reader should not have to infer that from the
+/// return type two lines down.
+fn decode_pseudonym(handle: &str) -> Option<[u8; 32]> {
+    if handle.len() != 64 {
+        return None;
+    }
+    hex::decode(handle).ok()?.try_into().ok()
+}
+
 fn pseudonym_of(core: &Core, device_id: &str) -> Option<[u8; 32]> {
     core.net
         .as_ref()
@@ -1380,6 +1431,15 @@ fn pseudonym_of(core: &Core, device_id: &str) -> Option<[u8; 32]> {
 /// that had already moved onto its session key, and report no conversation for
 /// someone the user has been talking to all afternoon.
 fn contact_id_for_device(core: &Core, device_id: &str) -> Result<Option<i64>, StoreError> {
+    // A contact listed while out of range carries its pseudonym as its handle,
+    // because it has no rotating device id to carry — there is no sighting to
+    // take one from. Resolved first: it is exact, where everything below is a
+    // lookup that can miss.
+    if let Some(pseudonym) = decode_pseudonym(device_id) {
+        if let Some(c) = core.store.contact_by_pseudonym(&pseudonym)? {
+            return Ok(Some(c.id));
+        }
+    }
     if let Some(real) = pseudonym_of(core, device_id) {
         if let Some(c) = core.store.contact_by_pseudonym(&real)? {
             return Ok(Some(c.id));
@@ -1718,4 +1778,24 @@ fn reset_stale_db(db: &Path) -> Result<(), String> {
         let _ = std::fs::remove_file(PathBuf::from(sidecar));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The length check is the whole of the discrimination: a rotating device
+    /// id is 16 hex characters and a pseudonym is 64. Without it a device id
+    /// would be offered to `contact_by_pseudonym` as if it were one, and a
+    /// wrong answer there routes a message into the wrong conversation.
+    #[test]
+    fn only_a_full_pseudonym_is_read_as_one() {
+        let pseudonym = [7u8; 32];
+        assert_eq!(decode_pseudonym(&hex::encode(pseudonym)), Some(pseudonym));
+        // A device id, which is what sightings carry.
+        assert_eq!(decode_pseudonym("4345b9d55c016b88"), None);
+        assert_eq!(decode_pseudonym(""), None);
+        // Right length, not hex.
+        assert_eq!(decode_pseudonym(&"z".repeat(64)), None);
+    }
 }
