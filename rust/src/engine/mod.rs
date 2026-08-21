@@ -626,12 +626,28 @@ pub fn send_chat(device_id: String, text: String) -> Result<ChatMessageDto, Stri
     // is promoted to Sent only once the bytes are actually away — a caller
     // that sees Sent can trust it.
     let net = require_net()?;
-    net.send_chat(&device_id, envelope.encode(), std::time::Instant::now())?;
-    with_core(|core| {
-        core.store
-            .set_message_state(&envelope.msg_id, MessageState::Sent)?;
-        Ok(())
-    })?;
+    match net.send_chat(&device_id, envelope.encode(), std::time::Instant::now()) {
+        Ok(()) => {
+            with_core(|core| {
+                core.store
+                    .set_message_state(&envelope.msg_id, MessageState::Sent)?;
+                Ok(())
+            })?;
+        }
+        // Out of range is not a failure to write a message, and saying so was
+        // false: the row is already `Queued` and `resend_queued` delivers it at
+        // the next encounter, which is exactly what R0-F5 promises. Reporting
+        // an error made the app contradict the requirement to the one person
+        // who could see both halves — measured on a Pixel, which showed
+        // "Error: no session with …" over a message sitting safely in the
+        // thread.
+        //
+        // Not swallowed: the row stays `Queued`, which is the whole difference
+        // between this and a send that got away, and the reason goes to the log.
+        Err(why) => {
+            log::info!("holding a message for {device_id} until we meet again: {why}");
+        }
+    }
     Ok(dto)
 }
 
@@ -883,6 +899,66 @@ pub fn mark_sent_for_test(thread_id: i64) -> Result<(), String> {
     })
 }
 
+/// Open a session with sighted devices we cannot yet name, when a message is
+/// waiting for somebody.
+///
+/// R0-F5 says queued messages are "delivered at the next direct encounter", and
+/// `resend_queued` does exactly that — on `SessionOpened`, which nothing but a
+/// manual Ping ever produced. So a message queued for someone out of range sat
+/// there while they stood next to you, because no part of the app was curious
+/// enough to ask who had just appeared. The reunion machinery was complete and
+/// unreachable.
+///
+/// Identity is why asking is necessary rather than merely convenient: R0-F2's
+/// transport ids rotate and are unlinkable, so a sighting cannot be matched to
+/// the contact a message is waiting for by looking at it. Only a session says
+/// who is there.
+///
+/// Gated on something actually being owed. Reaching every stranger on sight
+/// would be a handshake nobody asked for, paid for in radio time and battery
+/// (N4); a message waiting is the whole of the reason to be curious.
+///
+/// # Not covered by a test, and verified on hardware instead
+///
+/// Both mutants of this survive — removing the gate, and removing the call —
+/// because it needs a transport with live sightings and the contract tests have
+/// neither. Recorded rather than left to look like an oversight.
+///
+/// Two phones are what checked it: a message written to a paired peer who had
+/// gone was delivered the moment she came back, with nobody pressing anything.
+/// The Pixel logged `resending 1 queued messages on reunion` and the Samsung
+/// showed the message. That had never happened before this function existed.
+fn reach_for_queued_messages() {
+    let Ok(net) = require_net() else {
+        return;
+    };
+    let unnamed: Vec<String> = net
+        .discovery()
+        .sightings()
+        .into_iter()
+        .filter(|s| s.persona.is_none())
+        .map(|s| s.peer)
+        .collect();
+    if unnamed.is_empty() {
+        return;
+    }
+    let owed = with_core(|core| {
+        Ok(!core
+            .store
+            .messages_by_state(MessageState::Queued)?
+            .is_empty())
+    })
+    .unwrap_or(false);
+    if !owed {
+        return;
+    }
+    for peer in unnamed {
+        // Best effort and quiet: a peer that will not answer is the ordinary
+        // case, not an error worth a line each time round the loop.
+        let _ = net.reach(&peer);
+    }
+}
+
 /// Send everything this thread still owes, oldest first.
 ///
 /// # What counts as owed
@@ -985,6 +1061,7 @@ fn require_net() -> Result<Arc<net::Net>, String> {
 fn on_net_event(net: &Arc<net::Net>, event: net::NetEvent) {
     match event {
         net::NetEvent::PeersChanged => {
+            reach_for_queued_messages();
             if let Ok(devices) = nearby_devices() {
                 emit(CoreEvent::DiscoveryUpdated { devices });
             }

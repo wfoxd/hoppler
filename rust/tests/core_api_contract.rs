@@ -308,24 +308,27 @@ fn one_tap_is_one_dial() {
 }
 
 #[test]
-fn a_chat_with_no_session_still_stores_the_outgoing_row() {
-    // The row is written before the send is attempted, so a failure leaves the
-    // message in the thread rather than losing what the person typed.
+fn a_chat_to_someone_out_of_range_is_queued_rather_than_refused() {
+    // R0-F5: "messages composed out of range are queued locally and delivered
+    // at the next direct encounter". This answered `Err`, and a Pixel showed
+    // the consequence — "Error: no session with …" over a message sitting
+    // safely in the thread. The app contradicted the requirement to the one
+    // person who could see both halves.
     let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let _h = fresh();
-    assert!(send_chat("unreachable".into(), "hi".into()).is_err());
+    let dto = send_chat("unreachable".into(), "hi".into())
+        .expect("a message to someone out of range was refused");
+    assert_eq!(dto.text, "hi");
 
     let thread = thread_for_device("unreachable".into()).unwrap();
     assert!(thread.is_some(), "no thread was created for a failed send");
     let msgs = thread_messages(thread.unwrap()).unwrap();
     assert_eq!(msgs.len(), 1);
     assert!(msgs[0].outgoing && msgs[0].text == "hi");
-    // Not asserted here: that the row is still `Queued` rather than `Sent`.
-    // `state` is not on the DTO and no API surface exposes it, and inventing
-    // one for a test would be growing the bridge to suit the suite. The
-    // transition is covered where it belongs — `store::records` already tests
-    // `messages_by_state` — and a real assertion arrives with the resend queue
-    // in T12/T16, which is the first caller that needs to read it.
+    // And left *queued*, which is the difference between this and a send that
+    // got away, and what the next reunion acts on.
+    let owed = queued_for_resend_for_test("unreachable").unwrap();
+    assert_eq!(owed.len(), 1, "the message was not left for the reunion");
 }
 
 /// The defect this slice removes. A sender that never saw an ack resends the
