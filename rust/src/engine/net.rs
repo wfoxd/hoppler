@@ -1,7 +1,7 @@
 //! The engine's networking half (T10 part 2b) — discovery, sessions, and the
 //! event loop that joins them.
 //!
-//! Deliberately **not** a singleton, unlike [`super::CORE`]. The engine is
+//! Deliberately **not** a singleton, unlike the engine's `CORE`. The engine is
 //! process-wide, so an engine-against-engine test cannot exist; two `Net`s can
 //! talk to each other over the loopback rung, which is the only way the
 //! stranger→session→Ping path gets tested end to end before it meets a radio.
