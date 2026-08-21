@@ -562,10 +562,26 @@ class _HomePageState extends State<HomePage> {
     return NearbyTile(
       device: d,
       pingService: _pingService,
-      onChat: (text) => _run(() => sendChat(deviceId: d.deviceId, text: text)),
+      // Addressed by device when they are here and by thread when they are
+      // not. Both end in the same row on the same conversation — R0-F5 keeps
+      // what was written either way — so writing to somebody must not depend on
+      // whether the radio can see them this second.
+      onChat: (text) => _run(() {
+        final id = d.deviceId;
+        if (id != null) return sendChat(deviceId: id, text: text);
+        final thread = d.threadId;
+        if (thread != null) {
+          return sendChatToThread(threadId: thread, text: text);
+        }
+        // No handle and no conversation is not a state the core produces: an
+        // away row exists only for a paired contact, and R0-F4 gives every one
+        // of those a thread. Reported rather than dropped, because if it ever
+        // happens the invariant has moved.
+        throw StateError('no way to reach ${d.name}');
+      }),
       onDrop: () => _run(
         () => offerDrop(
-          deviceId: d.deviceId,
+          deviceId: d.deviceId!,
           name: 'photo.jpg',
           size: BigInt.from(5000000),
         ),

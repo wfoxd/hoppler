@@ -74,7 +74,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.12.0';
 
   @override
-  int get rustContentHash => 595831498;
+  int get rustContentHash => 1854925380;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -129,6 +129,11 @@ abstract class RustLibApi extends BaseApi {
 
   Future<ChatMessageDto> crateApiMessagingSendChat({
     required String deviceId,
+    required String text,
+  });
+
+  Future<ChatMessageDto> crateApiMessagingSendChatToThread({
+    required PlatformInt64 threadId,
     required String text,
   });
 
@@ -676,6 +681,41 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   );
 
   @override
+  Future<ChatMessageDto> crateApiMessagingSendChatToThread({
+    required PlatformInt64 threadId,
+    required String text,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_i_64(threadId, serializer);
+          sse_encode_String(text, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 19,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_chat_message_dto,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiMessagingSendChatToThreadConstMeta,
+        argValues: [threadId, text],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiMessagingSendChatToThreadConstMeta =>
+      const TaskConstMeta(
+        debugName: "send_chat_to_thread",
+        argNames: ["threadId", "text"],
+      );
+
+  @override
   Future<void> crateApiDiscoverySetDiscovery({required bool enabled}) {
     return handler.executeNormal(
       NormalTask(
@@ -685,7 +725,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 19,
+            funcId: 20,
             port: port_,
           );
         },
@@ -712,7 +752,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 20,
+            funcId: 21,
             port: port_,
           );
         },
@@ -742,7 +782,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 21,
+            funcId: 22,
             port: port_,
           );
         },
@@ -775,7 +815,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 22,
+            funcId: 23,
             port: port_,
           );
         },
@@ -807,7 +847,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 23,
+            funcId: 24,
             port: port_,
           );
         },
@@ -1080,13 +1120,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   NearbyDevice dco_decode_nearby_device(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 4)
-      throw Exception('unexpected arr length: expect 4 but see ${arr.length}');
+    if (arr.length != 5)
+      throw Exception('unexpected arr length: expect 5 but see ${arr.length}');
     return NearbyDevice(
-      deviceId: dco_decode_String(arr[0]),
-      name: dco_decode_String(arr[1]),
-      colour: dco_decode_u_32(arr[2]),
-      paired: dco_decode_bool(arr[3]),
+      deviceId: dco_decode_opt_String(arr[0]),
+      threadId: dco_decode_opt_box_autoadd_i_64(arr[1]),
+      name: dco_decode_String(arr[2]),
+      colour: dco_decode_u_32(arr[3]),
+      paired: dco_decode_bool(arr[4]),
     );
   }
 
@@ -1505,12 +1546,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   @protected
   NearbyDevice sse_decode_nearby_device(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
-    var var_deviceId = sse_decode_String(deserializer);
+    var var_deviceId = sse_decode_opt_String(deserializer);
+    var var_threadId = sse_decode_opt_box_autoadd_i_64(deserializer);
     var var_name = sse_decode_String(deserializer);
     var var_colour = sse_decode_u_32(deserializer);
     var var_paired = sse_decode_bool(deserializer);
     return NearbyDevice(
       deviceId: var_deviceId,
+      threadId: var_threadId,
       name: var_name,
       colour: var_colour,
       paired: var_paired,
@@ -1937,7 +1980,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   @protected
   void sse_encode_nearby_device(NearbyDevice self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
-    sse_encode_String(self.deviceId, serializer);
+    sse_encode_opt_String(self.deviceId, serializer);
+    sse_encode_opt_box_autoadd_i_64(self.threadId, serializer);
     sse_encode_String(self.name, serializer);
     sse_encode_u_32(self.colour, serializer);
     sse_encode_bool(self.paired, serializer);

@@ -38,7 +38,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.12.0";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 595831498;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 1854925380;
 
 // Section: executor
 
@@ -645,6 +645,41 @@ fn wire__crate__api__messaging__send_chat_impl(
         },
     )
 }
+fn wire__crate__api__messaging__send_chat_to_thread_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "send_chat_to_thread",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_thread_id = <i64>::sse_decode(&mut deserializer);
+            let api_text = <String>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, String>((move || {
+                    let output_ok =
+                        crate::api::messaging::send_chat_to_thread(api_thread_id, api_text)?;
+                    Ok(output_ok)
+                })())
+            }
+        },
+    )
+}
 fn wire__crate__api__discovery__set_discovery_impl(
     port_: flutter_rust_bridge::for_generated::MessagePort,
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
@@ -1197,12 +1232,14 @@ impl SseDecode for Vec<crate::api::types::ThreadSummary> {
 impl SseDecode for crate::api::types::NearbyDevice {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
-        let mut var_deviceId = <String>::sse_decode(deserializer);
+        let mut var_deviceId = <Option<String>>::sse_decode(deserializer);
+        let mut var_threadId = <Option<i64>>::sse_decode(deserializer);
         let mut var_name = <String>::sse_decode(deserializer);
         let mut var_colour = <u32>::sse_decode(deserializer);
         let mut var_paired = <bool>::sse_decode(deserializer);
         return crate::api::types::NearbyDevice {
             device_id: var_deviceId,
+            thread_id: var_threadId,
             name: var_name,
             colour: var_colour,
             paired: var_paired,
@@ -1354,15 +1391,18 @@ fn pde_ffi_dispatcher_primary_impl(
         ),
         17 => wire__crate__api__platform__platform_fact_impl(port, ptr, rust_vec_len, data_len),
         18 => wire__crate__api__messaging__send_chat_impl(port, ptr, rust_vec_len, data_len),
-        19 => wire__crate__api__discovery__set_discovery_impl(port, ptr, rust_vec_len, data_len),
-        20 => {
+        19 => {
+            wire__crate__api__messaging__send_chat_to_thread_impl(port, ptr, rust_vec_len, data_len)
+        }
+        20 => wire__crate__api__discovery__set_discovery_impl(port, ptr, rust_vec_len, data_len),
+        21 => {
             wire__crate__api__pairing__stop_showing_invite_impl(port, ptr, rust_vec_len, data_len)
         }
-        21 => {
+        22 => {
             wire__crate__api__messaging__thread_for_device_impl(port, ptr, rust_vec_len, data_len)
         }
-        22 => wire__crate__api__messaging__thread_messages_impl(port, ptr, rust_vec_len, data_len),
-        23 => wire__crate__api__identity__update_persona_impl(port, ptr, rust_vec_len, data_len),
+        23 => wire__crate__api__messaging__thread_messages_impl(port, ptr, rust_vec_len, data_len),
+        24 => wire__crate__api__identity__update_persona_impl(port, ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -1621,6 +1661,7 @@ impl flutter_rust_bridge::IntoDart for crate::api::types::NearbyDevice {
     fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
         [
             self.device_id.into_into_dart().into_dart(),
+            self.thread_id.into_into_dart().into_dart(),
             self.name.into_into_dart().into_dart(),
             self.colour.into_into_dart().into_dart(),
             self.paired.into_into_dart().into_dart(),
@@ -2054,7 +2095,8 @@ impl SseEncode for Vec<crate::api::types::ThreadSummary> {
 impl SseEncode for crate::api::types::NearbyDevice {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
-        <String>::sse_encode(self.device_id, serializer);
+        <Option<String>>::sse_encode(self.device_id, serializer);
+        <Option<i64>>::sse_encode(self.thread_id, serializer);
         <String>::sse_encode(self.name, serializer);
         <u32>::sse_encode(self.colour, serializer);
         <bool>::sse_encode(self.paired, serializer);

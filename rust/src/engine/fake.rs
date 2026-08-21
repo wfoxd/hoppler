@@ -43,7 +43,8 @@ pub fn nearby() -> Vec<NearbyDevice> {
     PEERS
         .iter()
         .map(|p| NearbyDevice {
-            device_id: p.device_id.to_owned(),
+            device_id: Some(p.device_id.to_owned()),
+            thread_id: None,
             name: p.name.to_owned(),
             colour: p.colour,
             paired: p.paired,

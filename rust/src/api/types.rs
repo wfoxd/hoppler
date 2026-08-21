@@ -20,11 +20,29 @@ pub struct PersonaDto {
     pub needs_name: bool,
 }
 
-/// A device visible in Discovery.
+/// Someone the app can show: a device in range, or a person we have paired
+/// with and are not currently in range of.
+///
+/// Both, because R0-F2 rotates transport ids every twelve minutes and R0-F4
+/// says pairing survives that. A list built only from what the radio can see
+/// drops a paired person the moment they stop advertising — the app forgetting
+/// someone the user deliberately introduced it to.
 pub struct NearbyDevice {
-    /// Opaque stable handle for this device (the caller passes it back to
-    /// `ping` / `send_chat` / `offer_drop`).
-    pub device_id: String,
+    /// Opaque transport handle, and `None` when they are not in range.
+    ///
+    /// The caller passes it back to `ping` / `send_chat` / `offer_drop`, so its
+    /// absence *is* "cannot be reached right now" — one fact, not a presence
+    /// flag alongside a handle that could disagree with it. Deliberately not a
+    /// stand-in identity when they are away: an earlier attempt put a durable
+    /// pseudonym in this field and made every transport-routed action on an
+    /// away row unroutable, because Ping and Drop had nothing to dial.
+    pub device_id: Option<String>,
+    /// The conversation with this person, once there is one.
+    ///
+    /// What an away row is addressed by. A thread outlives every id the peer
+    /// advertises under, so it is the handle that still means something when
+    /// the radio can no longer see them.
+    pub thread_id: Option<i64>,
     pub name: String,
     pub colour: u32,
     pub paired: bool,

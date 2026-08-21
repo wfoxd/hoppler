@@ -13,6 +13,12 @@ pub fn send_chat(device_id: String, text: String) -> Result<ChatMessageDto, Stri
     crate::engine::send_chat(device_id, text)
 }
 
+/// Send to a conversation rather than to a device — what a paired person who is
+/// not currently in range is addressed by. Queues if they cannot be reached.
+pub fn send_chat_to_thread(thread_id: i64, text: String) -> Result<ChatMessageDto, String> {
+    crate::engine::send_chat_to_thread(thread_id, text)
+}
+
 /// All messages on a thread, in chronological display order.
 pub fn thread_messages(thread_id: i64) -> Result<Vec<ChatMessageDto>, String> {
     crate::engine::thread_messages(thread_id)

@@ -21,6 +21,16 @@ Future<ChatMessageDto> sendChat({
   text: text,
 );
 
+/// Send to a conversation rather than to a device — what a paired person who is
+/// not currently in range is addressed by. Queues if they cannot be reached.
+Future<ChatMessageDto> sendChatToThread({
+  required PlatformInt64 threadId,
+  required String text,
+}) => RustLib.instance.api.crateApiMessagingSendChatToThread(
+  threadId: threadId,
+  text: text,
+);
+
 /// All messages on a thread, in chronological display order.
 Future<List<ChatMessageDto>> threadMessages({
   required PlatformInt64 threadId,

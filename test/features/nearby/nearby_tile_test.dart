@@ -16,8 +16,23 @@ class _StubPingService implements PingService {
   Future<void> ping(String deviceId) async {}
 }
 
-NearbyDevice _device({required String name, int colour = 0x0088ff}) =>
-    NearbyDevice(deviceId: 'dev-1', name: name, colour: colour, paired: false);
+NearbyDevice _device({required String name, int colour = 0x0088ff}) => NearbyDevice(
+  deviceId: 'dev-1',
+  threadId: null,
+  name: name,
+  colour: colour,
+  paired: false,
+);
+
+/// Someone we have paired with who is not in range: no transport handle, and a
+/// conversation that outlives every id they ever advertised under.
+NearbyDevice _away({required String name}) => NearbyDevice(
+  deviceId: null,
+  threadId: 7,
+  name: name,
+  colour: 0x0088ff,
+  paired: true,
+);
 
 void main() {
   Future<List<String>> pump(WidgetTester tester, NearbyDevice device) async {
@@ -83,5 +98,46 @@ void main() {
 
     await tester.tap(find.byTooltip('Chat'));
     expect(chats, ['Hey Margo!']);
+  });
+
+  // R0-F2 rotates ids and R0-F4 makes pairing durable, so a paired friend is on
+  // the list for most of the day without being reachable. The row has to say
+  // which of those two things is true right now.
+  testWidgets('an away friend is shown as away, not as nearby', (tester) async {
+    await pump(tester, _away(name: 'Wren'));
+
+    expect(find.text('Wren'), findsOneWidget);
+    expect(find.textContaining('away'), findsOneWidget);
+    expect(find.text('paired'), findsNothing);
+    expect(find.text('nearby'), findsNothing);
+  });
+
+  // Chat keeps working because R0-F5 says what happens to it: kept, and
+  // delivered when they next meet. Ping and Drop cannot be kept — a nudge
+  // answered tomorrow is not a nudge — so they are visibly unavailable rather
+  // than live buttons that quietly do nothing.
+  testWidgets('an away friend can be written to but not pinged or dropped', (
+    tester,
+  ) async {
+    final chats = await pump(tester, _away(name: 'Wren'));
+
+    await tester.tap(find.byTooltip('Chat'));
+    await tester.pump();
+    expect(chats, ['Hey Wren!'], reason: 'writing to an away friend was lost');
+
+    // Both Ping and Drop, found by the reason they carry rather than by
+    // position, so a reordered row still tests the right two buttons.
+    final blocked = tester
+        .widgetList<IconButton>(find.byType(IconButton))
+        .where((b) => b.tooltip == NearbyTile.awayHint)
+        .toList();
+    expect(
+      blocked.length,
+      2,
+      reason: 'Ping and Drop should both be unavailable, and say why',
+    );
+    for (final b in blocked) {
+      expect(b.onPressed, isNull, reason: 'an away row offered a live tap');
+    }
   });
 }
