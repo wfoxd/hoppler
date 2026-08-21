@@ -452,31 +452,40 @@ pub fn nearby_devices() -> Result<Vec<NearbyDevice>, String> {
         Some(net) => net,
         None => return Ok(Vec::new()),
     };
-    if !net.discovery().is_on() {
-        return Ok(Vec::new());
-    }
-    let mut devices: Vec<NearbyDevice> = net
-        .discovery()
-        .sightings()
-        .into_iter()
-        .map(|s| {
-            // A peer whose persona we have not fetched yet is real and
-            // reachable; showing it unnamed beats hiding it until a round trip
-            // completes, which is what "who's nearby" is asking.
-            let (name, colour) = match &s.persona {
-                Some(p) => (p.name.clone(), p.colour),
-                None => (String::new(), 0),
-            };
-            let paired = is_paired(&s.peer, s.persona.as_ref());
-            NearbyDevice {
-                device_id: s.peer,
-                name,
-                colour,
-                paired,
-                present: true,
-            }
-        })
-        .collect();
+    // Sightings only when Discovery is on — with it off we are not looking, so
+    // there is nothing to report and nothing has been seen.
+    //
+    // The list does not end here, though, and returning early is what made this
+    // change not do its job: R0-F2 says Discovery off leaves "connections with
+    // paired people unaffected", and *my* switch is about who can see me. It
+    // was never meant to empty my own address book. Turning it off used to hide
+    // everyone I had paired with, which is the same failure this whole change
+    // exists to fix, reached from the other side of the switch.
+    let mut devices: Vec<NearbyDevice> = if net.discovery().is_on() {
+        net.discovery()
+            .sightings()
+            .into_iter()
+            .map(|s| {
+                // A peer whose persona we have not fetched yet is real and
+                // reachable; showing it unnamed beats hiding it until a round trip
+                // completes, which is what "who's nearby" is asking.
+                let (name, colour) = match &s.persona {
+                    Some(p) => (p.name.clone(), p.colour),
+                    None => (String::new(), 0),
+                };
+                let paired = is_paired(&s.peer, s.persona.as_ref());
+                NearbyDevice {
+                    device_id: s.peer,
+                    name,
+                    colour,
+                    paired,
+                    present: true,
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     // Everyone paired, whether the radio can see them or not.
     //
