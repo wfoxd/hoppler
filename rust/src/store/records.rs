@@ -675,6 +675,29 @@ impl Store {
         Ok(usize::try_from(n).unwrap_or(usize::MAX))
     }
 
+    /// Which threads have a message in this state and direction — the ids
+    /// only, never the rows.
+    ///
+    /// The reunion gate asks two questions on every sighting event: is anything
+    /// owed at all, and is it owed to *this* person. `messages_by_state`
+    /// answers the first by loading every queued message and its body across
+    /// every thread — up to 8 KB a row, copied on the event pump, to compute an
+    /// `is_empty`. Discovery churn runs that gate often enough that a backlog
+    /// made the cost grow with the backlog. A short list of ids answers both
+    /// questions and costs the same whatever is in the queue.
+    pub fn threads_in_state(
+        &self,
+        direction: Direction,
+        state: MessageState,
+    ) -> Result<Vec<i64>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT thread_id FROM messages
+             WHERE direction = ?1 AND state = ?2",
+        )?;
+        let rows = stmt.query_map(params![direction.to_i64(), state.to_i64()], |r| r.get(0))?;
+        rows.map(|r| r.map_err(StoreError::from)).collect()
+    }
+
     /// A thread's messages in one state and direction, oldest first.
     ///
     /// Scoped in SQL rather than filtered afterwards: the resend path wants one
@@ -1827,6 +1850,76 @@ mod tests {
             s.message_by_msg_id(b"d").unwrap().unwrap().state,
             MessageState::Delivered
         );
+    }
+
+    /// The reunion gate's two questions, answered by one small list.
+    ///
+    /// Distinct ids, and only threads that still owe something *outgoing* — an
+    /// incoming message nobody has read is not a debt, and a thread whose queue
+    /// has drained must drop out or the gate dials someone for nothing.
+    #[test]
+    fn threads_in_state_names_only_the_threads_that_owe() {
+        let (s, _d) = store();
+        let c = s.add_contact(&a_contact()).unwrap();
+        let owing = s.create_thread(c, 0).unwrap();
+        let other = s
+            .add_contact(&NewContact {
+                pseudonym: [7u8; 32],
+                l2_pub: [8u8; 32],
+                name: "Bo".into(),
+                ..a_contact()
+            })
+            .unwrap();
+        let settled = s.create_thread(other, 0).unwrap();
+        let mk = |thread, seq, id: &[u8], direction, state| NewMessage {
+            thread_id: thread,
+            seq,
+            msg_id: id.to_vec(),
+            body: b"x".to_vec(),
+            direction,
+            state,
+            created_at: seq,
+        };
+        // Two queued in one thread: the id must appear once, not twice.
+        s.add_message(&mk(
+            owing,
+            1,
+            b"q1",
+            Direction::Outgoing,
+            MessageState::Queued,
+        ))
+        .unwrap();
+        s.add_message(&mk(
+            owing,
+            2,
+            b"q2",
+            Direction::Outgoing,
+            MessageState::Queued,
+        ))
+        .unwrap();
+        // Away already — nothing owed.
+        s.add_message(&mk(
+            settled,
+            1,
+            b"s1",
+            Direction::Outgoing,
+            MessageState::Sent,
+        ))
+        .unwrap();
+        // Theirs, not ours.
+        s.add_message(&mk(
+            settled,
+            1,
+            b"i1",
+            Direction::Incoming,
+            MessageState::Queued,
+        ))
+        .unwrap();
+
+        let owed = s
+            .threads_in_state(Direction::Outgoing, MessageState::Queued)
+            .unwrap();
+        assert_eq!(owed, vec![owing], "the gate would dial the wrong people");
     }
 
     #[test]

@@ -626,12 +626,33 @@ pub fn send_chat(device_id: String, text: String) -> Result<ChatMessageDto, Stri
     // is promoted to Sent only once the bytes are actually away — a caller
     // that sees Sent can trust it.
     let net = require_net()?;
-    net.send_chat(&device_id, envelope.encode(), std::time::Instant::now())?;
-    with_core(|core| {
-        core.store
-            .set_message_state(&envelope.msg_id, MessageState::Sent)?;
-        Ok(())
-    })?;
+    match net.send_chat(&device_id, envelope.encode(), std::time::Instant::now()) {
+        Ok(()) => {
+            with_core(|core| {
+                core.store
+                    .set_message_state(&envelope.msg_id, MessageState::Sent)?;
+                Ok(())
+            })?;
+        }
+        // Out of range is not a failure to write a message, and saying so was
+        // false: the row is already `Queued` and `resend_queued` delivers it at
+        // the next encounter, which is exactly what R0-F5 promises. Reporting
+        // an error made the app contradict the requirement to the one person
+        // who could see both halves — measured on a Pixel, which showed
+        // "Error: no session with …" over a message sitting safely in the
+        // thread.
+        //
+        // Not swallowed: the row stays `Queued`, which is the whole difference
+        // between this and a send that got away, and the reason goes to the log.
+        Err(net::SendError::NoSession) => {
+            log::info!("holding a message for {device_id} until we meet again");
+        }
+        // Everything else happened *with a session open*, so the reunion path
+        // will not run: nothing is going to reopen a session that never closed,
+        // and the row would wait forever beside a peer who is right there. Held
+        // and reported are opposite answers, and only one of them is true here.
+        Err(why) => return Err(format!("could not send that message: {why}")),
+    }
     Ok(dto)
 }
 
@@ -883,6 +904,110 @@ pub fn mark_sent_for_test(thread_id: i64) -> Result<(), String> {
     })
 }
 
+/// Open a session with sighted devices we are not talking to, when a message is
+/// waiting for one of them.
+///
+/// R0-F5 says queued messages are "delivered at the next direct encounter", and
+/// `resend_queued` does exactly that — on `SessionOpened`, which nothing but a
+/// manual Ping ever produced. So a message queued for someone out of range sat
+/// there while they stood next to you, because no part of the app was curious
+/// enough to ask who had just appeared. The reunion machinery was complete and
+/// unreachable.
+///
+/// Identity is why asking is necessary rather than merely convenient: R0-F2's
+/// transport ids rotate and are unlinkable, so a sighting we cannot name cannot
+/// be matched to the contact a message is waiting for by looking at it. Only a
+/// session says who is there.
+///
+/// # Why "not connected" and not "not named"
+///
+/// This gated on `persona.is_none()` first, which reads like the same question
+/// and is not. Discovery keeps a verified persona after the session that proved
+/// it has gone — `note_persona` outlives `SessionClosed`, which does not even
+/// emit `PeersChanged` — so a peer whose idle session was swept stays named and
+/// was skipped here forever after. That is precisely the person most likely to
+/// be owed something: someone we have talked to before.
+///
+/// Gated on something actually being owed, and on it being owed to *them* where
+/// we can tell. Reaching every sighting on sight would be a handshake nobody
+/// asked for, paid for in radio time, battery (N4) and — on BLE, which has run
+/// out of them before — connection slots. A peer we can name is dialled only if
+/// their thread has something queued; a peer we cannot name might be anyone,
+/// including the one we owe, so they are worth the one dial that answers it.
+///
+/// # What a test covers, and what it does not
+///
+/// That this runs at all is covered: `a_queued_message_goes_out_when_she_appears`
+/// queues a message for someone absent, brings her onto the loopback rung, and
+/// pumps only *her* side — so the session can only form if this device went and
+/// asked. Deleting the call fails it. An earlier note here said no test could,
+/// which was wrong: the engine's own persona fetch opens a pipe but never a
+/// session, so reaching really is the only thing that closes the gap.
+///
+/// The three narrowing mutants survive — dropping the not-connected filter, the
+/// owed gate, or the whose-debt check. Each makes this dial *more* than it needs
+/// to, and every assertion still holds, because nothing observes the cost of a
+/// dial nobody needed. That cost is the reason they are here (radio time, N4
+/// battery, and BLE connection slots, which we have run out of before), so they
+/// are recorded rather than left to look like an oversight.
+///
+/// Two phones checked the whole path first: a message written to a paired peer
+/// who had gone was delivered the moment she came back, with nobody pressing
+/// anything. The Pixel logged `resending 1 queued messages on reunion` and the
+/// Samsung showed the message.
+fn reach_for_queued_messages() {
+    let Ok(net) = require_net() else {
+        return;
+    };
+    // Everyone in sight we are not already talking to. `reach` no-ops on an
+    // open session by itself; asking here is what keeps the store work below
+    // off the path a connected peer takes on every discovery event.
+    let candidates: Vec<(String, Option<[u8; 32]>)> = net
+        .discovery()
+        .sightings()
+        .into_iter()
+        .filter(|s| !net.sessions().is_open(&s.peer))
+        .map(|s| (s.peer, s.persona.map(|p| p.l2_pub.0)))
+        .collect();
+    if candidates.is_empty() {
+        return;
+    }
+    let wanted = with_core(|core| {
+        let owed = core
+            .store
+            .threads_in_state(Direction::Outgoing, MessageState::Queued)?;
+        if owed.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut wanted = Vec::new();
+        for (peer, l2) in candidates {
+            // A named peer we have no contact for is not someone we can rule
+            // out — `paired_contact_by_l2` answers for paired contacts only,
+            // and a message can be queued for a stranger. Unknown means dial.
+            let theirs = match l2 {
+                Some(l2) => match core.store.paired_contact_by_l2(&l2)? {
+                    Some(c) => core
+                        .store
+                        .thread_for_contact(c.id)?
+                        .is_some_and(|thread| owed.contains(&thread)),
+                    None => true,
+                },
+                None => true,
+            };
+            if theirs {
+                wanted.push(peer);
+            }
+        }
+        Ok(wanted)
+    })
+    .unwrap_or_default();
+    for peer in wanted {
+        // Best effort and quiet: a peer that will not answer is the ordinary
+        // case, not an error worth a line each time round the loop.
+        let _ = net.reach(&peer);
+    }
+}
+
 /// Send everything this thread still owes, oldest first.
 ///
 /// # What counts as owed
@@ -966,7 +1091,12 @@ fn resend_queued(device_id: &str) -> Result<(), String> {
         // half way leaves the ones that got away marked `Sent` and the rest
         // still `Queued`, so the next reunion picks up exactly where this
         // stopped rather than starting again.
-        net.send_chat(device_id, envelope.encode(), std::time::Instant::now())?;
+        // Flattened, unlike the first send: this runs because a session just
+        // opened, so there is no out-of-range case left to tell apart — a
+        // refusal here is a refusal. Stopping is right either way, because
+        // order matters and a peer who has dropped will not take the next one.
+        net.send_chat(device_id, envelope.encode(), std::time::Instant::now())
+            .map_err(|why| why.to_string())?;
         with_core(|core| {
             core.store.set_message_state(&msg_id, MessageState::Sent)?;
             Ok(())
@@ -985,6 +1115,7 @@ fn require_net() -> Result<Arc<net::Net>, String> {
 fn on_net_event(net: &Arc<net::Net>, event: net::NetEvent) {
     match event {
         net::NetEvent::PeersChanged => {
+            reach_for_queued_messages();
             if let Ok(devices) = nearby_devices() {
                 emit(CoreEvent::DiscoveryUpdated { devices });
             }
