@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use rust_lib_hoppler::api::discovery::{nearby_devices, set_discovery};
 use rust_lib_hoppler::api::identity::{current_persona, update_persona};
 use rust_lib_hoppler::api::messaging::{
-    list_threads, ping, send_chat, thread_for_device, thread_messages,
+    list_threads, ping, send_chat, send_chat_to_thread, thread_for_device, thread_messages,
 };
 use rust_lib_hoppler::api::pairing::{
     begin_pairing, confirm_pairing, pairing_invite, stop_showing_invite,
@@ -29,7 +29,7 @@ use rust_lib_hoppler::api::types::CoreEvent;
 use rust_lib_hoppler::discovery::Discovery;
 use rust_lib_hoppler::engine::{
     has_session, init_with_transport, mark_sent_for_test, queued_for_resend_for_test,
-    receive_chat_for_test, resend_queued_for_test, thread_rows_for_test,
+    queued_on_thread_for_test, receive_chat_for_test, resend_queued_for_test, thread_rows_for_test,
 };
 use rust_lib_hoppler::identity::Identity;
 use rust_lib_hoppler::pairing::invite::Invite;
@@ -117,16 +117,18 @@ fn discovery_toggle_controls_the_nearby_list() {
     set_discovery(true).unwrap();
     until("an advertising peer to appear", || {
         nearby_devices()
-            .map(|d| d.iter().any(|d| d.device_id == "peer-one"))
+            .map(|d| d.iter().any(|d| d.device_id.as_deref() == Some("peer-one")))
             .unwrap_or(false)
     });
     let devices = nearby_devices().unwrap();
     assert!(
-        devices.iter().any(|d| d.device_id == "peer-one"),
+        devices
+            .iter()
+            .any(|d| d.device_id.as_deref() == Some("peer-one")),
         "an advertising peer was not seen; ids: {:?}",
         devices
             .iter()
-            .map(|d| d.device_id.clone())
+            .map(|d| d.device_id.clone().unwrap_or_default())
             .collect::<Vec<_>>()
     );
 
@@ -147,17 +149,19 @@ fn a_peer_with_no_persona_yet_is_still_listed() {
     set_discovery(true).unwrap();
     until("the sighting to arrive", || {
         nearby_devices()
-            .map(|d| d.iter().any(|d| d.device_id == "nameless"))
+            .map(|d| d.iter().any(|d| d.device_id.as_deref() == Some("nameless")))
             .unwrap_or(false)
     });
     let devices = nearby_devices().unwrap();
-    let seen = devices.iter().find(|d| d.device_id == "nameless");
+    let seen = devices
+        .iter()
+        .find(|d| d.device_id.as_deref() == Some("nameless"));
     assert!(
         seen.is_some(),
         "not listed at all; ids: {:?}",
         devices
             .iter()
-            .map(|d| d.device_id.clone())
+            .map(|d| d.device_id.clone().unwrap_or_default())
             .collect::<Vec<_>>()
     );
     assert_eq!(
@@ -283,7 +287,7 @@ fn one_tap_is_one_dial() {
     set_discovery(true).unwrap();
     until("an advertising peer to appear", || {
         nearby_devices()
-            .map(|d| d.iter().any(|d| d.device_id == "peer-one"))
+            .map(|d| d.iter().any(|d| d.device_id.as_deref() == Some("peer-one")))
             .unwrap_or(false)
     });
 
@@ -986,6 +990,43 @@ fn full_peer(air: &LoopbackNet, id: &str, name: &str) -> FullPeer {
 
 /// Drain whatever the peer's transport has to say. The engine pumps itself on
 /// its own thread; this is the other side's turn.
+/// Run a whole ceremony against `peer` and return the device id it paired.
+///
+/// The steps in order, with no assertions in between — a test that wants to
+/// watch the middle of a ceremony should not use this, and one that only needs
+/// two people paired should not carry fifty lines to say so.
+fn pair_with(peer: &FullPeer) -> String {
+    let invite = Invite::fresh(
+        peer.identity
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .layer2_public(),
+        &peer.id,
+    );
+    peer.net.show_invite(invite.clone());
+    let device_id = begin_pairing(invite.to_uri()).unwrap();
+    // Accumulated across pumps: the event arrives exactly once, so a condition
+    // re-evaluated per poll would have to catch that single pump or wait
+    // forever.
+    let mut seen = Vec::new();
+    until("both sides to reach the colours", || {
+        seen.extend(pump(peer));
+        seen.iter().any(|e| {
+            matches!(
+                e,
+                rust_lib_hoppler::engine::net::NetEvent::PairingSas { .. }
+            )
+        })
+    });
+    confirm_pairing(device_id.clone()).unwrap();
+    peer.net.confirm_pairing("core", Instant::now()).unwrap();
+    until("the pairing to be written down", || {
+        pump(peer);
+        list_threads().unwrap().len() == 1
+    });
+    device_id
+}
+
 fn pump(peer: &FullPeer) -> Vec<rust_lib_hoppler::engine::net::NetEvent> {
     let mut out = Vec::new();
     while let Ok(event) = peer.rx.recv_timeout(Duration::from_millis(30)) {
@@ -1013,7 +1054,7 @@ fn a_confirmed_ceremony_leaves_a_thread_behind() {
         nearby_devices()
             .unwrap()
             .iter()
-            .any(|d| d.device_id == peer.id)
+            .any(|d| d.device_id.as_deref() == Some(peer.id.as_str()))
     });
     assert!(
         list_threads().unwrap().is_empty(),
@@ -1074,7 +1115,7 @@ fn a_confirmed_ceremony_leaves_a_thread_behind() {
         nearby_devices()
             .unwrap()
             .iter()
-            .any(|d| d.device_id == peer.id && d.paired)
+            .any(|d| d.device_id.as_deref() == Some(peer.id.as_str()) && d.paired)
     });
 }
 
@@ -1101,34 +1142,10 @@ fn a_paired_friend_still_reads_as_paired_with_no_session() {
         nearby_devices()
             .unwrap()
             .iter()
-            .any(|d| d.device_id == peer.id)
+            .any(|d| d.device_id.as_deref() == Some(peer.id.as_str()))
     });
 
-    let invite = Invite::fresh(
-        peer.identity
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .layer2_public(),
-        &peer.id,
-    );
-    peer.net.show_invite(invite.clone());
-    let device_id = begin_pairing(invite.to_uri()).unwrap();
-    let mut seen = Vec::new();
-    until("both sides to reach the colours", || {
-        seen.extend(pump(&peer));
-        seen.iter().any(|e| {
-            matches!(
-                e,
-                rust_lib_hoppler::engine::net::NetEvent::PairingSas { .. }
-            )
-        })
-    });
-    confirm_pairing(device_id.clone()).unwrap();
-    peer.net.confirm_pairing("core", Instant::now()).unwrap();
-    until("the pairing to be written down", || {
-        pump(&peer);
-        list_threads().unwrap().len() == 1
-    });
+    let device_id = pair_with(&peer);
 
     // Now lose the session, as walking out of range would. Hanging up at the
     // peer's transport is what reaches the engine — closing the peer's own
@@ -1145,8 +1162,127 @@ fn a_paired_friend_still_reads_as_paired_with_no_session() {
         nearby_devices()
             .unwrap()
             .iter()
-            .any(|d| d.device_id == device_id && d.paired),
+            .any(|d| d.device_id.as_deref() == Some(device_id.as_str()) && d.paired),
         "a paired friend read as unpaired once the session was gone"
+    );
+}
+
+/// A person you paired with does not disappear because the radio stopped
+/// looking.
+///
+/// R0-F2 rotates transport ids and R0-F4 makes pairing durable, so a list built
+/// only from what the radio can see loses a paired friend the moment they stop
+/// advertising — the app forgetting somebody the user deliberately introduced
+/// it to. Discovery off is the sharpest version of the same thing: nothing is
+/// being scanned for at all, and the friend is still on disk.
+///
+/// What the row must *not* carry is a transport handle. An earlier attempt put
+/// a durable pseudonym in that field to keep the row addressable, which made
+/// every transport-routed action on it unroutable — Ping and Drop had nothing
+/// to dial. Absent is the honest answer, and the thread is what stays.
+#[test]
+fn a_paired_friend_stays_on_the_list_with_discovery_off() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = fresh();
+    let peer = full_peer(&h.air, "peer", "Ada");
+    let stranger = advertising_peer(&h.air, "passer-by");
+
+    set_discovery(true).unwrap();
+    peer.net
+        .discovery()
+        .set_enabled(true, Instant::now())
+        .unwrap();
+    peer.net.discovery().start_scanning().unwrap();
+    until("the engine to see the peer", || {
+        pump(&peer);
+        nearby_devices()
+            .unwrap()
+            .iter()
+            .any(|d| d.device_id.as_deref() == Some(peer.id.as_str()))
+    });
+    let _device_id = pair_with(&peer);
+
+    // While she is still in front of us, the row already carries the thread the
+    // away row will be addressed by — same handle, present or absent, so the
+    // UI is not holding two different ideas of the same person.
+    let listed = nearby_devices().unwrap();
+    assert!(
+        listed
+            .iter()
+            .any(|d| d.device_id.as_deref() == Some(peer.id.as_str()) && d.thread_id.is_some()),
+        "a sighted paired row had no conversation to open"
+    );
+    // Once, not twice. She is both a sighting and someone we have paired with,
+    // and the list is built from both — a friend standing in front of you must
+    // not appear a second time as away.
+    assert_eq!(
+        listed.iter().filter(|d| d.name == "Ada").count(),
+        1,
+        "a paired friend in front of us was listed twice"
+    );
+
+    // Somebody we have written to but never paired with. A contact and a thread
+    // exist for them, which is exactly what makes them a good test: the rule is
+    // *paired*, not *known*.
+    send_chat("a-stranger".into(), "hello?".into()).unwrap();
+
+    // The radio stops. Nothing is advertised, nothing is scanned for.
+    set_discovery(false).unwrap();
+    let devices = nearby_devices().unwrap();
+
+    // The stranger goes, because seeing a stranger *is* the radio.
+    assert!(
+        !devices
+            .iter()
+            .any(|d| d.device_id.as_deref() == Some("passer-by")),
+        "a stranger survived Discovery going off: {:?}",
+        devices.iter().map(|d| d.name.clone()).collect::<Vec<_>>()
+    );
+    drop(stranger);
+
+    // And so does someone we merely chatted with: R0-F4 is what makes a row
+    // outlive the radio, and a stranger has not done it. Counted rather than
+    // asked whether every row is paired — an away row sets that flag itself, so
+    // the flag cannot report a row that should not be there at all.
+    assert_eq!(
+        devices.len(),
+        1,
+        "exactly Ada was expected, got {:?}",
+        devices.iter().map(|d| d.name.clone()).collect::<Vec<_>>()
+    );
+
+    let ada = devices
+        .iter()
+        .find(|d| d.name == "Ada")
+        .expect("a paired friend vanished when Discovery went off");
+    assert!(
+        ada.paired,
+        "she was listed but not as someone we paired with"
+    );
+    assert!(
+        ada.device_id.is_none(),
+        "an away row carried a transport handle, which nothing can dial"
+    );
+    let thread = ada
+        .thread_id
+        .expect("no conversation to open on an away row");
+
+    // And the thread still takes what she is told, with no radio at all.
+    let dto = send_chat_to_thread(thread, "back in a bit".into())
+        .expect("writing to an away friend was refused");
+    assert_eq!(dto.text, "back in a bit");
+    assert_eq!(dto.thread_id, thread);
+    let msgs = thread_messages(thread).unwrap();
+    assert_eq!(msgs.len(), 1, "the message was not kept");
+    assert!(msgs[0].outgoing);
+    // Kept, not sent. The session with her may well still be open — turning
+    // Discovery off does not hang up — but F3 says a closed Discovery produces
+    // no traffic, and `ping` has always enforced that. Writing to a thread must
+    // not be the one way round it.
+    assert_eq!(
+        queued_on_thread_for_test(thread).unwrap(),
+        1,
+        "a message went out over the radio with Discovery off"
     );
 }
 
@@ -1208,7 +1344,7 @@ fn a_code_does_not_resolve_to_whoever_happens_to_be_nearby() {
         nearby_devices()
             .unwrap()
             .iter()
-            .any(|d| d.device_id == "peer")
+            .any(|d| d.device_id.as_deref() == Some("peer"))
     });
     ping("peer".into()).unwrap();
     until("the peer's persona to be known", || {
@@ -1216,7 +1352,7 @@ fn a_code_does_not_resolve_to_whoever_happens_to_be_nearby() {
         nearby_devices()
             .unwrap()
             .iter()
-            .any(|d| d.device_id == "peer" && !d.name.is_empty())
+            .any(|d| d.device_id.as_deref() == Some("peer") && !d.name.is_empty())
     });
 
     // Ada is right there with a persona the engine knows. The code is not hers.
@@ -1253,7 +1389,7 @@ fn a_code_whose_hint_has_gone_stale_still_finds_its_device() {
         nearby_devices()
             .unwrap()
             .iter()
-            .any(|d| d.device_id == "peer")
+            .any(|d| d.device_id.as_deref() == Some("peer"))
     });
 
     // A Ping to force the reach, because the persona is fetched by whoever
@@ -1266,7 +1402,7 @@ fn a_code_whose_hint_has_gone_stale_still_finds_its_device() {
         nearby_devices()
             .unwrap()
             .iter()
-            .any(|d| d.device_id == "peer" && !d.name.is_empty())
+            .any(|d| d.device_id.as_deref() == Some("peer") && !d.name.is_empty())
     });
 
     let peers_key = peer

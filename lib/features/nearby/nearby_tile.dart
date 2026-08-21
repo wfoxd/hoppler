@@ -38,6 +38,21 @@ class NearbyTile extends StatelessWidget {
   /// what is actually true and what to do about it.
   bool get isKnown => device.name.isNotEmpty;
 
+  /// Whether the radio can reach them this second.
+  ///
+  /// Derived from the handle rather than a flag beside it: the handle is what
+  /// Ping and Drop are dialled with, so its absence *is* "cannot be reached",
+  /// and there is no second fact to fall out of step with it.
+  bool get isHere => device.deviceId != null;
+
+  /// What a paired friend who is not in range can still be told.
+  ///
+  /// R0-F5 says a message written out of range is kept and delivered at the
+  /// next encounter, so Chat stays live. Ping and Drop do not: a Ping is a
+  /// nudge someone answers now, and a Drop needs both phones present. Offering
+  /// them anyway would mean a tap that quietly does nothing.
+  static const awayHint = 'Ping and Drop need them nearby.';
+
   @override
   Widget build(BuildContext context) {
     return ListTile(
@@ -50,16 +65,30 @@ class NearbyTile extends StatelessWidget {
       ),
       title: Text(isKnown ? device.name : 'Unknown device'),
       subtitle: Text(
-        isKnown ? (device.paired ? 'paired' : 'nearby') : 'Ping to connect',
+        !isHere
+            ? 'away · $awayHint'
+            : isKnown
+            ? (device.paired ? 'paired' : 'nearby')
+            : 'Ping to connect',
       ),
       trailing: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          PingButton(
-            key: ValueKey(device.deviceId),
-            service: pingService,
-            deviceId: device.deviceId,
-          ),
+          if (isHere)
+            PingButton(
+              key: ValueKey(device.deviceId),
+              service: pingService,
+              deviceId: device.deviceId!,
+            )
+          else
+            const IconButton(
+              icon: Icon(Icons.notifications_none),
+              tooltip: awayHint,
+              // Deliberately shown and disabled rather than removed. A row that
+              // loses its buttons when somebody walks away looks broken; one
+              // whose buttons are visibly unavailable says what changed.
+              onPressed: null,
+            ),
           IconButton(
             icon: const Icon(Icons.chat_bubble_outline),
             tooltip: 'Chat',
@@ -69,8 +98,8 @@ class NearbyTile extends StatelessWidget {
           ),
           IconButton(
             icon: const Icon(Icons.upload_file_outlined),
-            tooltip: 'Drop',
-            onPressed: onDrop,
+            tooltip: isHere ? 'Drop' : awayHint,
+            onPressed: isHere ? onDrop : null,
           ),
         ],
       ),

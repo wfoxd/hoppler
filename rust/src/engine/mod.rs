@@ -448,34 +448,71 @@ pub fn set_discovery(enabled: bool) -> Result<(), String> {
 /// reachable, and rule 5's dial-back depends on the record), and hiding them is
 /// a core-layer decision. See the note on `Transport::peers`.
 pub fn nearby_devices() -> Result<Vec<NearbyDevice>, String> {
-    let net = match with_core(|core| Ok(core.net.clone()))? {
-        Some(net) => net,
-        None => return Ok(Vec::new()),
+    // Discovery off means the radio is not looking, so there are no sightings.
+    // It does not mean we have forgotten anybody: the paired rows below come
+    // off the disk and cost no air at all.
+    let sightings = match with_core(|core| Ok(core.net.clone()))? {
+        Some(net) if net.discovery().is_on() => net.discovery().sightings(),
+        _ => Vec::new(),
     };
-    if !net.discovery().is_on() {
-        return Ok(Vec::new());
-    }
-    Ok(net
-        .discovery()
-        .sightings()
-        .into_iter()
-        .map(|s| {
+    with_core(|core| {
+        let mut rows = Vec::new();
+        let mut in_front_of_us = Vec::new();
+        for s in sightings {
+            let contact = contact_for_sighting(core, &s.peer, s.persona.as_ref())?;
+            if let Some(id) = contact {
+                in_front_of_us.push(id);
+            }
+            let known = match contact {
+                Some(id) => core.store.contact_by_id(id)?,
+                None => None,
+            };
+            let paired = match contact {
+                Some(id) => core.store.pairing_for_contact(id)?.is_some(),
+                None => false,
+            };
             // A peer whose persona we have not fetched yet is real and
             // reachable; showing it unnamed beats hiding it until a round trip
-            // completes, which is what "who's nearby" is asking.
-            let (name, colour) = match &s.persona {
-                Some(p) => (p.name.clone(), p.colour),
-                None => (String::new(), 0),
+            // completes, which is what "who's nearby" is asking. Unnamed is not
+            // the same as unknown, though — if we have met them before, their
+            // name is on disk, and drawing a blank row for someone the user
+            // knows is worse than drawing one for a stranger.
+            let (name, colour) = match (&s.persona, &known) {
+                (Some(p), _) => (p.name.clone(), p.colour),
+                (None, Some(c)) => (c.name.clone(), c.colour),
+                (None, None) => (String::new(), 0),
             };
-            let paired = is_paired(&s.peer, s.persona.as_ref());
-            NearbyDevice {
-                device_id: s.peer,
+            rows.push(NearbyDevice {
+                device_id: Some(s.peer),
+                thread_id: match contact {
+                    Some(id) => core.store.thread_for_contact(id)?,
+                    None => None,
+                },
                 name,
                 colour,
                 paired,
+            });
+        }
+        // Everyone we have paired with and cannot see. R0-F4 makes pairing a
+        // durable act, so these rows are the app remembering a person rather
+        // than reporting a radio: no handle to dial, and a thread that still
+        // takes what the user writes.
+        for contact in core.store.list_contacts()? {
+            if in_front_of_us.contains(&contact.id)
+                || core.store.pairing_for_contact(contact.id)?.is_none()
+            {
+                continue;
             }
-        })
-        .collect())
+            rows.push(NearbyDevice {
+                device_id: None,
+                thread_id: core.store.thread_for_contact(contact.id)?,
+                name: contact.name,
+                colour: contact.colour,
+                paired: true,
+            });
+        }
+        Ok(rows)
+    })
 }
 
 // ── sessions / threads ────────────────────────────────────────────────────────
@@ -550,10 +587,38 @@ fn watch_for_an_undelivered_ping(net: Arc<net::Net>) {
 /// event loop (never synchronously during this call). Real transports reply
 /// seconds later; UI must not assume the reply is present when this returns.
 pub fn send_chat(device_id: String, text: String) -> Result<ChatMessageDto, String> {
+    let thread = with_core_mut(|core| ensure_thread(core, &device_id, now_millis()))?;
+    write_then_send(thread, Some(device_id), text)
+}
+
+/// Write to a conversation rather than to a device.
+///
+/// The entry point an away row uses. R0-F4 makes pairing durable and R0-F2
+/// rotates transport ids, so there are stretches — most of the day, for most
+/// people — when someone we have paired with has no id we could name. A device
+/// is not addressable then; the thread still is, and R0-F5 already says what to
+/// do with what they type: keep it, and deliver it when they next meet.
+///
+/// Sends immediately if that thread's peer happens to be in front of us, which
+/// is why this is one function and not two: "write to Wren" should not behave
+/// differently depending on whether the radio can see her this second.
+pub fn send_chat_to_thread(thread_id: i64, text: String) -> Result<ChatMessageDto, String> {
+    let device_id = with_core(|core| device_for_thread(core, thread_id))?;
+    write_then_send(thread_id, device_id, text)
+}
+
+/// The rest of a send, once the conversation is known.
+///
+/// `device_id` is `None` when nothing can carry it right now. That is not a
+/// failure and is not reported as one — see the `NoSession` arm below, which
+/// this is the same decision as, reached earlier.
+fn write_then_send(
+    thread: i64,
+    device_id: Option<String>,
+    text: String,
+) -> Result<ChatMessageDto, String> {
     let (dto, envelope) = with_core_mut(|core| {
         let now = now_millis();
-        let thread = ensure_thread(core, &device_id, now)?;
-
         let seq = core.store.next_seq(thread, Direction::Outgoing)?;
         // The envelope draws the id, so the number the row is stored under and
         // the number that goes on the wire are the same object rather than two
@@ -620,6 +685,16 @@ pub fn send_chat(device_id: String, text: String) -> Result<ChatMessageDto, Stri
 
         Ok((dto, envelope))
     })?;
+
+    // Nobody to hand it to. The row is `Queued`, `reach_for_queued_messages`
+    // will go looking when anyone appears, and `resend_queued` delivers it when
+    // one of them turns out to be her. Deliberately before `require_net`: a
+    // device with Discovery off has no radio to ask and is still perfectly able
+    // to take down what someone typed.
+    let Some(device_id) = device_id else {
+        log::info!("holding a message on thread {thread} until we meet again");
+        return Ok(dto);
+    };
 
     // On the wire only after the row exists, so a failed send leaves the
     // message in the thread rather than losing what the person typed. The row
@@ -884,6 +959,20 @@ pub fn queued_for_resend_for_test(device_id: &str) -> Result<Vec<(u64, String)>,
         .into_iter()
         .map(|(_, e)| (e.seq, hex::encode(e.msg_id)))
         .collect())
+}
+
+/// How many of a thread's outgoing messages are still waiting, for the contract
+/// tests.
+///
+/// `pub` with a note, as [`open_store_for_test`]: the difference between a
+/// message held and a message sent is invisible from the public API — the DTO
+/// carries no state — and it is the whole of what F3 promises about a closed
+/// Discovery.
+pub fn queued_on_thread_for_test(thread_id: i64) -> Result<usize, String> {
+    with_core(|core| {
+        core.store
+            .count_in_state(thread_id, Direction::Outgoing, MessageState::Queued)
+    })
 }
 
 /// Mark every queued message on a thread as sent, for the contract tests.
@@ -1431,24 +1520,51 @@ fn with_core_mut<T>(f: impl FnOnce(&mut Core) -> Result<T, StoreError>) -> Resul
 ///
 /// A read failure reports "not paired": the alternative is propagating a store
 /// error out of a list refresh, and a tile missing a badge beats no list.
-fn is_paired(device_id: &str, sighting: Option<&VerifiedPersona>) -> bool {
-    with_core(|core| {
-        if let Some(contact) = contact_id_for_device(core, device_id)? {
-            if core.store.pairing_for_contact(contact)?.is_some() {
-                return Ok(true);
+/// A transport handle for this thread's peer, if they are in front of us.
+///
+/// Discovery off is `None` rather than a search of remembered sightings: off
+/// means we are neither advertising nor scanning, so a peer id from before is a
+/// guess about the present, and dialling it is exactly the traffic F3 says a
+/// closed Discovery must not produce.
+fn device_for_thread(core: &Core, thread: i64) -> Result<Option<String>, StoreError> {
+    let Some(net) = core.net.as_ref() else {
+        return Ok(None);
+    };
+    if !net.discovery().is_on() {
+        return Ok(None);
+    }
+    for s in net.discovery().sightings() {
+        if let Some(contact) = contact_for_sighting(core, &s.peer, s.persona.as_ref())? {
+            if core.store.thread_for_contact(contact)? == Some(thread) {
+                return Ok(Some(s.peer));
             }
         }
-        // Only consulted when a session has not already answered, so a proved
-        // identity always wins over a claimed one.
-        let Some(persona) = sighting else {
-            return Ok(false);
-        };
-        Ok(core
-            .store
-            .paired_contact_by_l2(&persona.l2_pub.0)?
-            .is_some())
-    })
-    .unwrap_or(false)
+    }
+    Ok(None)
+}
+
+/// Which contact a sighting belongs to, if we have one on file.
+///
+/// Two routes, in this order. A session pseudonym is proved, so it wins; the
+/// persona a sighting carries is only claimed, and is consulted when no session
+/// has answered — which is the ordinary case for someone who has just appeared.
+/// Creates nothing: a stranger stays a stranger, and drawing the nearby list is
+/// not the moment to start writing rows.
+fn contact_for_sighting(
+    core: &Core,
+    device_id: &str,
+    persona: Option<&VerifiedPersona>,
+) -> Result<Option<i64>, StoreError> {
+    if let Some(id) = contact_id_for_device(core, device_id)? {
+        return Ok(Some(id));
+    }
+    let Some(persona) = persona else {
+        return Ok(None);
+    };
+    Ok(core
+        .store
+        .paired_contact_by_l2(&persona.l2_pub.0)?
+        .map(|c| c.id))
 }
 
 /// The peer's durable identity, if a session has authenticated one.
