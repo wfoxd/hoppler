@@ -15,7 +15,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rust_lib_hoppler::discovery::ROTATION_PERIOD;
-use rust_lib_hoppler::engine::net::{Net, NetEvent, CEREMONY_DEADLINE, PING_DEADLINE};
+use rust_lib_hoppler::engine::net::{
+    Net, NetEvent, CEREMONY_CONFIRM_DEADLINE, CEREMONY_DEADLINE, PING_DEADLINE,
+};
 use rust_lib_hoppler::identity::Identity;
 use rust_lib_hoppler::pairing::invite::Invite;
 use rust_lib_hoppler::pairing::sas::Sas;
@@ -1261,6 +1263,18 @@ fn sas_in(events: &[NetEvent]) -> Option<Sas> {
     })
 }
 
+/// How many times a run of events said a ceremony finished.
+///
+/// Counted, not found. `completion_in` below takes the first and stops, so a
+/// second completion for the same ceremony is invisible to it — and two phones
+/// logged exactly that: one ceremony, two `paired with … on thread 1` lines.
+fn completions_in(events: &[NetEvent]) -> usize {
+    events
+        .iter()
+        .filter(|e| matches!(e, NetEvent::PairingCompleted { .. }))
+        .count()
+}
+
 fn completion_in(events: &[NetEvent]) -> Option<([u8; 32], String)> {
     events.iter().find_map(|e| match e {
         NetEvent::PairingCompleted {
@@ -1282,6 +1296,110 @@ fn paired_up(air: &LoopbackNet, now: Instant) -> (Node, Node) {
     alice.net.reach(&bob.id).unwrap();
     settle(&alice, &bob, now);
     (alice, bob)
+}
+
+/// A code on screen answers one person, not the room.
+///
+/// R0-F4 is a ceremony between two people who can see each other's screens, and
+/// the invite is the token for *that* ceremony. If a second peer can answer the
+/// same code while the first is still going, the person showing it runs two
+/// ceremonies, pairs twice and — because the store folds both onto one contact
+/// — sees one thread announced twice with no way to tell which stranger they
+/// just let in.
+///
+/// Two phones logged exactly that: one ceremony, two `paired with … on thread 1`
+/// lines. This is the smallest thing that could produce it.
+#[test]
+fn a_shown_code_answers_one_person_only() {
+    let air = air();
+    let now = Instant::now();
+    let (alice, bob) = paired_up(&air, now);
+
+    // Carol is in the room too, and has a session with Bob like anyone nearby.
+    let carol = node(&air, "carol", "Carol", now);
+    carol.net.discovery().set_enabled(true, now).unwrap();
+    settle(&carol, &bob, now);
+    carol.net.reach(&bob.id).unwrap();
+    settle(&carol, &bob, now);
+
+    let invite = Invite::fresh(
+        bob.identity
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .layer2_public(),
+        &bob.id,
+    );
+    bob.net.show_invite(invite.clone());
+
+    // Both answer the same code. Alice is the one Bob is looking at.
+    alice.net.begin_pairing(&bob.id, &invite, now).unwrap();
+    carol.net.begin_pairing(&bob.id, &invite, now).unwrap();
+    let (_, b_events) = settle(&alice, &bob, now);
+    let (_, b_more) = settle(&carol, &bob, now);
+
+    let sas_shown = b_events
+        .iter()
+        .chain(b_more.iter())
+        .filter(|e| matches!(e, NetEvent::PairingSas { .. }))
+        .count();
+    assert_eq!(
+        sas_shown, 1,
+        "one code put two sets of colours on Bob's screen: he is in two ceremonies at once"
+    );
+}
+
+/// The code is held, not spent.
+///
+/// Refusing a second answerer is only right if the first one's failure gives
+/// the code back. Otherwise a stranger walking past — or one attempt that
+/// times out — leaves a code sitting on screen that can never be used again,
+/// and the person holding the phone has no way to tell: the display looks
+/// exactly the same. "Try it again" is the first thing anyone does.
+#[test]
+fn a_ceremony_that_died_gives_the_code_back() {
+    let air = air();
+    let now = Instant::now();
+    let (alice, bob) = paired_up(&air, now);
+
+    let carol = node(&air, "carol", "Carol", now);
+    carol.net.discovery().set_enabled(true, now).unwrap();
+    settle(&carol, &bob, now);
+    carol.net.reach(&bob.id).unwrap();
+    settle(&carol, &bob, now);
+
+    let invite = Invite::fresh(
+        bob.identity
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .layer2_public(),
+        &bob.id,
+    );
+    bob.net.show_invite(invite.clone());
+
+    // Carol gets there first and then goes nowhere.
+    carol.net.begin_pairing(&bob.id, &invite, now).unwrap();
+    settle(&carol, &bob, now);
+    // Long enough for Bob to give up on her. Her ceremony reached the colours,
+    // so it is the confirm deadline that has to pass, and that outlives the
+    // session idle timeout — Alice is hung up on too, and dials back, which is
+    // what a person retrying actually does.
+    let much_later = now + CEREMONY_CONFIRM_DEADLINE + Duration::from_secs(30);
+    bob.net.tick(much_later);
+    alice.net.reach(&bob.id).unwrap();
+    settle(&alice, &bob, much_later);
+
+    // Alice, who Bob is actually looking at, tries now.
+    alice
+        .net
+        .begin_pairing(&bob.id, &invite, much_later)
+        .unwrap();
+    let (_, b_events) = settle(&alice, &bob, much_later);
+    assert!(
+        b_events
+            .iter()
+            .any(|e| matches!(e, NetEvent::PairingSas { .. })),
+        "the code was dead after one abandoned attempt: {b_events:?}"
+    );
 }
 
 /// Bob shows a code, Alice scans it, both confirm, both end up paired.
@@ -1326,6 +1444,8 @@ fn two_people_show_scan_confirm_and_pair() {
     bob.net.confirm_pairing(&alice.id, now).unwrap();
     let (a_events, b_events) = settle(&alice, &bob, now);
 
+    assert_eq!(completions_in(&a_events), 1, "Alice paired more than once");
+    assert_eq!(completions_in(&b_events), 1, "Bob paired more than once");
     let (alice_learned, bobs_name) = completion_in(&a_events).expect("Alice did not pair");
     let (bob_learned, alices_name) = completion_in(&b_events).expect("Bob did not pair");
     assert_eq!(bobs_name, "Bob");
