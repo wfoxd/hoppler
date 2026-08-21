@@ -362,10 +362,10 @@ const CLOCK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 /// because there is no event to hang them off — the absence of events is the
 /// condition they fire on.
 ///
-/// Holds a [`Weak`] rather than an `Arc`: nothing shuts the engine down today,
-/// but a second `init` replaces the core, and a clock still ticking against the
-/// previous one would rotate ids on a transport no longer in use. Losing the
-/// upgrade is how this thread learns it has been replaced.
+/// Holds a [`std::sync::Weak`] rather than an `Arc`: nothing shuts the engine
+/// down today, but a second `init` replaces the core, and a clock still ticking
+/// against the previous one would rotate ids on a transport no longer in use.
+/// Losing the upgrade is how this thread learns it has been replaced.
 fn spawn_clock(net: &Arc<net::Net>, interval: std::time::Duration) {
     let net = Arc::downgrade(net);
     std::thread::Builder::new()
@@ -1662,7 +1662,7 @@ const DEFAULT_COLOURS: [(&str, u32); 8] = [
     ("slate", 0x006b_7280),
 ];
 
-/// The palette offered on first launch. See [`DEFAULT_COLOURS`].
+/// The palette offered on first launch. See `DEFAULT_COLOURS`.
 pub fn persona_colours() -> Vec<(&'static str, u32)> {
     DEFAULT_COLOURS.to_vec()
 }

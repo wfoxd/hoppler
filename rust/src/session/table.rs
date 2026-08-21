@@ -16,7 +16,7 @@
 //! A session costs keys in memory and a peer that believes it can still reach
 //! us. Ring 0 keeps no ratchet state (tech spec §5: the thread dies with the
 //! session unless pairing upgrades it), so an idle session is pure liability —
-//! there is nothing to resume and nothing lost by rebuilding it. [`Self::sweep`]
+//! there is nothing to resume and nothing lost by rebuilding it. [`SessionTable::sweep`]
 //! drops them on the caller's clock rather than a timer of its own, so a test
 //! can age a session without waiting.
 
