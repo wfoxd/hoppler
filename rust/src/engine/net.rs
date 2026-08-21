@@ -197,6 +197,13 @@ pub const CEREMONY_CONFIRM_DEADLINE: std::time::Duration = std::time::Duration::
 struct InFlight {
     ceremony: Ceremony,
     deadline: Instant,
+    /// True when this ceremony was started by answering the code on our screen,
+    /// rather than by reading someone else's.
+    ///
+    /// The code answers one person at a time, and this is how the second
+    /// answerer is recognised — the ceremony map is keyed by peer, so two
+    /// people answering the same code are two perfectly valid-looking entries.
+    answering_our_code: bool,
 }
 
 /// Everything the engine needs a network for.
@@ -438,6 +445,8 @@ impl Net {
                 InFlight {
                     ceremony,
                     deadline: now + CEREMONY_DEADLINE,
+                    // We read their code; ours is not what is being answered.
+                    answering_our_code: false,
                 },
             );
             opening
@@ -608,6 +617,9 @@ impl Net {
             // Identity first, then ceremonies — see the note on `ceremonies`.
             let identity = self.identity.lock().unwrap_or_else(|e| e.into_inner());
             let mut ceremonies = self.ceremonies.lock().unwrap_or_else(|e| e.into_inner());
+            // Asked before the entry is taken, because it is a question about
+            // the *other* entries and the borrow below rules them out.
+            let code_already_answered = ceremonies.values().any(|f| f.answering_our_code);
             let in_flight = match ceremonies.entry(peer.to_string()) {
                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                 std::collections::hash_map::Entry::Vacant(slot) => {
@@ -623,10 +635,33 @@ impl Net {
                         log::info!("ignoring a ceremony message from {peer}: no code on screen");
                         return Vec::new();
                     };
+                    // A code on screen is the token for *one* ceremony, and
+                    // R0-F4 is between two people who can see each other. Left
+                    // open, a second answerer got a second ceremony: two sets
+                    // of colours on one screen, two completions, and — since
+                    // the store folds both onto one contact — one thread
+                    // announced twice with no way to tell which stranger had
+                    // just been let in. Two phones logged exactly that.
+                    //
+                    // Refused while the first is still going, not spent for
+                    // good: a ceremony that fails or times out releases the
+                    // code, so the ordinary "it did not work, try again" with
+                    // the code still on screen keeps working.
+                    //
+                    // Silent, like the no-code case above and for the same
+                    // reason — the person here is already pairing with someone,
+                    // and a stranger's failed attempt is not their news.
+                    if code_already_answered {
+                        log::info!(
+                            "ignoring a ceremony message from {peer}: already answering someone"
+                        );
+                        return Vec::new();
+                    }
                     match Ceremony::show(&identity, &invite) {
                         Ok(ceremony) => slot.insert(InFlight {
                             ceremony,
                             deadline: now + CEREMONY_DEADLINE,
+                            answering_our_code: true,
                         }),
                         Err(why) => {
                             log::warn!("could not answer {peer}'s ceremony: {why}");
