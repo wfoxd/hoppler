@@ -66,6 +66,35 @@ pub const PING_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10
 /// (N4) paid by every rung to help one.
 const QUIET_BEFORE_ASKING: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Why a frame did not go out.
+///
+/// Two cases that a `String` ran together, to everyone's cost. "No session
+/// yet" is the ordinary state of a peer who is out of range or has simply gone
+/// quiet, and the caller's right answer is to leave the message queued and say
+/// nothing. Every other refusal — a frame too long to encode, a session that
+/// will not seal, a transport that would not take the bytes — happens *with a
+/// session open*, so nothing is going to reopen one and retry: the message
+/// waits forever while its recipient sits there connected.
+///
+/// Telling them apart is the caller's whole decision, and a matched variant is
+/// the only way to make it that does not turn on the wording of a message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SendError {
+    /// No session with that peer yet. Not a failure — nothing to report.
+    NoSession,
+    /// The session or the transport refused the frame. A real failure.
+    Refused(String),
+}
+
+impl std::fmt::Display for SendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoSession => write!(f, "no session with that peer yet"),
+            Self::Refused(why) => write!(f, "{why}"),
+        }
+    }
+}
+
 /// Something the engine should act on: store a row, emit to Dart, update the UI.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NetEvent {
@@ -304,7 +333,9 @@ impl Net {
     /// only proof of delivery.
     pub fn ping(&self, peer: &str, now: Instant) -> Result<(), String> {
         if self.sessions.is_open(peer) {
-            return self.send_frame(peer, FrameKind::Ping, Vec::new(), now);
+            return self
+                .send_frame(peer, FrameKind::Ping, Vec::new(), now)
+                .map_err(|e| e.to_string());
         }
         self.pending_pings
             .lock()
@@ -556,7 +587,9 @@ impl Net {
     /// Put one ceremony message on the wire, or queue it and reach.
     fn send_ceremony(&self, peer: &str, message: Vec<u8>, now: Instant) -> Result<(), String> {
         if self.sessions.is_open(peer) {
-            return self.send_frame(peer, FrameKind::Ceremony, message, now);
+            return self
+                .send_frame(peer, FrameKind::Ceremony, message, now)
+                .map_err(|e| e.to_string());
         }
         self.pending_ceremony
             .lock()
@@ -702,7 +735,7 @@ impl Net {
     /// Takes bytes rather than text so the numbering stays where it is decided.
     /// A `&str` here would mean this layer inventing a `seq`, which is the
     /// sender's business and has to survive a restart.
-    pub fn send_chat(&self, peer: &str, envelope: Vec<u8>, now: Instant) -> Result<(), String> {
+    pub fn send_chat(&self, peer: &str, envelope: Vec<u8>, now: Instant) -> Result<(), SendError> {
         self.send_frame(peer, FrameKind::Chat, envelope, now)
     }
 
@@ -796,17 +829,17 @@ impl Net {
         kind: FrameKind,
         payload: Vec<u8>,
         now: Instant,
-    ) -> Result<(), String> {
+    ) -> Result<(), SendError> {
         if !self.sessions.is_open(peer) {
-            return Err(format!("no session with {peer} yet"));
+            return Err(SendError::NoSession);
         }
-        let frame = Frame::new(kind, payload).map_err(|e| e.to_string())?;
+        let frame = Frame::new(kind, payload).map_err(|e| SendError::Refused(e.to_string()))?;
         let sealed = self
             .sessions
             .seal(peer, &frame, now)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| SendError::Refused(e.to_string()))?;
         self.send_on(peer, CHANNEL_SESSION, &sealed)
-            .map_err(|e| e.to_string())
+            .map_err(|e| SendError::Refused(e.to_string()))
     }
 
     fn send_on(&self, peer: &str, channel: u8, payload: &[u8]) -> Result<(), TransportError> {

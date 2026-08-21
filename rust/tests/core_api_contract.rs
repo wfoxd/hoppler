@@ -647,6 +647,146 @@ fn offer_drop_returns_a_transfer_id() {
     assert!(id.starts_with("xfer-"), "unexpected id {id}");
 }
 
+/// A transport that can be told to stop accepting bytes, with the pipes it has
+/// already opened left alone.
+///
+/// Refusing from the start would only fail the handshake, and the handshake is
+/// not what is under test — a session that exists and then will not carry a
+/// frame is.
+struct RefusesSends {
+    inner: Arc<dyn Transport>,
+    refusing: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Transport for RefusesSends {
+    fn send(&self, peer: &str, bytes: &[u8]) -> Result<(), TransportError> {
+        if self.refusing.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(TransportError::Io("the radio would not take it".into()));
+        }
+        self.inner.send(peer, bytes)
+    }
+
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+    fn limits(&self) -> rust_lib_hoppler::transport::TransportLimits {
+        self.inner.limits()
+    }
+    fn is_available(&self) -> bool {
+        self.inner.is_available()
+    }
+    fn set_local_id(&self, id: &str) -> Result<(), TransportError> {
+        self.inner.set_local_id(id)
+    }
+    fn start_advertising(&self, payload: Vec<u8>) -> Result<(), TransportError> {
+        self.inner.start_advertising(payload)
+    }
+    fn stop_advertising(&self) -> Result<(), TransportError> {
+        self.inner.stop_advertising()
+    }
+    fn start_scanning(&self) -> Result<(), TransportError> {
+        self.inner.start_scanning()
+    }
+    fn stop_scanning(&self) -> Result<(), TransportError> {
+        self.inner.stop_scanning()
+    }
+    fn connect(&self, peer: &str) -> Result<(), TransportError> {
+        self.inner.connect(peer)
+    }
+    fn disconnect(&self, peer: &str) -> Result<(), TransportError> {
+        self.inner.disconnect(peer)
+    }
+    fn peers(&self) -> Vec<rust_lib_hoppler::transport::PeerId> {
+        self.inner.peers()
+    }
+    fn pipes(&self) -> Vec<rust_lib_hoppler::transport::PeerId> {
+        self.inner.pipes()
+    }
+    fn shutdown(&self) {
+        self.inner.shutdown()
+    }
+}
+
+/// The other half of "out of range is not an error".
+///
+/// Holding a message quietly is right for a peer we have no session with, and
+/// wrong for every other refusal — those happen *with a session open*, so no
+/// reunion is coming to retry them: nothing reopens a session that never
+/// closed. Reported as sent, the row would wait forever beside a recipient who
+/// is standing right there.
+///
+/// The two cases were one `String` before this, and the arm that held the first
+/// held the second with it. This is the test that tells them apart.
+#[test]
+fn a_send_the_transport_refuses_is_reported_rather_than_held() {
+    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+    let dir = tempfile::tempdir().unwrap();
+    let air = LoopbackNet::new();
+    let (tx, rx) = channel();
+    let tx = Mutex::new(tx);
+    let sink: Box<dyn Fn(TransportEvent) + Send + Sync> = Box::new(move |e| {
+        let _ = tx.lock().unwrap_or_else(|p| p.into_inner()).send(e);
+    });
+    let refusing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let transport: Arc<dyn Transport> = Arc::new(RefusesSends {
+        inner: Arc::new(air.join("core", sink)),
+        refusing: Arc::clone(&refusing),
+    });
+    init_with_transport(
+        dir.path().to_str().unwrap().to_string(),
+        transport,
+        "core",
+        rx,
+    )
+    .unwrap();
+    set_discovery(true).unwrap();
+
+    let identity = Arc::new(Mutex::new(Identity::generate("Wanda", 0x00_88_ff)));
+    let peer = session_peer(&air, "wanda", identity);
+    until_session(&peer);
+
+    refusing.store(true, std::sync::atomic::Ordering::SeqCst);
+    let why = match send_chat("wanda".into(), "are you there?".into()) {
+        Ok(_) => panic!("a refused send was reported as success"),
+        Err(why) => why,
+    };
+    assert!(
+        why.contains("could not send"),
+        "the person was not told the send failed: {why}"
+    );
+
+    // Still on the queue, because the row is the only copy of what they typed.
+    // Reported *and* kept is the whole answer; either alone is a bug.
+    let owed = queued_for_resend_for_test("wanda").unwrap();
+    assert_eq!(owed.len(), 1, "a refused message was dropped");
+}
+
+/// R0-F5 end to end, with nobody tapping anything.
+#[test]
+fn a_queued_message_goes_out_when_she_appears() {
+    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = fresh();
+    set_discovery(true).unwrap();
+
+    send_chat("wanda".into(), "hey".into()).expect("queueing refused");
+    assert_eq!(queued_for_resend_for_test("wanda").unwrap().len(), 1);
+
+    let identity = Arc::new(Mutex::new(Identity::generate("Wanda", 0x00_88_ff)));
+    let peer = session_peer(&h.air, "wanda", identity);
+    // Deliberately not `until_session`: that dials from her side, and the whole
+    // question is whether *this* device goes and asks who has just appeared.
+    until("the queued message to go out on its own", || {
+        let now = Instant::now();
+        while let Ok(e) = peer.rx.recv_timeout(Duration::from_millis(20)) {
+            peer.net.handle(e, now);
+        }
+        queued_for_resend_for_test("wanda")
+            .map(|q| q.is_empty())
+            .unwrap_or(false)
+    });
+}
+
 // ── contact identity across a rotation ────────────────────────────────────────
 
 struct SessionPeer {
