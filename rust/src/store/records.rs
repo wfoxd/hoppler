@@ -908,6 +908,40 @@ impl Store {
         Ok(outcome)
     }
 
+    /// Write an outgoing message and the ratchet that sealed it, together.
+    ///
+    /// The send-side twin of [`Store::commit_received`], and it exists for a
+    /// sharper reason than symmetry. `nonce_for` derives the AEAD nonce from
+    /// the message number alone, so the counter must never go backwards: if a
+    /// message is sealed and the advanced state is not durable before the bytes
+    /// leave, a restart rewinds the counter and the next message reuses a key
+    /// *and* a nonce on different plaintext. That is not a degraded ratchet, it
+    /// is a broken AEAD — the two plaintexts XOR out and the tag stops meaning
+    /// anything.
+    ///
+    /// So the caller's order is fixed and this is the middle of it: seal,
+    /// commit, *then* send. Crashing before the commit loses the message, which
+    /// is recoverable — the row is not there and nobody was told it was. Any
+    /// other order risks the key.
+    pub fn commit_sent(
+        &self,
+        ratchet: Option<&[u8]>,
+        message: &NewMessage,
+        now: i64,
+    ) -> Result<InsertOutcome, StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        // State first, message last — the same order as `commit_received`, and
+        // for the same reason: written the other way round, a failing message
+        // insert leaves nothing to roll back and the transaction stops being
+        // load-bearing.
+        if let Some(ratchet) = ratchet {
+            self.write_ratchet(message.thread_id, ratchet, now)?;
+        }
+        let outcome = self.add_message(message)?;
+        tx.commit()?;
+        Ok(outcome)
+    }
+
     /// Save a thread's ratchet on its own — the pairing case, where there is a
     /// ratchet before there is any message to go with it.
     ///

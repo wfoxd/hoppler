@@ -127,6 +127,13 @@ pub enum NetEvent {
         peer: PeerId,
         envelope: crate::session::chat::ChatEnvelope,
     },
+    /// A peer opened its end of a paired thread's ratchet chain
+    /// ([`FrameKind::Opening`]).
+    ///
+    /// Carries the sealed bytes and nothing else. There is no envelope to
+    /// decode because there is nothing in it to number: this says only "here is
+    /// a message key you can step to", and what it opens to is discarded.
+    ChainOpening { peer: PeerId, body: Vec<u8> },
     /// A queued Ping was dropped because the pipe never opened.
     PingUndeliverable { peer: PeerId, why: String },
     /// The radio became usable or unusable, and why.
@@ -830,6 +837,23 @@ impl Net {
         Ok(ratchet.to_state())
     }
 
+    /// This device's Layer-1 public key.
+    ///
+    /// Public so the contract tests can work out which side of a pairing the
+    /// ceremony will make the initiator — `speaks_first` decides it by
+    /// comparing these, and a test that cannot compute the answer can only
+    /// cover one of the two arrangements at random.
+    ///
+    /// A public key, and one that goes on the wire inside every ceremony this
+    /// device runs, so nothing is disclosed by having it here that pairing does
+    /// not already disclose to the person being paired with.
+    pub fn layer1_public(&self) -> sign::PublicKey {
+        self.identity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .layer1_public()
+    }
+
     /// Take the ratchet a just-completed pairing left, if there is one.
     ///
     /// Taken rather than read: it belongs in the store from here on, and a copy
@@ -863,6 +887,15 @@ impl Net {
     /// sender's business and has to survive a restart.
     pub fn send_chat(&self, peer: &str, envelope: Vec<u8>, now: Instant) -> Result<(), SendError> {
         self.send_frame(peer, FrameKind::Chat, envelope, now)
+    }
+
+    /// Send the frame that opens a paired thread's other end.
+    ///
+    /// `body` is a ratchet header followed by a sealed empty plaintext — the
+    /// engine's business, since the ratchet lives in the store. This layer only
+    /// knows it is not a chat line and must not arrive as one.
+    pub fn send_opening(&self, peer: &str, body: Vec<u8>, now: Instant) -> Result<(), SendError> {
+        self.send_frame(peer, FrameKind::Opening, body, now)
     }
 
     /// One turn of the engine's clock: drop sessions that have gone quiet, then
@@ -1405,6 +1438,10 @@ impl Net {
                         Err(e) => log::warn!("dropping an unreadable chat frame: {e}"),
                     }
                 }
+                FrameKind::Opening => out.push(NetEvent::ChainOpening {
+                    peer: peer.to_string(),
+                    body: frame.payload.clone(),
+                }),
                 FrameKind::Ceremony => {
                     out.extend(self.on_ceremony_frame(peer, &frame.payload, now))
                 }

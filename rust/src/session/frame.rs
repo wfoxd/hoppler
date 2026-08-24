@@ -54,6 +54,21 @@ pub enum FrameKind {
     /// sweeps and the T08 contract already built, instead of a parallel
     /// lifecycle that would need all of them again.
     Ceremony = 5,
+    /// R0-F5. The first turn of a paired thread's ratchet, carrying nothing.
+    ///
+    /// A `Ratchet::responder` has no sending chain until it has received
+    /// something, so the side the ceremony names as responder pairs and then
+    /// cannot write until the other person does. The initiator sends one of
+    /// these the moment pairing completes, which turns that ratchet and opens
+    /// both chains.
+    ///
+    /// Its own kind rather than a [`FrameKind::Chat`] with an empty body,
+    /// because "do not store this, do not show this" then has to be a rule the
+    /// receiver remembers on a path where every other message *is* stored. Here
+    /// the receiver has no route to the message table at all: the payload is a
+    /// ratchet header and a sealed empty body, with no `seq` and no `msg_id` to
+    /// write a row with.
+    Opening = 6,
 }
 
 impl FrameKind {
@@ -64,6 +79,7 @@ impl FrameKind {
             3 => Some(FrameKind::DropControl),
             4 => Some(FrameKind::Pong),
             5 => Some(FrameKind::Ceremony),
+            6 => Some(FrameKind::Opening),
             _ => None,
         }
     }

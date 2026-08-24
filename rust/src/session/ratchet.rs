@@ -138,6 +138,13 @@ impl From<CryptoError> for RatchetError {
 /// authenticated because it is the AEAD's associated data — a header altered in
 /// flight makes the tag fail rather than silently re-routing the message to
 /// another chain.
+/// Bytes a header occupies on the wire.
+///
+/// Named because a third place now needs it: the engine splits an incoming body
+/// into header and ciphertext, and a `40` written out there would be a copy of
+/// this type's layout kept somewhere the type cannot see.
+pub const HEADER_LEN: usize = 40;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Header {
     /// The sender's current ratchet public key.
@@ -154,7 +161,7 @@ pub struct Header {
 impl Header {
     /// The bytes the AEAD authenticates. Fixed width, so nothing about the
     /// framing can be moved between fields.
-    pub fn to_bytes(self) -> [u8; 40] {
+    pub fn to_bytes(self) -> [u8; HEADER_LEN] {
         let mut out = [0u8; 40];
         out[..32].copy_from_slice(&self.dh.0);
         out[32..36].copy_from_slice(&self.previous_chain_len.to_be_bytes());
@@ -162,7 +169,7 @@ impl Header {
         out
     }
 
-    pub fn from_bytes(bytes: &[u8; 40]) -> Self {
+    pub fn from_bytes(bytes: &[u8; HEADER_LEN]) -> Self {
         let mut dh = [0u8; 32];
         dh.copy_from_slice(&bytes[..32]);
         Self {
@@ -257,6 +264,40 @@ impl Ratchet {
     /// side to start with.
     pub fn public(&self) -> dh::DhPublic {
         self.ours.public()
+    }
+
+    /// Whether this end has a sending chain yet.
+    ///
+    /// False on a fresh [`Ratchet::responder`] and true from then on: the first
+    /// message it opens turns the ratchet, and a turn always produces both
+    /// chains. So this is the question "can I write on this thread", and asking
+    /// it is how the engine decides which side owes the other an opening — see
+    /// [`FrameKind::Opening`](crate::session::frame::FrameKind::Opening).
+    ///
+    /// A method rather than letting the caller find out by trying, because
+    /// [`Ratchet::encrypt`] answers with [`RatchetError::Undecryptable`] — the
+    /// deliberately uninformative variant — and "message could not be
+    /// decrypted" is the wrong sentence for "you have not been spoken to yet".
+    pub fn can_send(&self) -> bool {
+        self.sending.is_some()
+    }
+
+    /// Whether this end owes the other one an opening — the whole rule, in the
+    /// one place that can see both halves of it.
+    ///
+    /// Yes when we can write and they never have. The second half is what stops
+    /// it: a peer who has spoken turned our ratchet to do it, which means their
+    /// own turned when they were spoken to, which means they have a sending
+    /// chain. So having heard from someone is proof they are not stuck, and it
+    /// is the only proof available — nothing on the wire reports the far side's
+    /// chains.
+    ///
+    /// A method rather than two calls at the call site, because the engine
+    /// offers openings from two places (a completed pairing and a reunion) and
+    /// a condition written out twice is a condition that can come to disagree
+    /// with itself.
+    pub fn owes_an_opening(&self) -> bool {
+        self.sending.is_some() && self.receiving.is_none()
     }
 
     /// Encrypt one message.
@@ -807,6 +848,65 @@ mod tests {
 
     fn recv(to: &mut Ratchet, message: (Header, Vec<u8>)) -> String {
         String::from_utf8(to.decrypt(message.0, &message.1).unwrap().to_vec()).unwrap()
+    }
+
+    /// A responder cannot write until it has been written to, and an empty
+    /// message is enough to fix that.
+    ///
+    /// The reason
+    /// [`FrameKind::Opening`](crate::session::frame::FrameKind::Opening)
+    /// exists. Both ends of a pairing are seeded in the same ceremony, but only
+    /// the initiator takes a DH step up front, so the responder has no sending
+    /// chain — pair, type, and nothing can leave. What opens it is *receiving*,
+    /// not receiving anything in particular: a turn always produces both
+    /// chains, so a sealed empty body does the whole job.
+    #[test]
+    fn a_responder_can_write_only_once_it_has_been_written_to() {
+        let (mut alice, mut bob) = pair();
+        assert!(alice.can_send(), "an initiator can speak first");
+        assert!(!bob.can_send(), "a responder has nothing to speak on yet");
+        assert!(bob.encrypt(b"hello?").is_err());
+
+        // Empty, and it still turns the ratchet.
+        let opening = alice.encrypt(&[]).unwrap();
+        assert!(bob.decrypt(opening.0, &opening.1).unwrap().is_empty());
+
+        assert!(
+            bob.can_send(),
+            "one message opened both of the responder's chains"
+        );
+        assert_eq!(recv(&mut alice, send(&mut bob, "hello?")), "hello?");
+    }
+
+    /// Exactly one side of a fresh pairing owes an opening, and it stops owing
+    /// one the moment the other side speaks.
+    ///
+    /// Both halves of the condition matter and each fails differently. Drop
+    /// "can write" and a responder tries to send an opening it has no chain
+    /// for. Drop "never heard from them" and every reunion on every settled
+    /// conversation carries a message key nobody needed — for as long as the
+    /// two people keep meeting.
+    #[test]
+    fn only_the_side_that_can_write_first_owes_an_opening() {
+        let (mut alice, mut bob) = pair();
+        assert!(alice.owes_an_opening(), "the initiator owes the first word");
+        assert!(
+            !bob.owes_an_opening(),
+            "a responder has nothing to send it on"
+        );
+
+        recv(&mut bob, send(&mut alice, "morning"));
+        assert!(
+            !bob.owes_an_opening(),
+            "bob can write and alice already has"
+        );
+        assert!(
+            alice.owes_an_opening(),
+            "nothing has come back, so alice cannot know bob is unstuck"
+        );
+
+        recv(&mut alice, send(&mut bob, "morning yourself"));
+        assert!(!alice.owes_an_opening(), "bob spoke, so bob is not stuck");
     }
 
     #[test]

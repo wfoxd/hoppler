@@ -43,7 +43,10 @@ use crate::identity::keystore::Keystore;
 use crate::identity::{Identity, Persona, VerifiedPersona};
 use crate::identity::{COLOUR_MASK, MAX_PERSONA_NAME_LEN};
 use crate::pairing::invite::Invite;
+use zeroize::Zeroizing;
+
 use crate::session::chat::{ChatEnvelope, Delivery, Inbox, Outbox, MAX_UNACKED, MSG_ID_LEN};
+use crate::session::ratchet::{self, Ratchet};
 use crate::store::{
     Direction, InboxPosition, InsertOutcome, MessageState, NewContact, NewMessage, NewTransfer,
     Store, StoreError, TransferState,
@@ -617,7 +620,7 @@ fn write_then_send(
     device_id: Option<String>,
     text: String,
 ) -> Result<ChatMessageDto, String> {
-    let (dto, envelope) = with_core_mut(|core| {
+    let (dto, envelope, held) = with_core_mut(|core| {
         let now = now_millis();
         let seq = core.store.next_seq(thread, Direction::Outgoing)?;
         // The envelope draws the id, so the number the row is stored under and
@@ -654,8 +657,21 @@ fn write_then_send(
         // the peer picks that number, and is tested.
         let seq_out = u64::try_from(seq)
             .map_err(|_| StoreError::Db(format!("thread {thread} has a negative seq {seq}")))?;
-        let envelope = ChatEnvelope::new(seq_out, text.clone().into_bytes())
-            .map_err(|e| StoreError::Db(e.to_string()))?;
+        // Sealed before the row is written, because the row is what makes the
+        // advanced ratchet durable. See `commit_sent`: the counter must never
+        // go backwards, and the only ordering that guarantees it is seal,
+        // commit, send.
+        let sealed = seal_for_thread(core, thread, text.as_bytes())?;
+        let held = matches!(sealed, Outgoing::NoChainYet);
+        let (wire_body, advanced) = match sealed {
+            Outgoing::Ready { body, ratchet } => (body, ratchet),
+            // No body, because none can be built and none is going anywhere.
+            // The envelope below is here for the id it draws, and this one is
+            // never encoded — the send is skipped entirely.
+            Outgoing::NoChainYet => (Vec::new(), None),
+        };
+        let envelope =
+            ChatEnvelope::new(seq_out, wire_body).map_err(|e| StoreError::Db(e.to_string()))?;
         // Everything below reads the envelope. There is deliberately no second
         // copy of the id: the row, the value handed back to the caller and the
         // bytes on the wire are three uses of one value rather than three
@@ -663,18 +679,26 @@ fn write_then_send(
         // each other from here — the engine is a singleton, so no test can
         // stand up a second one to watch the wire — so the guarantee has to be
         // that there is nothing to diverge.
-        core.store.add_message(&NewMessage {
-            thread_id: thread,
-            seq,
-            msg_id: envelope.msg_id.to_vec(),
-            body: text.clone().into_bytes(),
-            direction: Direction::Outgoing,
-            // Queued, not Sent: nothing has left the device yet. Writing
-            // Sent here and hoping would make the row lie whenever the send
-            // fails, and a resend queue would have no way to find it.
-            state: MessageState::Queued,
-            created_at: now,
-        })?;
+        // The row keeps the *plaintext*: it is what the screen draws, and the
+        // store is already encrypted at rest. The ciphertext is not kept —
+        // a resend seals again, which costs a message key and saves a second
+        // copy of every conversation.
+        core.store.commit_sent(
+            advanced.as_ref().map(|s| s.as_slice()),
+            &NewMessage {
+                thread_id: thread,
+                seq,
+                msg_id: envelope.msg_id.to_vec(),
+                body: text.clone().into_bytes(),
+                direction: Direction::Outgoing,
+                // Queued, not Sent: nothing has left the device yet. Writing
+                // Sent here and hoping would make the row lie whenever the send
+                // fails, and a resend queue would have no way to find it.
+                state: MessageState::Queued,
+                created_at: now,
+            },
+            now,
+        )?;
         let dto = ChatMessageDto {
             msg_id: hex::encode(envelope.msg_id),
             thread_id: thread,
@@ -683,8 +707,17 @@ fn write_then_send(
             created_at: now,
         };
 
-        Ok((dto, envelope))
+        Ok((dto, envelope, held))
     })?;
+
+    // Written down, and staying put. The other end of this thread has never
+    // written to us, so this device has no chain to seal with yet — a window
+    // that lasts from pairing until their opening arrives, and one somebody can
+    // type into. `take_an_opening` sends the backlog the moment it closes.
+    if held {
+        log::info!("holding a message on thread {thread} until its other end opens");
+        return Ok(dto);
+    }
 
     // Nobody to hand it to. The row is `Queued`, `reach_for_queued_messages`
     // will go looking when anyone appears, and `resend_queued` delivers it when
@@ -973,7 +1006,7 @@ pub fn queued_for_resend_for_test(device_id: &str) -> Result<Vec<(u64, String)>,
     let owed = with_core(|core| queued_for_resend(core, device_id))?;
     Ok(owed
         .into_iter()
-        .map(|(_, e)| (e.seq, hex::encode(e.msg_id)))
+        .map(|(_, _, e)| (e.seq, hex::encode(e.msg_id)))
         .collect())
 }
 
@@ -1000,6 +1033,59 @@ pub fn queued_on_thread_for_test(thread_id: i64) -> Result<usize, String> {
 /// from a CI log. Review caught exactly that on the roots in #79.
 pub fn ratchet_size_for_test(thread_id: i64) -> Result<Option<usize>, String> {
     with_core(|core| Ok(core.store.ratchet_state(thread_id)?.map(|s| s.len())))
+}
+
+/// A hash of a thread's ratchet state, for the contract tests.
+///
+/// A fingerprint rather than the state: a test needs to know the ratchet
+/// *moved*, and comparing hashes answers that without a helper that hands key
+/// material to an assertion. Same reason [`ratchet_size_for_test`] returns a
+/// length — and size alone cannot see a turn, since the state keeps its shape.
+pub fn ratchet_fingerprint_for_test(thread_id: i64) -> Result<Option<[u8; 32]>, String> {
+    with_core(|core| {
+        Ok(core
+            .store
+            .ratchet_state(thread_id)?
+            .map(|s| crate::crypto::hash::hash(&s)))
+    })
+}
+
+/// This device's Layer-1 public key, for the contract tests.
+///
+/// Which of two paired devices takes the ratchet's initiator role is settled by
+/// comparing these — see `net::speaks_first` — and the keys are generated fresh
+/// per run, so a test that cannot compute the answer covers one of the two
+/// arrangements at random and calls it coverage. With this, a test can pick a
+/// peer identity that puts this device on the side it means to exercise.
+///
+/// `pub` with the same note as [`open_store_for_test`]: it is only reachable
+/// from `tests/`, and it hands back a public key that every ceremony this
+/// device runs already puts on the wire.
+pub fn layer1_public_for_test() -> Result<[u8; 32], String> {
+    Ok(require_net()?.layer1_public().0)
+}
+
+/// Whether a thread's ratchet has a sending chain, for the contract tests.
+///
+/// The one thing a fingerprint cannot say. Which of the two roles a ceremony
+/// hands this device is decided by comparing Layer-1 keys, which are freshly
+/// generated per run — so a test that only works when this end happens to be
+/// the initiator passes half the time, and that is how
+/// `writing_on_a_paired_thread_turns_the_ratchet` behaved before there was an
+/// opening frame. Asking directly is what makes both roles reachable.
+///
+/// A boolean, so nothing about the chain itself leaves the engine.
+pub fn ratchet_can_send_for_test(thread_id: i64) -> Result<Option<bool>, String> {
+    with_core(|core| {
+        core.store
+            .ratchet_state(thread_id)?
+            .map(|s| {
+                crate::session::ratchet::Ratchet::from_state(&s)
+                    .map(|r| r.can_send())
+                    .map_err(|e| StoreError::Db(format!("ratchet: {e}")))
+            })
+            .transpose()
+    })
 }
 
 /// Mark every queued message on a thread as sent, for the contract tests.
@@ -1149,7 +1235,7 @@ fn reach_for_queued_messages() {
 fn queued_for_resend(
     core: &Core,
     device_id: &str,
-) -> Result<Vec<(Vec<u8>, ChatEnvelope)>, StoreError> {
+) -> Result<Vec<(Vec<u8>, i64, ChatEnvelope)>, StoreError> {
     let Some(contact) = contact_id_for_device(core, device_id)? else {
         return Ok(Vec::new());
     };
@@ -1184,9 +1270,13 @@ fn queued_for_resend(
             let msg_id: [u8; MSG_ID_LEN] = m.msg_id.clone().try_into().ok()?;
             Some((
                 m.msg_id.clone(),
+                thread,
                 ChatEnvelope {
                     seq,
                     msg_id,
+                    // Plaintext, as stored. The resend seals it — see
+                    // `resend_queued`, which must turn the ratchet and make the
+                    // turn durable before anything goes out.
                     body: m.body.clone(),
                 },
             ))
@@ -1202,7 +1292,34 @@ fn resend_queued(device_id: &str) -> Result<(), String> {
     }
     let net = require_net()?;
     log::info!("resending {} queued messages on reunion", pending.len());
-    for (msg_id, envelope) in pending {
+    for (msg_id, thread, envelope) in pending {
+        // Sealed now, not when it was written. The row keeps plaintext, so a
+        // resend turns the ratchet again — one message key per attempt, which
+        // is the price of not keeping a second, ciphertext copy of every
+        // conversation. The receiver's ratchet handles the skipped keys and
+        // `seq` still says the person already has it.
+        //
+        // Persisted before the bytes leave, for the reason `commit_sent`
+        // gives: a counter that rewinds reuses a nonce. Crashing between the
+        // save and the send costs one message key and leaves the row `Queued`,
+        // which the next reunion picks up.
+        let envelope = with_core_mut(|core| {
+            let Outgoing::Ready { body, ratchet } = seal_for_thread(core, thread, &envelope.body)?
+            else {
+                return Ok(None);
+            };
+            if let Some(advanced) = &ratchet {
+                core.store.start_ratchet(thread, advanced, now_millis())?;
+            }
+            Ok(Some(ChatEnvelope {
+                seq: envelope.seq,
+                msg_id: envelope.msg_id,
+                body,
+            }))
+        })?;
+        // Still nothing to seal with. Left `Queued`, which is where it was, and
+        // picked up by the next reunion or by the opening that closes the gap.
+        let Some(envelope) = envelope else { continue };
         // One at a time, and the state moves per message: a send that fails
         // half way leaves the ones that got away marked `Sent` and the rest
         // still `Queued`, so the next reunion picks up exactly where this
@@ -1262,6 +1379,13 @@ fn on_net_event(net: &Arc<net::Net>, event: net::NetEvent) {
             if let Err(why) = resend_queued(&peer) {
                 log::warn!("could not resend to {peer}: {why}");
             }
+            // And the same idea one layer down: a paired thread whose other end
+            // has never been able to write is a conversation that only goes one
+            // way, and a reunion is the chance to fix it. Does nothing on every
+            // thread that is already two-way — see `offer_an_opening`.
+            if let Ok(Some(thread)) = thread_for_device(peer.clone()) {
+                offer_an_opening(thread, &peer);
+            }
         }
         net::NetEvent::SessionClosed { .. } => {
             if let Ok(devices) = nearby_devices() {
@@ -1279,6 +1403,24 @@ fn on_net_event(net: &Arc<net::Net>, event: net::NetEvent) {
         }
         net::NetEvent::RadioChanged { available, reason } => {
             emit(CoreEvent::RadioChanged { available, reason });
+        }
+        net::NetEvent::ChainOpening { peer, body } => {
+            // No `CoreEvent`. Nothing was said, so there is nothing for the UI
+            // to draw and nobody to notify — the whole effect is a ratchet that
+            // has moved.
+            match take_an_opening(&peer, &body) {
+                // The chain is open now, so whatever was written while it was
+                // not can go. The same rule as a reunion, reached by a
+                // different route: `write_then_send` holds a message it cannot
+                // seal rather than losing it, and this is the event that makes
+                // it sealable.
+                Ok(()) => {
+                    if let Err(why) = resend_queued(&peer) {
+                        log::warn!("could not send what was held for {peer}: {why}");
+                    }
+                }
+                Err(why) => log::warn!("could not take an opening from {peer}: {why}"),
+            }
         }
         net::NetEvent::PingUndeliverable { peer, why } => {
             emit(CoreEvent::PingFailed {
@@ -1341,7 +1483,11 @@ fn on_net_event(net: &Arc<net::Net>, event: net::NetEvent) {
                     // local row number and names nobody.
                     log::info!("paired with {peer} on thread {thread_id}");
                     emit(CoreEvent::PairingCompleted {
-                        device_id: peer,
+                        // Cloned so the screen goes first: the opening below
+                        // writes to the store and then to the wire, and the
+                        // person who has just held two phones together should
+                        // not wait on either.
+                        device_id: peer.clone(),
                         thread_id,
                         name: persona_name,
                         colour: persona_colour,
@@ -1356,6 +1502,11 @@ fn on_net_event(net: &Arc<net::Net>, event: net::NetEvent) {
                     if let Ok(devices) = nearby_devices() {
                         emit(CoreEvent::DiscoveryUpdated { devices });
                     }
+                    // Last, and after the row exists: the opening turns the
+                    // ratchet that `record_pairing` just wrote down, so it has
+                    // to be able to read it back. Only one of the two sides
+                    // sends one — whichever the ceremony made the initiator.
+                    offer_an_opening(thread_id, &peer);
                 }
                 Err(why) => {
                     // The ceremony succeeded and the store did not. Reported as
@@ -1466,10 +1617,27 @@ fn store_incoming_chat(
             }
         }
 
+        // Opened before anything is written, and the advanced state goes down
+        // with the message that advanced it. A message that will not open
+        // leaves the ratchet exactly as it was — `Ratchet::decrypt` spends
+        // nothing before the tag is checked — so a forged body cannot burn a
+        // key the real message needs.
+        let Incoming {
+            plaintext,
+            ratchet: advanced,
+        } = match open_for_thread(core, thread, &envelope.body) {
+            Ok(opened) => opened,
+            Err(why) => {
+                // Not fatal to the session. A body we cannot open is a body we
+                // cannot show, and storing ciphertext as though somebody had
+                // written it would be worse than dropping it.
+                log::warn!("dropping a chat message that would not open: {why}");
+                return Ok(None);
+            }
+        };
+
         let outcome = core.store.commit_received(
-            // No ratchet on this path yet: an unpaired thread has none, and a
-            // paired one will land with the ratchet that decrypted it.
-            None,
+            advanced.as_ref().map(|s| s.as_slice()),
             &InboxPosition {
                 through: inbox.through(),
                 ahead: inbox.ahead(),
@@ -1480,7 +1648,7 @@ fn store_incoming_chat(
                 // this safe to store directly (tech spec §8).
                 seq,
                 msg_id: envelope.msg_id.to_vec(),
-                body: envelope.body.clone(),
+                body: plaintext.clone(),
                 direction: Direction::Incoming,
                 state: MessageState::Delivered,
                 created_at: now,
@@ -1568,6 +1736,223 @@ fn device_for_thread(core: &Core, thread: i64) -> Result<Option<String>, StoreEr
         }
     }
     Ok(None)
+}
+
+/// What a thread's ratchet had to say about a body on its way out.
+enum Outgoing {
+    /// The bytes for the wire, and the ratchet state that has to be stored with
+    /// the message that advanced it. `ratchet` is `None` on an unpaired thread,
+    /// which has none.
+    Ready {
+        body: Vec<u8>,
+        ratchet: Option<Zeroizing<Vec<u8>>>,
+    },
+    /// Paired, but this end has never been written to, so it has no sending
+    /// chain to seal with. Nothing can go out until the other side opens it —
+    /// see [`offer_an_opening`], which is what does.
+    NoChainYet,
+}
+
+/// Seal a body with the thread's ratchet, if it has one.
+///
+/// An unpaired thread has no ratchet and its body travels as it always did,
+/// inside the session's own encryption — R0-F5 lets strangers chat, and the
+/// Double Ratchet belongs to a paired thread (tech spec §5).
+///
+/// The header travels in clear ahead of the body because the receiver needs it
+/// to find the key; it is the AEAD's associated data, so the two cannot be
+/// separated without the tag failing.
+///
+/// # Why a responder with no chain is not an error
+///
+/// It is a window measured in the milliseconds between two devices finishing
+/// the same ceremony, and it is a window somebody can type into. Reported as an
+/// error, the message they wrote is gone — `write_then_send` seals before it
+/// writes the row, so there would be no row — and what they would have to go on
+/// is "message could not be decrypted", which is both frightening and about
+/// something else. Held instead, which is what R0-F5 already does for every
+/// other reason a message cannot leave right now.
+fn seal_for_thread(core: &Core, thread: i64, plaintext: &[u8]) -> Result<Outgoing, StoreError> {
+    let Some(state) = core.store.ratchet_state(thread)? else {
+        return Ok(Outgoing::Ready {
+            body: plaintext.to_vec(),
+            ratchet: None,
+        });
+    };
+    let mut ratchet =
+        Ratchet::from_state(&state).map_err(|e| StoreError::Db(format!("ratchet: {e}")))?;
+    if !ratchet.can_send() {
+        return Ok(Outgoing::NoChainYet);
+    }
+    let (header, sealed) = ratchet
+        .encrypt(plaintext)
+        .map_err(|e| StoreError::Db(format!("ratchet: {e}")))?;
+    let mut body = header.to_bytes().to_vec();
+    body.extend_from_slice(&sealed);
+    Ok(Outgoing::Ready {
+        body,
+        ratchet: Some(ratchet.to_state()),
+    })
+}
+
+/// Speak first on a paired thread, so the other end can speak at all.
+///
+/// A `Ratchet::responder` has no sending chain until it has received
+/// something, so the side the ceremony names as responder pairs and then finds
+/// it cannot write. The side that *can* write settles it by sending one
+/// [`FrameKind::Opening`](crate::session::frame::FrameKind::Opening): a ratchet
+/// header and a sealed empty body, which turns their ratchet and gives them
+/// both chains.
+///
+/// The two other ways out were considered and are in the T12 notes. Holding a
+/// responder's messages `Queued` until the initiator writes makes "you paired,
+/// you typed, nothing left" a normal state with nothing on screen to explain
+/// it. Seeding both sides so either can start departs from the Signal
+/// handshake this ratchet follows, in the one file where following it is what
+/// stands in for the review nobody has done.
+///
+/// Best effort by design, and it repairs itself. This runs at pairing and
+/// again whenever a session opens, for as long as the thread's ratchet says
+/// one is owed ([`Ratchet::owes_an_opening`]). An opening lost to a pipe that
+/// closed at the wrong moment would otherwise leave that thread one-way for
+/// good, and the only way back would be pairing again — two people and a code.
+///
+/// The reunion call is the part with no test on it, the same gap and the same
+/// reason as `resend_queued` in the arm beside it: a `SessionOpened` is a
+/// transport event and nothing in the public API produces one. What it decides
+/// is covered — `only_the_side_that_can_write_first_owes_an_opening` — so what
+/// is untested is the wiring rather than the rule.
+fn offer_an_opening(thread: i64, device_id: &str) {
+    let body = match with_core_mut(|core| opening_for_thread(core, thread)) {
+        Ok(Some(body)) => body,
+        // Nothing owed: an unpaired thread, a responder with nothing to say
+        // yet, or a peer who has already spoken.
+        Ok(None) => return,
+        Err(why) => {
+            log::warn!("could not open the chain on thread {thread}: {why}");
+            return;
+        }
+    };
+    let Ok(net) = require_net() else { return };
+    match net.send_opening(device_id, body, std::time::Instant::now()) {
+        // Not "sent to <device>": this is the one line that would say a paired
+        // thread and a rotating id belong together, and it is written on the
+        // device that already knows.
+        Ok(()) => log::info!("opened the chain on thread {thread}"),
+        // The message key is spent either way — it was persisted before the
+        // bytes left, for the reason `commit_sent` gives — and the next session
+        // tries again.
+        Err(why) => log::info!("could not open the chain on thread {thread} yet: {why}"),
+    }
+}
+
+/// The bytes of an opening, if this thread owes one, with the turn made durable.
+///
+/// Persisted before it is returned and therefore before it is sent, which is
+/// the same rule as [`Store::commit_sent`](crate::store::Store::commit_sent)
+/// and for the same reason: `nonce_for` derives from the message number, so a
+/// counter that rewound would reuse a key *and* a nonce. Crashing between the
+/// write and the send costs one message key, which the receiver's ratchet steps
+/// over without noticing.
+fn opening_for_thread(core: &Core, thread: i64) -> Result<Option<Vec<u8>>, StoreError> {
+    let Some(state) = core.store.ratchet_state(thread)? else {
+        return Ok(None);
+    };
+    let mut ratchet =
+        Ratchet::from_state(&state).map_err(|e| StoreError::Db(format!("ratchet: {e}")))?;
+    if !ratchet.owes_an_opening() {
+        return Ok(None);
+    }
+    let (header, sealed) = ratchet
+        .encrypt(&[])
+        .map_err(|e| StoreError::Db(format!("ratchet: {e}")))?;
+    core.store
+        .start_ratchet(thread, &ratchet.to_state(), now_millis())?;
+    let mut body = header.to_bytes().to_vec();
+    body.extend_from_slice(&sealed);
+    Ok(Some(body))
+}
+
+/// Take the opening a peer sent: turn the ratchet, write down the turn, keep
+/// nothing else.
+///
+/// The receiving half of [`offer_an_opening`], and the half that has to be
+/// trusted not to store anything. It is written so that trust is structural
+/// rather than remembered — there is no `seq`, no `msg_id` and no
+/// [`NewMessage`] anywhere below, so there is nothing this could write a row
+/// with even if a later edit wanted to. `an_opening_leaves_no_message_behind`
+/// is what says so out loud.
+fn take_an_opening(device_id: &str, body: &[u8]) -> Result<(), String> {
+    with_core_mut(|core| {
+        let Some(contact) = contact_id_for_device(core, device_id)? else {
+            return Ok(());
+        };
+        let Some(thread) = core.store.thread_for_contact(contact)? else {
+            return Ok(());
+        };
+        // Opened through the same door as a chat body, so the two cannot drift
+        // apart about what a sealed body looks like.
+        let Incoming {
+            plaintext,
+            ratchet: advanced,
+        } = open_for_thread(core, thread, body)?;
+        let Some(advanced) = advanced else {
+            // No ratchet on this thread, so `open_for_thread` handed the bytes
+            // straight back. Nothing turned and nothing to write.
+            log::warn!("an opening arrived for a thread with no ratchet");
+            return Ok(());
+        };
+        if !plaintext.is_empty() {
+            // Dropped, not shown and not stored — it has nowhere to go from
+            // here. Logged because a peer putting something in a frame defined
+            // to carry nothing is worth being able to see.
+            log::warn!("an opening arrived carrying {} bytes", plaintext.len());
+        }
+        core.store.start_ratchet(thread, &advanced, now_millis())?;
+        Ok(())
+    })
+}
+
+/// What a thread's ratchet made of a body that arrived.
+///
+/// A struct rather than the pair it used to be, because the pair was two
+/// options deep and read as neither of the two things it meant.
+struct Incoming {
+    plaintext: Vec<u8>,
+    /// The state to store with the message that advanced it, or `None` on an
+    /// unpaired thread, which has no ratchet to advance.
+    ratchet: Option<Zeroizing<Vec<u8>>>,
+}
+
+/// Open a body with the thread's ratchet, if it has one.
+///
+/// The mirror of [`seal_for_thread`], and it decides the same way: a thread
+/// with a ratchet expects sealed bodies, one without expects plain. Both sides
+/// gain their ratchet in the same act — the ceremony — so the two ends agree
+/// without anything on the wire saying which it is.
+fn open_for_thread(core: &Core, thread: i64, body: &[u8]) -> Result<Incoming, StoreError> {
+    let Some(state) = core.store.ratchet_state(thread)? else {
+        return Ok(Incoming {
+            plaintext: body.to_vec(),
+            ratchet: None,
+        });
+    };
+    let mut ratchet =
+        Ratchet::from_state(&state).map_err(|e| StoreError::Db(format!("ratchet: {e}")))?;
+    let header_bytes: [u8; ratchet::HEADER_LEN] = body
+        .get(..ratchet::HEADER_LEN)
+        .and_then(|h| h.try_into().ok())
+        .ok_or_else(|| StoreError::Db("a sealed message with no header".into()))?;
+    let plaintext = ratchet
+        .decrypt(
+            ratchet::Header::from_bytes(&header_bytes),
+            &body[ratchet::HEADER_LEN..],
+        )
+        .map_err(|e| StoreError::Db(format!("ratchet: {e}")))?;
+    Ok(Incoming {
+        plaintext: plaintext.to_vec(),
+        ratchet: Some(ratchet.to_state()),
+    })
 }
 
 /// Which contact a sighting belongs to, if we have one on file.
