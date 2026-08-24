@@ -36,10 +36,11 @@ const L1Proof$json = {
   '2': [
     {'1': 'l1_pub', '3': 1, '4': 1, '5': 12, '10': 'l1Pub'},
     {'1': 'signature', '3': 2, '4': 1, '5': 12, '10': 'signature'},
+    {'1': 'ratchet_pub', '3': 3, '4': 1, '5': 12, '10': 'ratchetPub'},
   ],
 };
 
 /// Descriptor for `L1Proof`. Decode as a `google.protobuf.DescriptorProto`.
 final $typed_data.Uint8List l1ProofDescriptor = $convert.base64Decode(
     'CgdMMVByb29mEhUKBmwxX3B1YhgBIAEoDFIFbDFQdWISHAoJc2lnbmF0dXJlGAIgASgMUglzaW'
-    'duYXR1cmU=');
+    'duYXR1cmUSHwoLcmF0Y2hldF9wdWIYAyABKAxSCnJhdGNoZXRQdWI=');

@@ -136,10 +136,12 @@ class L1Proof extends $pb.GeneratedMessage {
   factory L1Proof({
     $core.List<$core.int>? l1Pub,
     $core.List<$core.int>? signature,
+    $core.List<$core.int>? ratchetPub,
   }) {
     final result = create();
     if (l1Pub != null) result.l1Pub = l1Pub;
     if (signature != null) result.signature = signature;
+    if (ratchetPub != null) result.ratchetPub = ratchetPub;
     return result;
   }
 
@@ -160,6 +162,8 @@ class L1Proof extends $pb.GeneratedMessage {
         1, _omitFieldNames ? '' : 'l1Pub', $pb.PbFieldType.OY)
     ..a<$core.List<$core.int>>(
         2, _omitFieldNames ? '' : 'signature', $pb.PbFieldType.OY)
+    ..a<$core.List<$core.int>>(
+        3, _omitFieldNames ? '' : 'ratchetPub', $pb.PbFieldType.OY)
     ..hasRequiredFields = false;
 
   @$core.Deprecated('See https://github.com/google/protobuf.dart/issues/998.')
@@ -197,6 +201,19 @@ class L1Proof extends $pb.GeneratedMessage {
   $core.bool hasSignature() => $_has(1);
   @$pb.TagNumber(2)
   void clearSignature() => $_clearField(2);
+
+  /// X25519 public whose shared secret seeds this thread's Double Ratchet.
+  /// Signed over by the field above, so it cannot be swapped in flight: an
+  /// attacker who substituted it would own the root of every message that
+  /// follows, and nothing on either screen would look different.
+  @$pb.TagNumber(3)
+  $core.List<$core.int> get ratchetPub => $_getN(2);
+  @$pb.TagNumber(3)
+  set ratchetPub($core.List<$core.int> value) => $_setBytes(2, value);
+  @$pb.TagNumber(3)
+  $core.bool hasRatchetPub() => $_has(2);
+  @$pb.TagNumber(3)
+  void clearRatchetPub() => $_clearField(3);
 }
 
 const $core.bool _omitFieldNames =
