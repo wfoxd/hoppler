@@ -36,6 +36,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use super::pipe::{self, PipeReader, CHANNEL_DISCOVERY, CHANNEL_SESSION};
+use std::cmp::Ordering;
+
 use zeroize::Zeroizing;
 
 use crate::crypto::{dh, sign};
@@ -817,7 +819,10 @@ impl Net {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .layer1_public();
-        let ratchet = if speaks_first(&our_l1, their_l1) {
+        let ours_pub = ours_dh.public();
+        let first = speaks_first((&our_l1, &ours_pub), (their_l1, &theirs_dh))
+            .ok_or("paired with something holding our own identity and our own key")?;
+        let ratchet = if first {
             Ratchet::initiator(*root, theirs_dh).map_err(|e| e.to_string())?
         } else {
             Ratchet::responder(*root, ours_dh)
@@ -1426,8 +1431,33 @@ impl Net {
 /// answers yes. Both saying no is a conversation neither can start; both saying
 /// yes is two sending chains that cannot read each other. Neither failure says
 /// anything on screen — the messages simply never open.
-fn speaks_first(ours: &sign::PublicKey, theirs: &sign::PublicKey) -> bool {
-    ours.0 < theirs.0
+/// `None` when the two ends are indistinguishable — see below.
+fn speaks_first(
+    ours: (&sign::PublicKey, &dh::DhPublic),
+    theirs: (&sign::PublicKey, &dh::DhPublic),
+) -> Option<bool> {
+    match ours.0 .0.cmp(&theirs.0 .0) {
+        Ordering::Less => Some(true),
+        Ordering::Greater => Some(false),
+        // Two devices wearing the same Layer-1 identity. Unreachable between
+        // honest strangers and not forgeable — a Layer-1 proof is signed over
+        // the *peer's* Layer-2 key, so ours cannot be reflected back at us —
+        // but an identity restored onto a second device would land here, and
+        // the failure is the silent one: both sides answer no, both become
+        // responders, and neither can ever speak.
+        //
+        // The ephemeral ratchet keys break it. They are fresh per ceremony and
+        // differ with overwhelming probability, so this is a tie-break that
+        // resolves rather than a second coin with the same bias.
+        Ordering::Equal => match ours.1 .0.cmp(&theirs.1 .0) {
+            Ordering::Less => Some(true),
+            Ordering::Greater => Some(false),
+            // Same identity *and* same ephemeral key: one device on both ends
+            // of one ceremony. Refused rather than given a role, because there
+            // is no answer that makes a conversation work.
+            Ordering::Equal => None,
+        },
+    }
 }
 
 /// What to log for a radio report.
@@ -1448,7 +1478,7 @@ fn radio_log(available: bool, reason: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{radio_log, speaks_first};
-    use crate::crypto::sign;
+    use crate::crypto::{dh, sign};
 
     /// Exactly one side speaks first, whichever way round you ask.
     ///
@@ -1459,10 +1489,12 @@ mod tests {
     /// pass a single-direction check.
     #[test]
     fn exactly_one_side_of_a_pairing_speaks_first() {
+        let dh_a = dh::DhPublic([3u8; 32]);
+        let dh_b = dh::DhPublic([4u8; 32]);
         let small = sign::PublicKey([1u8; 32]);
         let large = sign::PublicKey([2u8; 32]);
-        assert!(speaks_first(&small, &large));
-        assert!(!speaks_first(&large, &small));
+        assert_eq!(speaks_first((&small, &dh_a), (&large, &dh_b)), Some(true));
+        assert_eq!(speaks_first((&large, &dh_b), (&small, &dh_a)), Some(false));
 
         // Differing in the last byte only: a rule comparing the wrong end, or
         // comparing lengths, would agree with itself here.
@@ -1472,10 +1504,33 @@ mod tests {
         b[31] = 9;
         let (a, b) = (sign::PublicKey(a), sign::PublicKey(b));
         assert_ne!(
-            speaks_first(&a, &b),
-            speaks_first(&b, &a),
+            speaks_first((&a, &dh_a), (&b, &dh_b)),
+            speaks_first((&b, &dh_b), (&a, &dh_a)),
             "both ends of a pairing took the same role"
         );
+    }
+
+    /// One identity on two devices still gets two roles.
+    ///
+    /// Raised in review, and the failure it prevents is the silent one: with
+    /// Layer-1 keys alone, equal identities make *both* ends responders and the
+    /// conversation simply never starts. Not reachable between honest strangers
+    /// — a Layer-1 proof is signed over the peer's Layer-2 key, so ours cannot
+    /// be reflected at us — but an identity restored onto a second device would
+    /// land here, and nothing would say so.
+    #[test]
+    fn the_same_identity_on_both_ends_is_still_split_by_the_ephemeral_keys() {
+        let same = sign::PublicKey([5u8; 32]);
+        let mine = dh::DhPublic([1u8; 32]);
+        let yours = dh::DhPublic([2u8; 32]);
+
+        assert_eq!(speaks_first((&same, &mine), (&same, &yours)), Some(true));
+        assert_eq!(speaks_first((&same, &yours), (&same, &mine)), Some(false));
+
+        // Same identity *and* the same ephemeral key is one device on both ends
+        // of one ceremony. There is no role that makes that work, so it is
+        // refused rather than answered.
+        assert_eq!(speaks_first((&same, &mine), (&same, &mine)), None);
     }
 
     #[test]
