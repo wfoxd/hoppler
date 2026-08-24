@@ -19,6 +19,16 @@ gen:              ## Regenerate Dart<->Rust bridge and protobuf types
 # itself live, so it is the last place worth leaving unchecked.
 lint:             ## All linters, warnings are errors
 	cd rust && cargo fmt --check && cargo clippy --all-targets -- -D warnings
+# Rustdoc, because the docs in this crate are load-bearing: they carry the
+# reasoning, and a `[`Thing`]` that resolves to nothing is a reader sent looking
+# for something that is not there. Eight were broken when this gate went in,
+# including one naming a method on the wrong type and one inherited from a
+# comment in a .proto file.
+#
+# `--document-private-items` on purpose. Most of the explanation in this crate
+# hangs off private functions, so without it the gate would check the smaller
+# half of the docs and miss exactly the links most likely to rot.
+	cd rust && RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items
 	flutter analyze
 
 # The Android-only Rust — the JNI bridge to the hardware keystore — is

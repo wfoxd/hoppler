@@ -79,7 +79,7 @@ const PREFERRED_WRITE_SIZE: usize = 240;
 /// A radio is orders of magnitude slower than the code feeding it, so without a
 /// window a sender fills an unbounded queue in the adapter and the first
 /// evidence is an OOM on a phone. The credit is returned by
-/// [`BleTransport::on_write_complete`], which is the adapter's *only*
+/// [`BleIngress::on_write_complete`], which is the adapter's *only*
 /// obligation beyond delivering events.
 const SEND_WINDOW: usize = 64 * 1024;
 
@@ -107,7 +107,7 @@ pub trait BlePlatform: Send + Sync {
     /// success arrives as `PipeOpened`, failure as `PipeFailed`.
     fn connect(&self, peer: &str) -> Result<(), TransportError>;
     /// Write bytes to an open pipe. The adapter must preserve order and must
-    /// call back [`BleTransport::on_write_complete`] once the bytes are gone.
+    /// call back [`BleIngress::on_write_complete`] once the bytes are gone.
     fn send(&self, peer: &str, bytes: &[u8]) -> Result<(), TransportError>;
     /// Close one pipe.
     fn disconnect(&self, peer: &str) -> Result<(), TransportError>;

@@ -122,7 +122,7 @@ pub struct NewTransfer {
 
 /// Someone we have written down.
 ///
-/// Not necessarily someone we have paired with — that is [`Pairing`], and most
+/// Not necessarily someone we have paired with — that is `Pairing`, and most
 /// contacts do not have one. A contact is the durable side of a person we have
 /// met: a name, a colour, and a handle stable enough to hang a conversation on.
 #[derive(Clone, Debug, PartialEq, Eq)]
