@@ -8,6 +8,8 @@ import 'package:hoppler/features/pairing/pairing_code_view.dart';
 import 'package:hoppler/features/pairing/pairing_surface.dart';
 import 'package:hoppler/features/pairing/sas_view.dart';
 import 'package:hoppler/features/pairing/scanner.dart';
+import 'package:hoppler/features/threads/thread_view.dart';
+import 'package:hoppler/features/threads/threads_view.dart';
 import 'package:hoppler/features/ping/ping_service.dart';
 import 'package:hoppler/src/rust/api/core.dart';
 import 'package:hoppler/src/rust/api/discovery.dart';
@@ -157,6 +159,12 @@ class _HomePageState extends State<HomePage> {
   bool _canTap = false;
   StreamSubscription<NfcEvent>? _taps;
   StreamSubscription<CoreEvent>? _events;
+
+  /// Told when a message lands on the conversation currently on screen.
+  ///
+  /// Null whenever no thread is open, which is also what stops a closed route
+  /// being redrawn.
+  Future<void> Function(int threadId)? _onThreadArrival;
   late final PingService _pingService;
 
   @override
@@ -222,8 +230,9 @@ class _HomePageState extends State<HomePage> {
         // which is what keeps "blocked" indistinguishable from "not there".
         case CoreEvent_PingFailed(:final reason):
           _log.insert(0, 'Ping failed: $reason');
-        case CoreEvent_MessageReceived(:final text):
+        case CoreEvent_MessageReceived(:final text, :final threadId):
           _log.insert(0, 'Message: $text');
+          unawaited(_onThreadArrival?.call(threadId.toInt()) ?? Future.value());
         case CoreEvent_TransferProgress(:final received, :final total):
           _transfer = total == BigInt.zero ? 0 : received / total;
         case CoreEvent_TransferCompleted(:final success):
@@ -322,6 +331,13 @@ class _HomePageState extends State<HomePage> {
       appBar: AppBar(
         backgroundColor: _personaColour,
         title: Text('Hoppler — ${widget.persona.name}'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.forum_outlined),
+            tooltip: 'Conversations',
+            onPressed: _openConversations,
+          ),
+        ],
       ),
       body: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -587,6 +603,88 @@ class _HomePageState extends State<HomePage> {
         ),
       ),
     );
+  }
+
+  /// Open the conversation list.
+  ///
+  /// Read on the way in rather than held in this page's state: threads change
+  /// underneath us — a reunion delivers a backlog, a pairing opens a thread —
+  /// and a list captured when the app started would be quietly stale by the
+  /// time anyone looked at it.
+  Future<void> _openConversations() async {
+    try {
+      final threads = await listThreads();
+      if (!mounted) return;
+      await Navigator.of(context).push(
+        MaterialPageRoute<void>(
+          builder: (_) => Scaffold(
+            appBar: AppBar(title: const Text('Conversations')),
+            body: ThreadsView<ThreadSummary>(
+              threads: threads,
+              tile: (t) => ListTile(
+                leading: CircleAvatar(
+                  backgroundColor: Color(0xFF000000 | t.colour),
+                ),
+                title: Text(t.name.isEmpty ? 'Unknown' : t.name),
+                onTap: () => _openThread(t),
+              ),
+            ),
+          ),
+        ),
+      );
+    } catch (e) {
+      if (mounted) setState(() => _log.insert(0, 'Error: $e'));
+    }
+  }
+
+  /// Open one conversation.
+  ///
+  /// Rebuilt from the store after every send and on every arrival, rather than
+  /// appending locally. What the store holds is the truth about a conversation
+  /// — it is what survives a restart, what a resend is drawn from, and what
+  /// dedupes a message that arrives twice — so a screen that kept its own list
+  /// beside it would be a second answer able to disagree with the first.
+  Future<void> _openThread(ThreadSummary t) async {
+    Future<List<ThreadLine>> read() async => (await threadMessages(
+      threadId: t.threadId,
+    )).map((m) => ThreadLine(text: m.text, outgoing: m.outgoing)).toList();
+
+    var lines = await read();
+    if (!mounted) return;
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => StatefulBuilder(
+          builder: (context, setLocal) {
+            // Arrivals land here too, so a message that comes in while the
+            // conversation is open appears without anyone leaving and coming
+            // back. Routed through the page's existing subscription rather than
+            // opening a second one: the event stream is single-subscription,
+            // and two listeners would mean the first one silently winning.
+            _onThreadArrival = (arrived) async {
+              if (arrived != t.threadId) return;
+              final fresh = await read();
+              setLocal(() => lines = fresh);
+            };
+            return ThreadView(
+              title: t.name.isEmpty ? 'Unknown' : t.name,
+              lines: lines,
+              onSend: (text) async {
+                try {
+                  await sendChatToThread(threadId: t.threadId, text: text);
+                  final fresh = await read();
+                  if (!context.mounted) return;
+                  setLocal(() => lines = fresh);
+                } catch (e) {
+                  if (mounted) setState(() => _log.insert(0, 'Error: $e'));
+                }
+              },
+            );
+          },
+        ),
+      ),
+    );
+    // The route is gone; nothing should still be trying to redraw it.
+    _onThreadArrival = null;
   }
 
   /// Run an API call, surfacing any failure in the log instead of leaving an
