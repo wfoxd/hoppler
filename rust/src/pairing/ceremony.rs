@@ -876,11 +876,16 @@ mod tests {
         // message either of them sends is undecryptable by the other; and not
         // all-zeroes, which is what a Diffie-Hellman with a substituted or
         // missing key would tend to produce.
-        assert_eq!(
-            scanner_view.root, shower_view.root,
+        // Compared, never printed. `assert_eq!` formats both sides on failure,
+        // which would put a live ratchet root into the test output and from
+        // there into a CI log that outlives the run. The same rule the log
+        // lines follow for Bluetooth addresses: a secret that reaches a
+        // transcript is a secret for as long as the transcript is kept.
+        assert!(
+            scanner_view.root == shower_view.root,
             "the two sides derived different ratchet roots"
         );
-        assert_ne!(*scanner_view.root, [0u8; 32], "the root is not a secret");
+        assert!(*scanner_view.root != [0u8; 32], "the root is not a secret");
     }
 
     /// Two ceremonies do not share a root.
@@ -908,9 +913,8 @@ mod tests {
 
         let ada = Identity::generate("Ada", 0x11_2233);
         let bo = Identity::generate("Bo", 0x44_5566);
-        assert_ne!(
-            root_of(&ada, &bo),
-            root_of(&ada, &bo),
+        assert!(
+            root_of(&ada, &bo) != root_of(&ada, &bo),
             "the same two people pairing twice reused a root"
         );
     }
@@ -1138,12 +1142,13 @@ mod tests {
         let theirs = dh::DhSecret::generate();
         let one = ratchet_root(&ours, &theirs.public(), b"ceremony one").unwrap();
         let other = ratchet_root(&ours, &theirs.public(), b"ceremony two").unwrap();
-        assert_ne!(*one, *other, "the transcript did not reach the root");
+        assert!(*one != *other, "the transcript did not reach the root");
 
         // And both sides of one ceremony still agree, which is the point.
-        assert_eq!(
-            *ratchet_root(&ours, &theirs.public(), b"ceremony one").unwrap(),
-            *ratchet_root(&theirs, &ours.public(), b"ceremony one").unwrap(),
+        assert!(
+            *ratchet_root(&ours, &theirs.public(), b"ceremony one").unwrap()
+                == *ratchet_root(&theirs, &ours.public(), b"ceremony one").unwrap(),
+            "the two sides of one ceremony disagreed"
         );
     }
 

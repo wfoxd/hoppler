@@ -51,5 +51,5 @@ message L1Proof {
   // Signed over by the field above, so it cannot be swapped in flight: an
   // attacker who substituted it would own the root of every message that
   // follows, and nothing on either screen would look different.
-  bytes ratchet_pub = 3;
+  bytes ratchet_pub = 3; // X25519 public (32 bytes), ephemeral to this ceremony
 }
