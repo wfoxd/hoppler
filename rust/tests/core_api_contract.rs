@@ -29,7 +29,8 @@ use rust_lib_hoppler::api::types::CoreEvent;
 use rust_lib_hoppler::discovery::Discovery;
 use rust_lib_hoppler::engine::{
     has_session, init_with_transport, mark_sent_for_test, queued_for_resend_for_test,
-    queued_on_thread_for_test, receive_chat_for_test, resend_queued_for_test, thread_rows_for_test,
+    queued_on_thread_for_test, ratchet_size_for_test, receive_chat_for_test,
+    resend_queued_for_test, thread_rows_for_test,
 };
 use rust_lib_hoppler::identity::Identity;
 use rust_lib_hoppler::pairing::invite::Invite;
@@ -1117,6 +1118,46 @@ fn a_confirmed_ceremony_leaves_a_thread_behind() {
             .iter()
             .any(|d| d.device_id.as_deref() == Some(peer.id.as_str()) && d.paired)
     });
+}
+
+/// Pairing leaves a ratchet behind.
+///
+/// T12 calls ratchet persistence the correctness heart of Chat, and until now
+/// `Ratchet::initiator` and `Ratchet::responder` had no caller outside their own
+/// tests: the state machine, the `ratchets` table and `start_ratchet` all
+/// existed with nothing joining them. A paired thread with no ratchet cannot
+/// ever hold a ratcheted message, and the only way back is pairing again —
+/// which costs two people and a code.
+///
+/// The size, never the state. A test helper that handed back key material would
+/// put it one assertion away from a CI log.
+#[test]
+fn pairing_leaves_a_ratchet_on_the_thread() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = fresh();
+    let peer = full_peer(&h.air, "peer", "Ada");
+
+    set_discovery(true).unwrap();
+    peer.net
+        .discovery()
+        .set_enabled(true, Instant::now())
+        .unwrap();
+    peer.net.discovery().start_scanning().unwrap();
+    until("the engine to see the peer", || {
+        pump(&peer);
+        nearby_devices()
+            .unwrap()
+            .iter()
+            .any(|d| d.device_id.as_deref() == Some(peer.id.as_str()))
+    });
+    pair_with(&peer);
+
+    let thread = list_threads().unwrap()[0].thread_id;
+    let size = ratchet_size_for_test(thread).unwrap();
+    assert!(
+        size.is_some_and(|n| n > 0),
+        "a paired thread has no ratchet: {size:?}"
+    );
 }
 
 /// A pairing outlives the session that made it.

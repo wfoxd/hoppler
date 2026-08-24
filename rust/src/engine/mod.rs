@@ -888,11 +888,27 @@ fn record_pairing(
     l2_pub: &[u8; 32],
     l1_pub: &[u8; 32],
 ) -> Result<i64, String> {
+    // Taken before the store lock, not inside it: `take_pairing_ratchet` reaches
+    // into `Net`, and the engine's rule is that no `Net` call happens while the
+    // core lock is held.
+    let seed = require_net()
+        .ok()
+        .and_then(|net| net.take_pairing_ratchet(device_id));
     with_core_mut(|core| {
         let now = now_millis();
         let contact = ensure_contact(core, device_id, now)?;
-        core.store
-            .record_pairing(contact, l2_pub, name, colour, version, l1_pub, now)
+        let thread = core
+            .store
+            .record_pairing(contact, l2_pub, name, colour, version, l1_pub, now)?;
+        // The thread's first ratchet, written beside the pairing that agreed
+        // it. A paired thread without one could never hold a ratcheted message,
+        // and the only way back is pairing again — which costs two people and a
+        // code.
+        match &seed {
+            Some(seed) => core.store.start_ratchet(thread, seed, now)?,
+            None => log::warn!("paired with {device_id} but no ratchet was seeded"),
+        }
+        Ok(thread)
     })
 }
 
@@ -973,6 +989,17 @@ pub fn queued_on_thread_for_test(thread_id: i64) -> Result<usize, String> {
         core.store
             .count_in_state(thread_id, Direction::Outgoing, MessageState::Queued)
     })
+}
+
+/// Whether a thread has a ratchet, and how many bytes of state — never the
+/// state itself.
+///
+/// `pub` with a note, as [`open_store_for_test`]. The length rather than the
+/// bytes on purpose: a test only needs to know a ratchet was seeded, and a
+/// helper that handed back key material would put it one `assert_eq!` away
+/// from a CI log. Review caught exactly that on the roots in #79.
+pub fn ratchet_size_for_test(thread_id: i64) -> Result<Option<usize>, String> {
+    with_core(|core| Ok(core.store.ratchet_state(thread_id)?.map(|s| s.len())))
 }
 
 /// Mark every queued message on a thread as sent, for the contract tests.

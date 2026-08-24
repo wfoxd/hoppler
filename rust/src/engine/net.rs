@@ -36,15 +36,18 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use super::pipe::{self, PipeReader, CHANNEL_DISCOVERY, CHANNEL_SESSION};
-use crate::crypto::dh;
+use zeroize::Zeroizing;
+
+use crate::crypto::{dh, sign};
 use crate::discovery::protocol::{Request, Response};
 use crate::discovery::Discovery;
 use crate::identity::{Identity, VerifiedPersona};
-use crate::pairing::ceremony::{Ceremony, CeremonyError, Step};
+use crate::pairing::ceremony::{Ceremony, CeremonyError, Paired, Step};
 use crate::pairing::invite::Invite;
 use crate::pairing::sas::Sas;
 use crate::session::frame::{Frame, FrameKind};
 use crate::session::handshake::{Established, Initiator, Responder};
+use crate::session::ratchet::Ratchet;
 use crate::session::table::SessionTable;
 use crate::transport::{PeerId, Transport, TransportError, TransportEvent};
 
@@ -248,6 +251,14 @@ pub struct Net {
     /// survives exactly until someone edits one of them, so it is a stated
     /// order now. Neither lock is held across `dispatch`, which sends.
     ceremonies: Mutex<HashMap<PeerId, InFlight>>,
+    /// Initial ratchet state for a pairing that has just completed, waiting for
+    /// the engine to write it down beside the pairing row.
+    ///
+    /// Held here rather than carried on [`NetEvent::PairingCompleted`] because
+    /// that type derives `Debug` and is logged: a ratchet's serialised state is
+    /// key material, and the one place it must never reach is a transcript that
+    /// outlives the conversation.
+    pairing_ratchets: Mutex<HashMap<PeerId, Zeroizing<Vec<u8>>>>,
     /// The code currently on this device's screen, if any.
     ///
     /// Exactly one, because its nonce is what binds a ceremony. Showing a
@@ -285,6 +296,7 @@ impl Net {
             readers: Mutex::new(HashMap::new()),
             pending_pings: Mutex::new(HashMap::new()),
             ceremonies: Mutex::new(HashMap::new()),
+            pairing_ratchets: Mutex::new(HashMap::new()),
             showing: Mutex::new(None),
             pending_ceremony: Mutex::new(HashMap::new()),
         }
@@ -737,18 +749,91 @@ impl Net {
                 }),
                 Step::Paired(paired) => {
                     self.forget_ceremony(peer);
+                    // Destructured rather than borrowed: the ratchet secret is
+                    // not `Clone` — deliberately, so it cannot be copied by
+                    // accident — and seeding needs it by value.
+                    let Paired {
+                        persona,
+                        l1_pub,
+                        ratchet_secret,
+                        their_ratchet,
+                        root,
+                        ..
+                    } = *paired;
+                    // Seeded while the ceremony's keys are still here; they go
+                    // out of scope at the end of this arm.
+                    match self.seed_ratchet(&root, ratchet_secret, their_ratchet, &l1_pub) {
+                        Ok(state) => {
+                            self.pairing_ratchets
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .insert(peer.to_string(), state);
+                        }
+                        // Reported, not fatal to the pairing. The identities
+                        // crossed and both people confirmed; refusing the whole
+                        // ceremony over a ratchet we can rebuild would throw
+                        // away the part that needed two humans.
+                        Err(why) => {
+                            log::warn!("could not seed the ratchet for {peer}: {why}");
+                        }
+                    }
                     out.push(NetEvent::PairingCompleted {
                         peer: peer.to_string(),
-                        persona_name: paired.persona.name.clone(),
-                        persona_colour: paired.persona.colour,
-                        persona_version: paired.persona.version,
-                        l2_pub: paired.persona.l2_pub.0,
-                        l1_pub: paired.l1_pub.0,
+                        persona_name: persona.name.clone(),
+                        persona_colour: persona.colour,
+                        persona_version: persona.version,
+                        l2_pub: persona.l2_pub.0,
+                        l1_pub: l1_pub.0,
                     });
                 }
             }
         }
         out
+    }
+
+    /// Build this side's opening ratchet from what the ceremony agreed.
+    ///
+    /// # Who speaks first
+    ///
+    /// The two roles are not interchangeable: the initiator takes a Diffie-
+    /// Hellman step immediately and can send, the responder cannot send until
+    /// it has heard. Both sides picking the same role is a conversation that
+    /// never starts, so the choice has to be one both compute and agree on
+    /// without another round trip.
+    ///
+    /// Layer-1 keys decide it, smaller half first. They are stable — unlike the
+    /// transport id, which R0-F2 rotates every twelve minutes and which would
+    /// hand the two ends different answers to the same question an hour later —
+    /// and both sides hold both keys by the time this runs.
+    fn seed_ratchet(
+        &self,
+        root: &[u8; 32],
+        ours_dh: dh::DhSecret,
+        theirs_dh: dh::DhPublic,
+        their_l1: &sign::PublicKey,
+    ) -> Result<Zeroizing<Vec<u8>>, String> {
+        let our_l1 = self
+            .identity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .layer1_public();
+        let ratchet = if speaks_first(&our_l1, their_l1) {
+            Ratchet::initiator(*root, theirs_dh).map_err(|e| e.to_string())?
+        } else {
+            Ratchet::responder(*root, ours_dh)
+        };
+        Ok(ratchet.to_state())
+    }
+
+    /// Take the ratchet a just-completed pairing left, if there is one.
+    ///
+    /// Taken rather than read: it belongs in the store from here on, and a copy
+    /// left in memory is a copy that outlives the write.
+    pub fn take_pairing_ratchet(&self, peer: &str) -> Option<Zeroizing<Vec<u8>>> {
+        self.pairing_ratchets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(peer)
     }
 
     /// One wording for every ceremony failure the peer can cause.
@@ -1331,6 +1416,20 @@ impl Net {
     }
 }
 
+/// Which side of a pairing takes the ratchet's initiator role.
+///
+/// A free function, and tested as one, because the two ends of a pairing can
+/// never be stood up together in a test — `CORE` is process-wide — so the only
+/// way to check that they *disagree* is to ask the rule directly.
+///
+/// The property is antisymmetry: given the same two keys, exactly one side
+/// answers yes. Both saying no is a conversation neither can start; both saying
+/// yes is two sending chains that cannot read each other. Neither failure says
+/// anything on screen — the messages simply never open.
+fn speaks_first(ours: &sign::PublicKey, theirs: &sign::PublicKey) -> bool {
+    ours.0 < theirs.0
+}
+
 /// What to log for a radio report.
 ///
 /// `available` decides, never `reason`. Keying off the reason instead reads an
@@ -1348,7 +1447,36 @@ fn radio_log(available: bool, reason: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::radio_log;
+    use super::{radio_log, speaks_first};
+    use crate::crypto::sign;
+
+    /// Exactly one side speaks first, whichever way round you ask.
+    ///
+    /// The failure this rules out is silent on both phones: two responders
+    /// never start, two initiators never understand each other, and in neither
+    /// case does anything appear on a screen. Asserted over both orderings
+    /// rather than one, because a rule that answered the same way twice would
+    /// pass a single-direction check.
+    #[test]
+    fn exactly_one_side_of_a_pairing_speaks_first() {
+        let small = sign::PublicKey([1u8; 32]);
+        let large = sign::PublicKey([2u8; 32]);
+        assert!(speaks_first(&small, &large));
+        assert!(!speaks_first(&large, &small));
+
+        // Differing in the last byte only: a rule comparing the wrong end, or
+        // comparing lengths, would agree with itself here.
+        let mut a = [7u8; 32];
+        let mut b = [7u8; 32];
+        a[31] = 0;
+        b[31] = 9;
+        let (a, b) = (sign::PublicKey(a), sign::PublicKey(b));
+        assert_ne!(
+            speaks_first(&a, &b),
+            speaks_first(&b, &a),
+            "both ends of a pairing took the same role"
+        );
+    }
 
     #[test]
     fn availability_is_read_from_the_flag_and_never_from_the_reason() {
