@@ -73,7 +73,9 @@ use snow::{Builder, HandshakeState, TransportState};
 
 use prost::Message;
 
-use crate::crypto::{dh, sign};
+use zeroize::Zeroizing;
+
+use crate::crypto::{dh, hash, sign};
 use crate::identity::{self, Identity, VerifiedPersona};
 use crate::proto::v0::L1Proof;
 use crate::session::handshake::{decode_intro, encode_intro, HandshakeError};
@@ -234,6 +236,14 @@ pub struct Paired {
     pub l1_pub: sign::PublicKey,
     /// What both people compared. Kept so the UI can show what was agreed.
     pub sas: Sas,
+    /// The seed for this thread's Double Ratchet.
+    ///
+    /// Both sides derive the same 32 bytes from the exchange in the Layer-1
+    /// proofs, and neither side chose them. Bound to the ceremony transcript,
+    /// so the root a message chain hangs off is authenticated by the same
+    /// comparison the two people made with their eyes — swap the transcript and
+    /// the root changes with it.
+    pub root: Zeroizing<[u8; 32]>,
     /// The ceremony channel, still open. Handed on rather than dropped: it is
     /// an authenticated channel to someone who has just been verified, and
     /// re-establishing one costs a round trip for nothing.
@@ -264,6 +274,13 @@ struct Confirming {
     persona: VerifiedPersona,
     transcript: Vec<u8>,
     sas: Sas,
+    /// Our half of the key that will seed this thread's Double Ratchet.
+    ///
+    /// Generated here rather than at pairing's end because both sides must send
+    /// their public with the Layer-1 proof, and the proof is the last thing
+    /// either side sends. Contributory on purpose: a root chosen by one device
+    /// is a root only that device's RNG has to fail for.
+    ratchet_secret: dh::DhSecret,
     we_confirmed: bool,
     they_confirmed: bool,
     /// Set once we have sent ours.
@@ -471,6 +488,7 @@ impl Ceremony {
             persona,
             transcript,
             sas,
+            ratchet_secret: dh::DhSecret::generate(),
             we_confirmed: false,
             they_confirmed: false,
             we_proved: false,
@@ -517,10 +535,12 @@ impl Ceremony {
         }
         c.we_proved = true;
         let l1_pub = us.layer1_public();
-        let message = l1_proof_message(&c.transcript, &l1_pub, &us.layer2_public());
+        let ratchet_pub = c.ratchet_secret.public();
+        let message = l1_proof_message(&c.transcript, &l1_pub, &us.layer2_public(), &ratchet_pub);
         let proof = L1Proof {
             l1_pub: l1_pub.0.to_vec(),
             signature: us.sign_with_layer1(&message).0.to_vec(),
+            ratchet_pub: ratchet_pub.0.to_vec(),
         }
         .encode_to_vec();
         Ok(vec![Step::Send(self.seal(FrameKind::L1, &proof)?)])
@@ -537,17 +557,19 @@ impl Ceremony {
             return Err(CeremonyError::OutOfOrder);
         }
 
-        let l1_pub = verify_l1_proof(&c.transcript, &c.persona.l2_pub, payload)?;
+        let (l1_pub, their_ratchet) = verify_l1_proof(&c.transcript, &c.persona.l2_pub, payload)?;
 
         // Taken by value now the checks have passed, so the stage closes and
         // its keys go with it. Read through the borrow above until this point.
         let Stage::Confirming(c) = std::mem::replace(&mut self.stage, Stage::Closed) else {
             return Err(CeremonyError::OutOfOrder);
         };
+        let root = ratchet_root(&c.ratchet_secret, &their_ratchet, &c.transcript)?;
         Ok(vec![Step::Paired(Box::new(Paired {
             persona: c.persona,
             l1_pub,
             sas: c.sas,
+            root,
             transport: *c.transport,
         }))])
     }
@@ -619,11 +641,32 @@ const MAX_CEREMONY_CIPHERTEXT: usize = KIND_LEN + MAX_CEREMONY_FRAME + MAX_NOISE
 /// `peer_l2` comes from the handshake and never from the payload. Taking it
 /// from the message would let the sender pick which key its proof is bound to,
 /// which is the whole substitution this is meant to stop.
+/// The root both sides end up with.
+///
+/// Keyed on the Diffie-Hellman output and bound to the transcript, rather than
+/// the DH output used raw: the transcript is what the SAS is computed over, so
+/// binding it means the colours the two people compared authenticate the root
+/// as well as the identities. A root that survived a transcript substitution
+/// would be a root an attacker could have arranged.
+fn ratchet_root(
+    ours: &dh::DhSecret,
+    theirs: &dh::DhPublic,
+    transcript: &[u8],
+) -> Result<Zeroizing<[u8; 32]>, CeremonyError> {
+    let shared = ours
+        .diffie_hellman(theirs)
+        .map_err(|_| CeremonyError::Malformed)?;
+    Ok(Zeroizing::new(hash::keyed_hash(
+        shared.as_bytes(),
+        &[b"hoppler/ratchet-root/v1".as_slice(), transcript].concat(),
+    )))
+}
+
 fn verify_l1_proof(
     transcript: &[u8],
     peer_l2: &sign::PublicKey,
     payload: &[u8],
-) -> Result<sign::PublicKey, CeremonyError> {
+) -> Result<(sign::PublicKey, dh::DhPublic), CeremonyError> {
     let proof = L1Proof::decode(payload).map_err(|_| CeremonyError::Malformed)?;
     let l1_bytes: [u8; sign::PUBLIC_KEY_LEN] = proof
         .l1_pub
@@ -636,11 +679,19 @@ fn verify_l1_proof(
         .try_into()
         .map_err(|_| CeremonyError::Malformed)?;
     let l1_pub = sign::PublicKey(l1_bytes);
+    let ratchet_bytes: [u8; 32] = proof
+        .ratchet_pub
+        .as_slice()
+        .try_into()
+        .map_err(|_| CeremonyError::Malformed)?;
+    let ratchet_pub = dh::DhPublic(ratchet_bytes);
 
-    let message = l1_proof_message(transcript, &l1_pub, peer_l2);
+    // The ratchet key is inside what the Layer-1 key signed, so a substituted
+    // one fails here rather than quietly seeding a root the attacker owns.
+    let message = l1_proof_message(transcript, &l1_pub, peer_l2, &ratchet_pub);
     sign::verify(&l1_pub, &message, &sign::Signature(sig_bytes))
         .map_err(|_| CeremonyError::L1ProofInvalid)?;
-    Ok(l1_pub)
+    Ok((l1_pub, ratchet_pub))
 }
 
 /// What a Layer-1 key signs.
@@ -656,12 +707,18 @@ fn l1_proof_message(
     transcript: &[u8],
     l1_pub: &sign::PublicKey,
     l2_pub: &sign::PublicKey,
+    ratchet_pub: &dh::DhPublic,
 ) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(L1_PROOF_LABEL.len() + transcript.len() + 64);
+    let mut msg = Vec::with_capacity(L1_PROOF_LABEL.len() + transcript.len() + 96);
     msg.extend_from_slice(L1_PROOF_LABEL);
     msg.extend_from_slice(transcript);
     msg.extend_from_slice(&l1_pub.0);
     msg.extend_from_slice(&l2_pub.0);
+    // A fourth ingredient, closing a fourth substitution: the ratchet key. It
+    // is the only one of these that is ephemeral, and the only one whose
+    // replacement would leave both screens looking exactly right while an
+    // attacker held the root of the conversation.
+    msg.extend_from_slice(&ratchet_pub.0);
     msg
 }
 
@@ -814,6 +871,52 @@ mod tests {
         assert_eq!(scanner_view.persona.name, "Ada");
         assert_eq!(shower_view.persona.name, "Bo");
         assert_eq!(scanner_view.sas, shower_view.sas);
+
+        // The root both sides will hang a ratchet off. Equal, or the first
+        // message either of them sends is undecryptable by the other; and not
+        // all-zeroes, which is what a Diffie-Hellman with a substituted or
+        // missing key would tend to produce.
+        // Compared, never printed. `assert_eq!` formats both sides on failure,
+        // which would put a live ratchet root into the test output and from
+        // there into a CI log that outlives the run. The same rule the log
+        // lines follow for Bluetooth addresses: a secret that reaches a
+        // transcript is a secret for as long as the transcript is kept.
+        assert!(
+            scanner_view.root == shower_view.root,
+            "the two sides derived different ratchet roots"
+        );
+        assert!(*scanner_view.root != [0u8; 32], "the root is not a secret");
+    }
+
+    /// Two ceremonies do not share a root.
+    ///
+    /// The property that makes the root worth deriving rather than fixing: it
+    /// is fresh per pairing, so compromising one conversation's chain says
+    /// nothing about another's. Runs the same two identities twice, so what
+    /// varies is only the ephemeral exchange — if the root came from the
+    /// long-term keys alone these would match.
+    #[test]
+    fn each_pairing_gets_its_own_root() {
+        fn root_of(shower_id: &Identity, scanner_id: &Identity) -> [u8; 32] {
+            let invite = Invite::fresh(shower_id.layer2_public(), "a1b2c3d4");
+            let (mut shower, mut scanner) = run_handshake(shower_id, scanner_id, &invite, &invite);
+            let from_scanner = sends(&scanner.confirm(scanner_id).unwrap());
+            shower.read(shower_id, &from_scanner[0]).unwrap();
+            let from_shower = sends(&shower.confirm(shower_id).unwrap());
+            scanner.read(scanner_id, &from_shower[0]).unwrap();
+            let done = scanner.read(scanner_id, &from_shower[1]).unwrap();
+            let Step::Paired(view) = &done[0] else {
+                panic!("did not pair: {done:?}")
+            };
+            *view.root
+        }
+
+        let ada = Identity::generate("Ada", 0x11_2233);
+        let bo = Identity::generate("Bo", 0x44_5566);
+        assert!(
+            root_of(&ada, &bo) != root_of(&ada, &bo),
+            "the same two people pairing twice reused a root"
+        );
     }
 
     /// R0-F4 as a test: no identity crosses without both confirmations.
@@ -927,10 +1030,12 @@ mod tests {
         // Mallory's signature over Ada's key: someone handing over an identity
         // that is not theirs.
         let claimed = ada.layer1_public();
-        let message = l1_proof_message(&transcript, &claimed, &ada.layer2_public());
+        let ratchet = dh::DhSecret::generate().public();
+        let message = l1_proof_message(&transcript, &claimed, &ada.layer2_public(), &ratchet);
         let forged = L1Proof {
             l1_pub: claimed.0.to_vec(),
             signature: mallory.sign_with_layer1(&message).0.to_vec(),
+            ratchet_pub: ratchet.0.to_vec(),
         }
         .encode_to_vec();
 
@@ -943,11 +1048,12 @@ mod tests {
         let honest = L1Proof {
             l1_pub: claimed.0.to_vec(),
             signature: ada.sign_with_layer1(&message).0.to_vec(),
+            ratchet_pub: ratchet.0.to_vec(),
         }
         .encode_to_vec();
         assert_eq!(
             verify_l1_proof(&transcript, &ada.layer2_public(), &honest).unwrap(),
-            claimed
+            (claimed, ratchet)
         );
     }
 
@@ -958,10 +1064,12 @@ mod tests {
         let ada = Identity::generate("Ada", 1);
         let transcript = [0x33u8; 32];
         let l1 = ada.layer1_public();
-        let message = l1_proof_message(&transcript, &l1, &ada.layer2_public());
+        let ratchet = dh::DhSecret::generate().public();
+        let message = l1_proof_message(&transcript, &l1, &ada.layer2_public(), &ratchet);
         let proof = L1Proof {
             l1_pub: l1.0.to_vec(),
             signature: ada.sign_with_layer1(&message).0.to_vec(),
+            ratchet_pub: ratchet.0.to_vec(),
         }
         .encode_to_vec();
 
@@ -978,15 +1086,92 @@ mod tests {
         ));
     }
 
+    /// Swapping the ratchet key invalidates the proof.
+    ///
+    /// The attack this closes: the Layer-1 key and the signature are left
+    /// untouched and only the ephemeral key is replaced, so both people still
+    /// see the right identity and the right colours while the attacker holds
+    /// the root of every message that follows. Nothing on either screen would
+    /// differ. The proof covers the ratchet key precisely so this fails.
+    #[test]
+    fn a_substituted_ratchet_key_is_refused() {
+        let ada = Identity::generate("Ada", 1);
+        let transcript = [0x33u8; 32];
+        let l1 = ada.layer1_public();
+        let honest = dh::DhSecret::generate().public();
+        let message = l1_proof_message(&transcript, &l1, &ada.layer2_public(), &honest);
+        let signature = ada.sign_with_layer1(&message).0.to_vec();
+
+        let theirs = dh::DhSecret::generate().public();
+        assert_ne!(honest.0, theirs.0);
+        let tampered = L1Proof {
+            l1_pub: l1.0.to_vec(),
+            signature: signature.clone(),
+            ratchet_pub: theirs.0.to_vec(),
+        }
+        .encode_to_vec();
+        assert!(matches!(
+            verify_l1_proof(&transcript, &ada.layer2_public(), &tampered),
+            Err(CeremonyError::L1ProofInvalid)
+        ));
+
+        // Untampered, so the test above cannot pass against a verifier that
+        // refuses everything.
+        let intact = L1Proof {
+            l1_pub: l1.0.to_vec(),
+            signature,
+            ratchet_pub: honest.0.to_vec(),
+        }
+        .encode_to_vec();
+        assert_eq!(
+            verify_l1_proof(&transcript, &ada.layer2_public(), &intact).unwrap(),
+            (l1, honest)
+        );
+    }
+
+    /// The transcript is part of the root, not just part of the proof.
+    ///
+    /// Same two ephemeral keys, different ceremony: the roots must differ. What
+    /// this buys is that the colours the two people compared — computed over
+    /// the transcript — authenticate the root as well as the identities. Using
+    /// the Diffie-Hellman output raw would still agree on both sides and still
+    /// be secret, so nothing else here would notice its absence.
+    #[test]
+    fn the_transcript_binds_the_root() {
+        let ours = dh::DhSecret::generate();
+        let theirs = dh::DhSecret::generate();
+        let one = ratchet_root(&ours, &theirs.public(), b"ceremony one").unwrap();
+        let other = ratchet_root(&ours, &theirs.public(), b"ceremony two").unwrap();
+        assert!(*one != *other, "the transcript did not reach the root");
+
+        // And both sides of one ceremony still agree, which is the point.
+        assert!(
+            *ratchet_root(&ours, &theirs.public(), b"ceremony one").unwrap()
+                == *ratchet_root(&theirs, &ours.public(), b"ceremony one").unwrap(),
+            "the two sides of one ceremony disagreed"
+        );
+    }
+
     /// Junk, and fields of the wrong size, are refused as malformed rather than
     /// reaching the signature check with a truncated key.
     #[test]
     fn a_malformed_proof_is_refused() {
         let ada = Identity::generate("Ada", 1);
-        for (l1_len, sig_len) in [(31, 64), (33, 64), (32, 63), (0, 64), (32, 0)] {
+        // The ratchet key is a third field that has to be exactly 32 bytes, and
+        // a short one must be refused here rather than reaching the DH.
+        for (l1_len, sig_len, ratchet_len) in [
+            (31, 64, 32),
+            (33, 64, 32),
+            (32, 63, 32),
+            (0, 64, 32),
+            (32, 0, 32),
+            (32, 64, 31),
+            (32, 64, 0),
+        ] {
             let bad = L1Proof {
                 l1_pub: vec![0u8; l1_len],
                 signature: vec![0u8; sig_len],
+                ratchet_pub: vec![0u8; ratchet_len],
             }
             .encode_to_vec();
             assert!(
@@ -994,7 +1179,8 @@ mod tests {
                     verify_l1_proof(&[0u8; 32], &ada.layer2_public(), &bad),
                     Err(CeremonyError::Malformed)
                 ),
-                "accepted a proof with a {l1_len}-byte key and a {sig_len}-byte signature"
+                "accepted a proof with a {l1_len}-byte key, a {sig_len}-byte signature \
+                 and a {ratchet_len}-byte ratchet key"
             );
         }
     }
