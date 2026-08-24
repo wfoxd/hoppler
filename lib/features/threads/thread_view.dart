@@ -18,7 +18,7 @@ class ThreadLine {
 /// disagree by seconds) and not `seq` (which is per-sender, so both sides
 /// number from 1 and interleaving them by number would shuffle the
 /// conversation).
-class ThreadView extends StatelessWidget {
+class ThreadView extends StatefulWidget {
   const ThreadView({
     super.key,
     required this.title,
@@ -42,10 +42,36 @@ class ThreadView extends StatelessWidget {
   final String? cannotSendReason;
 
   @override
+  State<ThreadView> createState() => _ThreadViewState();
+}
+
+/// Stateful for one reason: the box has to remember what is half-typed.
+///
+/// A controller built in `build` is a new controller on every rebuild, and a
+/// rebuild here is exactly what an *arriving message* causes — so a reply
+/// landing mid-sentence would take the sentence with it. In an app whose whole
+/// subject is two people writing to each other while the radio comes and goes,
+/// that is the moment the draft matters most.
+///
+/// It is also the only thing here worth owning: the lines come from the store
+/// on every change, deliberately, so this holds no copy of the conversation.
+class _ThreadViewState extends State<ThreadView> {
+  final _controller = TextEditingController();
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
-    final controller = TextEditingController();
+    final controller = _controller;
+    final lines = widget.lines;
+    final canSend = widget.canSend;
+    final cannotSendReason = widget.cannotSendReason;
     return Scaffold(
-      appBar: AppBar(title: Text(title)),
+      appBar: AppBar(title: Text(widget.title)),
       body: Column(
         children: [
           Expanded(
@@ -110,6 +136,6 @@ class ThreadView extends StatelessWidget {
     final trimmed = text.trim();
     if (trimmed.isEmpty) return;
     controller.clear();
-    onSend(trimmed);
+    widget.onSend(trimmed);
   }
 }

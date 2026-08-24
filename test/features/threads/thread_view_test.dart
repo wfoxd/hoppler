@@ -76,4 +76,34 @@ void main() {
     expect(button.tooltip, 'This contact is gone.');
     expect(tester.widget<TextField>(find.byType(TextField)).enabled, isFalse);
   });
+
+  // The bug this is here for: a `TextEditingController` built inside `build`
+  // is a *new* controller on every rebuild, and a rebuild is exactly what an
+  // arriving message causes. So a reply landing mid-sentence took the sentence
+  // with it — in an app about two people writing to each other while the radio
+  // comes and goes, that is the moment a draft matters most.
+  testWidgets('a message arriving does not wipe what is half-typed', (
+    tester,
+  ) async {
+    final sent = <String>[];
+    Widget withLines(List<ThreadLine> lines) => MaterialApp(
+      home: ThreadView(title: 'Wren', lines: lines, onSend: sent.add),
+    );
+
+    await tester.pumpWidget(withLines(const []));
+    await tester.enterText(find.byType(TextField), 'on my way');
+
+    // She replies while the sentence is still being typed.
+    await tester.pumpWidget(
+      withLines(const [ThreadLine(text: 'where are you?', outgoing: false)]),
+    );
+    await tester.pump();
+
+    expect(find.text('where are you?'), findsOneWidget);
+    expect(
+      tester.widget<TextField>(find.byType(TextField)).controller?.text,
+      'on my way',
+      reason: 'an arriving message threw away the draft',
+    );
+  });
 }

@@ -672,6 +672,7 @@ class _HomePageState extends State<HomePage> {
                 try {
                   await sendChatToThread(threadId: t.threadId, text: text);
                   final fresh = await read();
+                  if (!context.mounted) return;
                   setLocal(() => lines = fresh);
                 } catch (e) {
                   if (mounted) setState(() => _log.insert(0, 'Error: $e'));
