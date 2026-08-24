@@ -36,15 +36,20 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use super::pipe::{self, PipeReader, CHANNEL_DISCOVERY, CHANNEL_SESSION};
-use crate::crypto::dh;
+use std::cmp::Ordering;
+
+use zeroize::Zeroizing;
+
+use crate::crypto::{dh, sign};
 use crate::discovery::protocol::{Request, Response};
 use crate::discovery::Discovery;
 use crate::identity::{Identity, VerifiedPersona};
-use crate::pairing::ceremony::{Ceremony, CeremonyError, Step};
+use crate::pairing::ceremony::{Ceremony, CeremonyError, Paired, Step};
 use crate::pairing::invite::Invite;
 use crate::pairing::sas::Sas;
 use crate::session::frame::{Frame, FrameKind};
 use crate::session::handshake::{Established, Initiator, Responder};
+use crate::session::ratchet::Ratchet;
 use crate::session::table::SessionTable;
 use crate::transport::{PeerId, Transport, TransportError, TransportEvent};
 
@@ -248,6 +253,14 @@ pub struct Net {
     /// survives exactly until someone edits one of them, so it is a stated
     /// order now. Neither lock is held across `dispatch`, which sends.
     ceremonies: Mutex<HashMap<PeerId, InFlight>>,
+    /// Initial ratchet state for a pairing that has just completed, waiting for
+    /// the engine to write it down beside the pairing row.
+    ///
+    /// Held here rather than carried on [`NetEvent::PairingCompleted`] because
+    /// that type derives `Debug` and is logged: a ratchet's serialised state is
+    /// key material, and the one place it must never reach is a transcript that
+    /// outlives the conversation.
+    pairing_ratchets: Mutex<HashMap<PeerId, Zeroizing<Vec<u8>>>>,
     /// The code currently on this device's screen, if any.
     ///
     /// Exactly one, because its nonce is what binds a ceremony. Showing a
@@ -285,6 +298,7 @@ impl Net {
             readers: Mutex::new(HashMap::new()),
             pending_pings: Mutex::new(HashMap::new()),
             ceremonies: Mutex::new(HashMap::new()),
+            pairing_ratchets: Mutex::new(HashMap::new()),
             showing: Mutex::new(None),
             pending_ceremony: Mutex::new(HashMap::new()),
         }
@@ -737,18 +751,94 @@ impl Net {
                 }),
                 Step::Paired(paired) => {
                     self.forget_ceremony(peer);
+                    // Destructured rather than borrowed: the ratchet secret is
+                    // not `Clone` — deliberately, so it cannot be copied by
+                    // accident — and seeding needs it by value.
+                    let Paired {
+                        persona,
+                        l1_pub,
+                        ratchet_secret,
+                        their_ratchet,
+                        root,
+                        ..
+                    } = *paired;
+                    // Seeded while the ceremony's keys are still here; they go
+                    // out of scope at the end of this arm.
+                    match self.seed_ratchet(&root, ratchet_secret, their_ratchet, &l1_pub) {
+                        Ok(state) => {
+                            self.pairing_ratchets
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .insert(peer.to_string(), state);
+                        }
+                        // Reported, not fatal to the pairing. The identities
+                        // crossed and both people confirmed; refusing the whole
+                        // ceremony over a ratchet we can rebuild would throw
+                        // away the part that needed two humans.
+                        Err(why) => {
+                            log::warn!("could not seed the ratchet for {peer}: {why}");
+                        }
+                    }
                     out.push(NetEvent::PairingCompleted {
                         peer: peer.to_string(),
-                        persona_name: paired.persona.name.clone(),
-                        persona_colour: paired.persona.colour,
-                        persona_version: paired.persona.version,
-                        l2_pub: paired.persona.l2_pub.0,
-                        l1_pub: paired.l1_pub.0,
+                        persona_name: persona.name.clone(),
+                        persona_colour: persona.colour,
+                        persona_version: persona.version,
+                        l2_pub: persona.l2_pub.0,
+                        l1_pub: l1_pub.0,
                     });
                 }
             }
         }
         out
+    }
+
+    /// Build this side's opening ratchet from what the ceremony agreed.
+    ///
+    /// # Who speaks first
+    ///
+    /// The two roles are not interchangeable: the initiator takes a Diffie-
+    /// Hellman step immediately and can send, the responder cannot send until
+    /// it has heard. Both sides picking the same role is a conversation that
+    /// never starts, so the choice has to be one both compute and agree on
+    /// without another round trip.
+    ///
+    /// Layer-1 keys decide it, smaller half first. They are stable — unlike the
+    /// transport id, which R0-F2 rotates every twelve minutes and which would
+    /// hand the two ends different answers to the same question an hour later —
+    /// and both sides hold both keys by the time this runs.
+    fn seed_ratchet(
+        &self,
+        root: &[u8; 32],
+        ours_dh: dh::DhSecret,
+        theirs_dh: dh::DhPublic,
+        their_l1: &sign::PublicKey,
+    ) -> Result<Zeroizing<Vec<u8>>, String> {
+        let our_l1 = self
+            .identity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .layer1_public();
+        let ours_pub = ours_dh.public();
+        let first = speaks_first((&our_l1, &ours_pub), (their_l1, &theirs_dh))
+            .ok_or("paired with something holding our own identity and our own key")?;
+        let ratchet = if first {
+            Ratchet::initiator(*root, theirs_dh).map_err(|e| e.to_string())?
+        } else {
+            Ratchet::responder(*root, ours_dh)
+        };
+        Ok(ratchet.to_state())
+    }
+
+    /// Take the ratchet a just-completed pairing left, if there is one.
+    ///
+    /// Taken rather than read: it belongs in the store from here on, and a copy
+    /// left in memory is a copy that outlives the write.
+    pub fn take_pairing_ratchet(&self, peer: &str) -> Option<Zeroizing<Vec<u8>>> {
+        self.pairing_ratchets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(peer)
     }
 
     /// One wording for every ceremony failure the peer can cause.
@@ -1331,6 +1421,45 @@ impl Net {
     }
 }
 
+/// Which side of a pairing takes the ratchet's initiator role.
+///
+/// A free function, and tested as one, because the two ends of a pairing can
+/// never be stood up together in a test — `CORE` is process-wide — so the only
+/// way to check that they *disagree* is to ask the rule directly.
+///
+/// The property is antisymmetry: given the same two keys, exactly one side
+/// answers yes. Both saying no is a conversation neither can start; both saying
+/// yes is two sending chains that cannot read each other. Neither failure says
+/// anything on screen — the messages simply never open.
+/// `None` when the two ends are indistinguishable — see below.
+fn speaks_first(
+    ours: (&sign::PublicKey, &dh::DhPublic),
+    theirs: (&sign::PublicKey, &dh::DhPublic),
+) -> Option<bool> {
+    match ours.0 .0.cmp(&theirs.0 .0) {
+        Ordering::Less => Some(true),
+        Ordering::Greater => Some(false),
+        // Two devices wearing the same Layer-1 identity. Unreachable between
+        // honest strangers and not forgeable — a Layer-1 proof is signed over
+        // the *peer's* Layer-2 key, so ours cannot be reflected back at us —
+        // but an identity restored onto a second device would land here, and
+        // the failure is the silent one: both sides answer no, both become
+        // responders, and neither can ever speak.
+        //
+        // The ephemeral ratchet keys break it. They are fresh per ceremony and
+        // differ with overwhelming probability, so this is a tie-break that
+        // resolves rather than a second coin with the same bias.
+        Ordering::Equal => match ours.1 .0.cmp(&theirs.1 .0) {
+            Ordering::Less => Some(true),
+            Ordering::Greater => Some(false),
+            // Same identity *and* same ephemeral key: one device on both ends
+            // of one ceremony. Refused rather than given a role, because there
+            // is no answer that makes a conversation work.
+            Ordering::Equal => None,
+        },
+    }
+}
+
 /// What to log for a radio report.
 ///
 /// `available` decides, never `reason`. Keying off the reason instead reads an
@@ -1348,7 +1477,61 @@ fn radio_log(available: bool, reason: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::radio_log;
+    use super::{radio_log, speaks_first};
+    use crate::crypto::{dh, sign};
+
+    /// Exactly one side speaks first, whichever way round you ask.
+    ///
+    /// The failure this rules out is silent on both phones: two responders
+    /// never start, two initiators never understand each other, and in neither
+    /// case does anything appear on a screen. Asserted over both orderings
+    /// rather than one, because a rule that answered the same way twice would
+    /// pass a single-direction check.
+    #[test]
+    fn exactly_one_side_of_a_pairing_speaks_first() {
+        let dh_a = dh::DhPublic([3u8; 32]);
+        let dh_b = dh::DhPublic([4u8; 32]);
+        let small = sign::PublicKey([1u8; 32]);
+        let large = sign::PublicKey([2u8; 32]);
+        assert_eq!(speaks_first((&small, &dh_a), (&large, &dh_b)), Some(true));
+        assert_eq!(speaks_first((&large, &dh_b), (&small, &dh_a)), Some(false));
+
+        // Differing in the last byte only: a rule comparing the wrong end, or
+        // comparing lengths, would agree with itself here.
+        let mut a = [7u8; 32];
+        let mut b = [7u8; 32];
+        a[31] = 0;
+        b[31] = 9;
+        let (a, b) = (sign::PublicKey(a), sign::PublicKey(b));
+        assert_ne!(
+            speaks_first((&a, &dh_a), (&b, &dh_b)),
+            speaks_first((&b, &dh_b), (&a, &dh_a)),
+            "both ends of a pairing took the same role"
+        );
+    }
+
+    /// One identity on two devices still gets two roles.
+    ///
+    /// Raised in review, and the failure it prevents is the silent one: with
+    /// Layer-1 keys alone, equal identities make *both* ends responders and the
+    /// conversation simply never starts. Not reachable between honest strangers
+    /// — a Layer-1 proof is signed over the peer's Layer-2 key, so ours cannot
+    /// be reflected at us — but an identity restored onto a second device would
+    /// land here, and nothing would say so.
+    #[test]
+    fn the_same_identity_on_both_ends_is_still_split_by_the_ephemeral_keys() {
+        let same = sign::PublicKey([5u8; 32]);
+        let mine = dh::DhPublic([1u8; 32]);
+        let yours = dh::DhPublic([2u8; 32]);
+
+        assert_eq!(speaks_first((&same, &mine), (&same, &yours)), Some(true));
+        assert_eq!(speaks_first((&same, &yours), (&same, &mine)), Some(false));
+
+        // Same identity *and* the same ephemeral key is one device on both ends
+        // of one ceremony. There is no role that makes that work, so it is
+        // refused rather than answered.
+        assert_eq!(speaks_first((&same, &mine), (&same, &mine)), None);
+    }
 
     #[test]
     fn availability_is_read_from_the_flag_and_never_from_the_reason() {

@@ -236,6 +236,15 @@ pub struct Paired {
     pub l1_pub: sign::PublicKey,
     /// What both people compared. Kept so the UI can show what was agreed.
     pub sas: Sas,
+    /// Our half of the ratchet exchange, kept rather than dropped.
+    ///
+    /// The side that answers seeds its ratchet with this secret — the other end
+    /// was given its public in the Layer-1 proof, so it is the key pair the
+    /// first message will turn. Deriving the root and throwing this away would
+    /// leave a root nothing could hang a chain off.
+    pub ratchet_secret: dh::DhSecret,
+    /// Their half. The side that speaks first seeds its ratchet with this.
+    pub their_ratchet: dh::DhPublic,
     /// The seed for this thread's Double Ratchet.
     ///
     /// Both sides derive the same 32 bytes from the exchange in the Layer-1
@@ -569,6 +578,8 @@ impl Ceremony {
             persona: c.persona,
             l1_pub,
             sas: c.sas,
+            ratchet_secret: c.ratchet_secret,
+            their_ratchet,
             root,
             transport: *c.transport,
         }))])
@@ -886,6 +897,56 @@ mod tests {
             "the two sides derived different ratchet roots"
         );
         assert!(*scanner_view.root != [0u8; 32], "the root is not a secret");
+    }
+
+    /// The two ends can actually talk once the ceremony is done.
+    ///
+    /// Agreeing a root is not the same as having a working ratchet: the two
+    /// sides must also take *different* roles, seeded from opposite halves of
+    /// the same exchange. Both picking responder is a conversation neither can
+    /// start; both picking initiator is two chains that cannot read each other.
+    /// Equal roots would pass the test above and still fail here.
+    ///
+    /// Roles are decided by Layer-1 key order, the same rule the engine uses.
+    #[test]
+    fn the_paired_sides_seed_ratchets_that_understand_each_other() {
+        use crate::session::ratchet::Ratchet;
+
+        let mut h = halfway();
+        let from_scanner = sends(&h.scanner.confirm(&h.scanner_id).unwrap());
+        h.shower.read(&h.shower_id, &from_scanner[0]).unwrap();
+        let from_shower = sends(&h.shower.confirm(&h.shower_id).unwrap());
+        let scanner_proof = one_send(&h.scanner.read(&h.scanner_id, &from_shower[0]).unwrap());
+        let scanner_done = h.scanner.read(&h.scanner_id, &from_shower[1]).unwrap();
+        let shower_done = h.shower.read(&h.shower_id, &scanner_proof).unwrap();
+        // Owned, not borrowed: the ratchet secret is deliberately not `Clone`,
+        // so seeding a responder means moving it out of the ceremony's result.
+        let take = |done: Vec<Step>| match done.into_iter().next() {
+            Some(Step::Paired(view)) => *view,
+            other => panic!("expected a pairing, got {other:?}"),
+        };
+        let scanner_view = take(scanner_done);
+        let shower_view = take(shower_done);
+
+        // Same rule as `Net::seed_ratchet`: smaller Layer-1 key speaks first.
+        let scanner_first = h.scanner_id.layer1_public().0 < h.shower_id.layer1_public().0;
+        let (mut speaker, mut listener) = if scanner_first {
+            (
+                Ratchet::initiator(*scanner_view.root, scanner_view.their_ratchet).unwrap(),
+                Ratchet::responder(*shower_view.root, shower_view.ratchet_secret),
+            )
+        } else {
+            (
+                Ratchet::initiator(*shower_view.root, shower_view.their_ratchet).unwrap(),
+                Ratchet::responder(*scanner_view.root, scanner_view.ratchet_secret),
+            )
+        };
+
+        let (header, sealed) = speaker.encrypt(b"are you there?").unwrap();
+        let opened = listener
+            .decrypt(header, &sealed)
+            .expect("the other side could not read the first message");
+        assert_eq!(&opened[..], b"are you there?");
     }
 
     /// Two ceremonies do not share a root.
