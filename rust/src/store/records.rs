@@ -409,23 +409,26 @@ impl Store {
 
     // ── pairings ────────────────────────────────────────────────────────────
 
-    /// Record that a ceremony completed, and open the persistent thread it
-    /// entitles (R0-F4: "a completed ceremony creates a persistent thread").
+    /// A paired contact and its thread, with no ceremony behind it and no
+    /// ratchet — **test scaffolding**, and named so at every call site.
+    ///
+    /// [`Store::record_pairing`] is the production path and it takes a ratchet
+    /// it cannot be called without, because a paired thread with no ratchet is
+    /// read by the send path as a thread that is *not* paired and answered with
+    /// plaintext. This writes exactly that state, which is why it says what it
+    /// is: a store test wanting "a thread that exists" should not have to
+    /// invent a ceremony, and a shipped build should never reach this.
     ///
     /// One transaction, because the pairing and the thread are one fact. A
     /// pairing row with no thread is a contact the UI cannot open; a thread
     /// with no pairing is a conversation claiming a ceremony that did not
-    /// finish. Neither is a state anything downstream knows how to read, and
-    /// both are reachable if these are two calls and the second fails.
+    /// finish.
     ///
     /// Idempotent on the pairing: re-pairing the same two people replaces the
-    /// Layer-1 key and the timestamp rather than failing. That is not
-    /// hypothetical tidiness — a ceremony can be run again after one side
-    /// wipes (R0-F9) and regenerates, and the honest reading of the second
-    /// ceremony is that it supersedes the first.
+    /// Layer-1 key and the timestamp rather than failing.
     ///
     /// Returns the thread id.
-    pub fn pair_contact(
+    pub fn pair_contact_for_test(
         &self,
         contact_id: i64,
         l1_pub: &[u8; 32],
@@ -1269,7 +1272,7 @@ mod tests {
         assert!(s.pairing_for_contact(id).unwrap().is_none());
         assert!(s.thread_for_contact(id).unwrap().is_none());
 
-        let thread = s.pair_contact(id, &[9u8; 32], 2000).unwrap();
+        let thread = s.pair_contact_for_test(id, &[9u8; 32], 2000).unwrap();
         assert_eq!(s.thread_for_contact(id).unwrap(), Some(thread));
         assert_eq!(
             s.pairing_for_contact(id).unwrap().unwrap(),
@@ -1301,7 +1304,10 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(s.pair_contact(id, &[9u8; 32], 2000).unwrap(), existing);
+        assert_eq!(
+            s.pair_contact_for_test(id, &[9u8; 32], 2000).unwrap(),
+            existing
+        );
         assert_eq!(s.messages_for_thread(existing).unwrap().len(), 1);
     }
 
@@ -1312,8 +1318,11 @@ mod tests {
     fn pairing_again_replaces_the_key_and_keeps_the_thread() {
         let (s, _d) = store();
         let id = s.add_contact(&a_contact()).unwrap();
-        let thread = s.pair_contact(id, &[9u8; 32], 2000).unwrap();
-        assert_eq!(s.pair_contact(id, &[8u8; 32], 3000).unwrap(), thread);
+        let thread = s.pair_contact_for_test(id, &[9u8; 32], 2000).unwrap();
+        assert_eq!(
+            s.pair_contact_for_test(id, &[8u8; 32], 3000).unwrap(),
+            thread
+        );
 
         assert_eq!(
             s.pairing_for_contact(id).unwrap().unwrap().l1_pub,
@@ -1342,7 +1351,7 @@ mod tests {
             .unwrap();
         // Someone paired whose Layer-1 key happens to equal the stranger's
         // pseudonym.
-        s.pair_contact(other, &[1u8; 32], 2000).unwrap();
+        s.pair_contact_for_test(other, &[1u8; 32], 2000).unwrap();
 
         assert_eq!(
             s.contact_by_pseudonym(&[1u8; 32]).unwrap().unwrap().id,
@@ -1427,9 +1436,9 @@ mod tests {
                 ..a_contact()
             })
             .unwrap();
-        s.pair_contact(first, &[9u8; 32], 2000).unwrap();
+        s.pair_contact_for_test(first, &[9u8; 32], 2000).unwrap();
 
-        assert!(s.pair_contact(second, &[9u8; 32], 3000).is_err());
+        assert!(s.pair_contact_for_test(second, &[9u8; 32], 3000).is_err());
         // Rolled back whole: no pairing, and no thread opened on the way past.
         assert!(s.pairing_for_contact(second).unwrap().is_none());
         assert!(s.thread_for_contact(second).unwrap().is_none());
@@ -1469,7 +1478,7 @@ mod tests {
                 ..a_contact()
             })
             .unwrap();
-        s.pair_contact(friend, &[9u8; 32], 2000).unwrap();
+        s.pair_contact_for_test(friend, &[9u8; 32], 2000).unwrap();
 
         assert!(
             s.paired_contact_by_l2(&[0u8; 32]).unwrap().is_none(),
@@ -1492,7 +1501,7 @@ mod tests {
     fn unpairing_keeps_the_thread_and_its_messages() {
         let (s, _d) = store();
         let id = s.add_contact(&a_contact()).unwrap();
-        let thread = s.pair_contact(id, &[9u8; 32], 2000).unwrap();
+        let thread = s.pair_contact_for_test(id, &[9u8; 32], 2000).unwrap();
         s.add_message(&NewMessage {
             thread_id: thread,
             seq: 1,
@@ -1525,7 +1534,7 @@ mod tests {
     fn pairing_an_unknown_contact_says_which_contact() {
         let (s, _d) = store();
         let err = s
-            .pair_contact(4242, &[9u8; 32], 2000)
+            .pair_contact_for_test(4242, &[9u8; 32], 2000)
             .unwrap_err()
             .to_string();
         assert!(err.contains("4242"), "unhelpful error: {err}");
@@ -1544,7 +1553,7 @@ mod tests {
                 ..a_contact()
             })
             .unwrap();
-        s.pair_contact(go, &[9u8; 32], 2000).unwrap();
+        s.pair_contact_for_test(go, &[9u8; 32], 2000).unwrap();
 
         s.merge_contact(go, keep).unwrap();
         assert!(s.contact_by_l1(&[9u8; 32]).unwrap().is_none());
@@ -2121,7 +2130,7 @@ mod tests {
     /// A paired thread with nothing received yet.
     fn a_thread(s: &Store) -> i64 {
         let id = s.add_contact(&a_contact()).unwrap();
-        s.pair_contact(id, &[9u8; 32], 2000).unwrap()
+        s.pair_contact_for_test(id, &[9u8; 32], 2000).unwrap()
     }
 
     fn an_incoming(thread_id: i64, seq: i64, msg_id: u8) -> NewMessage {
@@ -2306,7 +2315,7 @@ mod tests {
     fn deleting_a_contact_takes_the_ratchet_with_it() {
         let (s, _d) = store();
         let contact = s.add_contact(&a_contact()).unwrap();
-        let thread = s.pair_contact(contact, &[9u8; 32], 2000).unwrap();
+        let thread = s.pair_contact_for_test(contact, &[9u8; 32], 2000).unwrap();
         s.start_ratchet(thread, b"state one", 3000).unwrap();
 
         // Straight to SQL, as the messages cascade test next door does: there
