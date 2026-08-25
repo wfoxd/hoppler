@@ -605,11 +605,35 @@ impl Store {
     /// so does R0-F9 in part. Deliberately does **not** delete the thread: the
     /// messages are the person's, and a block is not a request to destroy what
     /// was said. Returns whether there was a pairing to revoke.
+    ///
+    /// # The ratchet goes with it, and the thread does not
+    ///
+    /// Two reasons, and the second is the one that bites. A ratchet is the
+    /// paired conversation's key material — its root, both live chains, and
+    /// every key still owed — so leaving it behind means revoking a pairing and
+    /// keeping the ability to read and write it, which is not what anyone
+    /// pressing "block" is asking for.
+    ///
+    /// And the engine reads "does this thread have a ratchet" as "is this
+    /// thread paired": `seal_for_thread` has no other question to ask. Left in
+    /// place, a revoked pairing would keep sealing with the old root and keep
+    /// offering openings to a person this device has blocked, while the peer —
+    /// who revoked too, or was told — has stopped listening.
+    ///
+    /// One transaction, because a revocation that took the pairing and left the
+    /// keys is worse than one that did neither.
     pub fn unpair_contact(&self, contact_id: i64) -> Result<bool, StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        // Before the pairing goes, so the thread is still findable through it.
+        if let Some(thread) = self.thread_for_contact(contact_id)? {
+            self.conn
+                .execute("DELETE FROM ratchets WHERE thread_id = ?1", params![thread])?;
+        }
         let n = self.conn.execute(
             "DELETE FROM pairings WHERE contact_id = ?1",
             params![contact_id],
         )?;
+        tx.commit()?;
         Ok(n > 0)
     }
 
@@ -1512,12 +1536,26 @@ mod tests {
             created_at: 2100,
         })
         .unwrap();
+        // Seeded by hand: `pair_contact_for_test` writes a pairing with no
+        // ratchet, so without this the assertion below passes on a thread that
+        // never had one — which is how it read at first, saying nothing.
+        s.start_ratchet(thread, b"live keys", 2100).unwrap();
 
         assert!(s.unpair_contact(id).unwrap());
         assert!(s.pairing_for_contact(id).unwrap().is_none());
         assert!(s.contact_by_l1(&[9u8; 32]).unwrap().is_none());
         assert_eq!(s.thread_for_contact(id).unwrap(), Some(thread));
         assert_eq!(s.messages_for_thread(thread).unwrap().len(), 1);
+        // What was said stays; the ability to say more does not. The engine has
+        // no question to ask about a thread other than "does it have a
+        // ratchet", so a revoked pairing that kept one would go on sealing with
+        // the old root and go on offering openings to somebody this device has
+        // just blocked.
+        assert_eq!(
+            s.ratchet_state(thread).unwrap(),
+            None,
+            "revoking a pairing left its keys behind"
+        );
         // Reports rather than pretends, like every other revoking call here.
         assert!(!s.unpair_contact(id).unwrap());
     }
