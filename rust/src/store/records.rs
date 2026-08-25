@@ -349,10 +349,20 @@ impl Store {
     /// reason: `record_pairing` folds and writes as one act, and half of that
     /// is worse than neither.
     fn fold_contact(&self, from: i64, into: i64) -> Result<(), StoreError> {
-        match (
-            self.thread_for_contact(from)?,
-            self.thread_for_contact(into)?,
-        ) {
+        // Every one of them, because the delete at the bottom cascades and a
+        // thread left behind is a conversation deleted. A contact can have more
+        // than one now — one per pairing — so taking only the current one would
+        // lose every conversation the two of you had before the last ceremony,
+        // silently, in the middle of a pairing that looked like it worked.
+        let mut theirs = self.threads_for_contact(from)?;
+        // Newest first, so this is the conversation they are having now.
+        let current = if theirs.is_empty() {
+            None
+        } else {
+            Some(theirs.remove(0))
+        };
+
+        match (current, self.thread_for_contact(into)?) {
             (Some(from_thread), Some(into_thread)) => {
                 for dir in [Direction::Incoming, Direction::Outgoing] {
                     let offset = self.next_seq(into_thread, dir)? - 1;
@@ -377,6 +387,17 @@ impl Store {
             }
             (None, _) => {}
         }
+
+        // The finished ones are carried across whole. Merging them would have
+        // to interleave two histories that were never one conversation, and
+        // the point of a thread per pairing is that they are not.
+        for old in theirs {
+            self.conn.execute(
+                "UPDATE threads SET contact_id = ?1 WHERE id = ?2",
+                params![into, old],
+            )?;
+        }
+
         self.conn
             .execute("DELETE FROM contacts WHERE id = ?1", params![from])?;
         Ok(())
@@ -1513,6 +1534,57 @@ mod tests {
         );
         assert!(s.contact_by_l1(&[9u8; 32]).unwrap().is_none());
         assert_eq!(s.contact_by_l1(&[8u8; 32]).unwrap().unwrap().id, id);
+    }
+
+    /// Folding two rows for one person carries *every* conversation across.
+    ///
+    /// The delete at the end of a fold cascades, so a thread left behind is a
+    /// conversation deleted — and a contact can have more than one now, one per
+    /// pairing. Taking only the current one would lose everything said before
+    /// the last ceremony, silently, in the middle of a pairing that looked like
+    /// it worked. That is the worst shape a bug can have here: no error, no
+    /// empty screen, just less history than there was yesterday.
+    ///
+    /// The current conversation merges, as it always did — that is what makes a
+    /// fold read as one conversation rather than two. The finished ones are
+    /// carried across whole, because merging them would interleave histories
+    /// that were never one conversation, and a thread per pairing is the
+    /// statement that they are not.
+    #[test]
+    fn folding_carries_every_conversation_across() {
+        let (s, _d) = store();
+        let stray = s.add_contact(&a_contact()).unwrap();
+        let old = s.pair_contact_for_test(stray, &[1u8; 32], 1000).unwrap();
+        s.add_message(&an_incoming(old, 1, 1)).unwrap();
+        // A second ceremony for the same stray row, so it has a finished
+        // conversation and a current one.
+        let current = s.pair_contact_for_test(stray, &[1u8; 32], 2000).unwrap();
+        s.add_message(&an_incoming(current, 1, 2)).unwrap();
+        assert_ne!(old, current);
+
+        let known = s
+            .add_contact(&NewContact {
+                pseudonym: [4u8; 32],
+                ..a_contact()
+            })
+            .unwrap();
+        let kept = s.pair_contact_for_test(known, &[2u8; 32], 3000).unwrap();
+        s.add_message(&an_incoming(kept, 1, 3)).unwrap();
+
+        s.merge_contact(stray, known).unwrap();
+
+        // The current conversations became one, and the finished one came too.
+        assert_eq!(s.messages_for_thread(kept).unwrap().len(), 2);
+        assert_eq!(
+            s.messages_for_thread(old).unwrap().len(),
+            1,
+            "a finished conversation was deleted by the cascade"
+        );
+        assert_eq!(
+            s.contact_for_thread(old).unwrap(),
+            Some(known),
+            "the finished conversation belongs to nobody"
+        );
     }
 
     /// Pairing again opens a new thread, and leaves the old one alone.
