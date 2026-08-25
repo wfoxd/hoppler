@@ -941,21 +941,35 @@ fn record_pairing(
     let seed = require_net()
         .ok()
         .and_then(|net| net.take_pairing_ratchet(device_id));
+    // Refused rather than written down without one, and this is a change of
+    // mind: it used to pair anyway with a line in the log, on the grounds that
+    // the identities crossed, both people confirmed, and a ratchet can be
+    // rebuilt. That was true while nothing used the ratchet. Now a paired
+    // thread without one is read by the send path as a thread that is not
+    // paired, and answered with **plaintext on the wire** — so the cheaper
+    // outcome is the honest one: nothing written, and two people who pair
+    // again.
+    //
+    // No test reaches this and none can through the public API: `seed_ratchet`
+    // fails only on a peer key that is not usable or on pairing with our own
+    // identity, and nothing in `tests/` can produce either against a real
+    // ceremony. Recorded so the surviving mutant reads as what it is — a guard
+    // against a state the harness cannot build — rather than as a hole to close
+    // by deleting the guard. Its twin, the store writing the two as one
+    // transaction, *is* covered: see
+    // `recording_a_pairing_writes_identity_persona_pairing_and_thread`.
+    let Some(seed) = seed else {
+        return Err(format!("no ratchet was seeded for {device_id}"));
+    };
     with_core_mut(|core| {
         let now = now_millis();
         let contact = ensure_contact(core, device_id, now)?;
-        let thread = core
-            .store
-            .record_pairing(contact, l2_pub, name, colour, version, l1_pub, now)?;
-        // The thread's first ratchet, written beside the pairing that agreed
-        // it. A paired thread without one could never hold a ratcheted message,
-        // and the only way back is pairing again — which costs two people and a
-        // code.
-        match &seed {
-            Some(seed) => core.store.start_ratchet(thread, seed, now)?,
-            None => log::warn!("paired with {device_id} but no ratchet was seeded"),
-        }
-        Ok(thread)
+        // One call and one transaction, ratchet included. Written as two, a
+        // failure between them leaves exactly the durable paired-without-a-
+        // ratchet row above — and the caller reports the pairing as failed
+        // while the row stays.
+        core.store
+            .record_pairing(contact, l2_pub, name, colour, version, l1_pub, &seed, now)
     })
 }
 
