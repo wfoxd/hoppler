@@ -1024,12 +1024,33 @@ impl Store {
         Ok(())
     }
 
-    /// Save the bytes a queued message will go out as, on its own.
+    /// The turn a late seal made and the bytes it produced, together.
     ///
     /// The path where sealing could not happen when the row was written — a
-    /// thread whose chain had not opened yet — and happens later instead.
-    pub fn seal_queued(&self, msg_id: &[u8], wire: &[u8], now: i64) -> Result<(), StoreError> {
-        self.write_seal(msg_id, wire, now)
+    /// paired thread whose chain had not opened yet — and happens at a reunion
+    /// instead.
+    ///
+    /// One transaction, because they are one fact and splitting them puts back
+    /// exactly the failure this table removes. Written as two, a crash between
+    /// them leaves the ratchet advanced and no seal on disk, so the *next*
+    /// reunion seals again and draws another key — which is the drift that
+    /// cannot be caught up once it passes `MAX_SKIP`. The counter must not move
+    /// unless the bytes it produced are durable in the same breath.
+    pub fn seal_queued(
+        &self,
+        thread_id: i64,
+        ratchet: Option<&[u8]>,
+        msg_id: &[u8],
+        wire: &[u8],
+        now: i64,
+    ) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        if let Some(ratchet) = ratchet {
+            self.write_ratchet(thread_id, ratchet, now)?;
+        }
+        self.write_seal(msg_id, wire, now)?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// The bytes a queued message was sealed as, if it still has them.
@@ -2288,6 +2309,36 @@ mod tests {
         );
     }
 
+    /// A late seal that cannot be stored leaves the ratchet where it was.
+    ///
+    /// The two writes are one fact and the transaction is what makes them one.
+    /// Split, a crash between them advances the counter with no seal on disk,
+    /// so the next reunion seals again and draws another key — which is exactly
+    /// the drift this table exists to stop, and it cannot be caught up once it
+    /// passes `MAX_SKIP`.
+    ///
+    /// The failure is injected through the seal's foreign key: `outbound_seals`
+    /// references `messages(msg_id)`, so sealing a message that is not there is
+    /// refused *after* the ratchet write in the same transaction. That is the
+    /// order that matters — the other way round proves nothing.
+    #[test]
+    fn a_late_seal_that_fails_leaves_the_ratchet_where_it_was() {
+        let (s, _d) = store();
+        let thread = a_thread(&s);
+        s.start_ratchet(thread, b"state one", 3000).unwrap();
+
+        assert!(
+            s.seal_queued(thread, Some(b"state two"), &[9u8; 16], b"sealed", 4000)
+                .is_err(),
+            "a seal for a message that does not exist was accepted"
+        );
+        assert_eq!(
+            s.ratchet_state(thread).unwrap().unwrap()[..],
+            b"state one"[..],
+            "the ratchet advanced for a seal that was never stored"
+        );
+    }
+
     /// The first seal wins.
     ///
     /// Nothing should seal a message twice — `commit_sent` inserts a fresh
@@ -2310,7 +2361,8 @@ mod tests {
             3000,
         )
         .unwrap();
-        s.seal_queued(&id, b"a later one", 4000).unwrap();
+        s.seal_queued(thread, None, &id, b"a later one", 4000)
+            .unwrap();
 
         assert_eq!(
             s.seal_for(&id).unwrap().as_deref(),

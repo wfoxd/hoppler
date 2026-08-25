@@ -1351,13 +1351,18 @@ fn resend_queued(device_id: &str) -> Result<(), String> {
                 return Ok(None);
             };
             // Both before the bytes leave, for the reason `commit_sent` gives:
-            // a counter that rewinds reuses a nonce. Crashing between the save
-            // and the send costs nothing now — the seal is on disk, so the next
-            // reunion sends these same bytes rather than drawing another key.
-            if let Some(advanced) = &ratchet {
-                core.store.start_ratchet(thread, advanced, now_millis())?;
-            }
-            core.store.seal_queued(&msg_id, &body, now_millis())?;
+            // a counter that rewinds reuses a nonce. And both in one write, for
+            // a reason of their own — see `seal_queued`. Crashing between the
+            // save and the send costs nothing now: the seal is on disk, so the
+            // next reunion sends these same bytes rather than drawing another
+            // key.
+            core.store.seal_queued(
+                thread,
+                ratchet.as_ref().map(|s| s.as_slice()),
+                &msg_id,
+                &body,
+                now_millis(),
+            )?;
             Ok(Some(body))
         })?;
         // Still nothing to seal with. Left `Queued`, which is where it was, and
