@@ -117,16 +117,17 @@ pub enum NetEvent {
     /// the two together made a tap look answered only when the other person
     /// happened to nudge back, and never otherwise.
     PingAcked { peer: PeerId },
-    /// A chat line arrived, as the sender numbered and identified it.
+    /// A chat line arrived, still sealed.
     ///
-    /// The whole envelope rather than the text, because the two identifiers on
-    /// it are the only things that can tell a resend from a new message. The
-    /// receiver used to invent both, which made every resend a second line on
-    /// somebody's screen — and left the outbox nothing to resend *as*.
-    ChatReceived {
-        peer: PeerId,
-        envelope: crate::session::chat::ChatEnvelope,
-    },
+    /// Bytes rather than a decoded envelope, and that is the whole point of the
+    /// shape. On a paired thread the payload is a ratchet header and a sealed
+    /// [`ChatEnvelope`](crate::session::chat::ChatEnvelope) — so there is
+    /// nothing to decode until it has been opened, and only the engine has the
+    /// thread's ratchet. Decoding here instead meant every rejection this layer
+    /// could make (`seq == 0`, a short `msg_id`, an over-long body) threw away
+    /// a message that would have opened, and with it the chain step the sender
+    /// had already taken.
+    ChatReceived { peer: PeerId, body: Vec<u8> },
     /// A peer opened its end of a paired thread's ratchet chain
     /// ([`FrameKind::Opening`]).
     ///
@@ -1423,21 +1424,13 @@ impl Net {
                         peer: peer.to_string(),
                     });
                 }
-                FrameKind::Chat => {
-                    // Decoded here rather than passed on as bytes, so a peer
-                    // cannot make the engine deal with a half-message. A frame
-                    // that is not an envelope is dropped with a line in the log
-                    // and nothing else: it is one bad message, not a reason to
-                    // end a session, and certainly not a reason to show
-                    // somebody an empty line.
-                    match crate::session::chat::ChatEnvelope::decode(&frame.payload) {
-                        Ok(envelope) => out.push(NetEvent::ChatReceived {
-                            peer: peer.to_string(),
-                            envelope,
-                        }),
-                        Err(e) => log::warn!("dropping an unreadable chat frame: {e}"),
-                    }
-                }
+                // Passed on sealed. This layer has no ratchet and so no way to
+                // read a chat frame, and no business forming an opinion about
+                // one it cannot read — see [`NetEvent::ChatReceived`].
+                FrameKind::Chat => out.push(NetEvent::ChatReceived {
+                    peer: peer.to_string(),
+                    body: frame.payload.clone(),
+                }),
                 FrameKind::Opening => out.push(NetEvent::ChainOpening {
                     peer: peer.to_string(),
                     body: frame.payload.clone(),

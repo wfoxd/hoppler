@@ -44,9 +44,8 @@ use std::collections::BTreeSet;
 
 use prost::Message as _;
 
-use crate::crypto::{aead, rng};
+use crate::crypto::rng;
 use crate::proto::v0::ChatMessage;
-use crate::session::ratchet;
 
 /// Length of a [`MsgId`].
 pub const MSG_ID_LEN: usize = 16;
@@ -68,24 +67,6 @@ pub type MsgId = [u8; MSG_ID_LEN];
 /// anything genuinely large is a Drop (R0-F6), which never travels as a chat
 /// line.
 pub const MAX_BODY: usize = 8 * 1024;
-
-/// What sealing adds to a body between [`MAX_BODY`] and the wire.
-///
-/// A ratchet header ahead of it and an AEAD tag behind it (T12). Named because
-/// the two limits are about different bytes and were quietly the same one: a
-/// person's eight thousand characters arrive at this layer already fifty-six
-/// bytes longer, so a bound applied here would have cost them the last
-/// fifty-six characters and said "message body exceeds 8192 bytes" about a
-/// message that did not.
-pub const SEAL_OVERHEAD: usize = ratchet::HEADER_LEN + aead::TAG_LEN;
-
-/// Longest body a message may carry *on the wire*.
-///
-/// What this layer bounds, because this layer sees what travels. The limit on
-/// what a person may type is [`MAX_BODY`] and belongs where the plaintext is
-/// still plaintext — the engine, on both the way out and the way in. An
-/// unpaired thread's body is not sealed and so never reaches this bound.
-pub const MAX_WIRE_BODY: usize = MAX_BODY + SEAL_OVERHEAD;
 
 /// How many messages may be waiting on an acknowledgement before an [`Outbox`]
 /// stops taking more.
@@ -115,7 +96,7 @@ pub enum EnvelopeError {
     NoSeq,
     /// `msg_id` was not [`MSG_ID_LEN`] bytes.
     BadMsgId,
-    /// The body is longer than [`MAX_WIRE_BODY`].
+    /// The body is longer than [`MAX_BODY`].
     TooLong,
 }
 
@@ -125,7 +106,7 @@ impl std::fmt::Display for EnvelopeError {
             EnvelopeError::Malformed => write!(f, "not a chat message"),
             EnvelopeError::NoSeq => write!(f, "message has no sequence number"),
             EnvelopeError::BadMsgId => write!(f, "message id is not {MSG_ID_LEN} bytes"),
-            EnvelopeError::TooLong => write!(f, "message body exceeds {MAX_WIRE_BODY} bytes"),
+            EnvelopeError::TooLong => write!(f, "message body exceeds {MAX_BODY} bytes"),
         }
     }
 }
@@ -153,7 +134,7 @@ impl ChatEnvelope {
         if seq == 0 {
             return Err(EnvelopeError::NoSeq);
         }
-        if body.len() > MAX_WIRE_BODY {
+        if body.len() > MAX_BODY {
             return Err(EnvelopeError::TooLong);
         }
         Ok(Self {
@@ -187,7 +168,7 @@ impl ChatEnvelope {
             .msg_id
             .try_into()
             .map_err(|_| EnvelopeError::BadMsgId)?;
-        if message.body.len() > MAX_WIRE_BODY {
+        if message.body.len() > MAX_BODY {
             return Err(EnvelopeError::TooLong);
         }
         Ok(Self {
@@ -410,7 +391,7 @@ mod tests {
         let mut out = Outbox::new();
         out.queue(b"first".to_vec()).unwrap();
         assert_eq!(
-            out.queue(vec![0; MAX_WIRE_BODY + 1]),
+            out.queue(vec![0; MAX_BODY + 1]),
             Err(OutboxError::Envelope(EnvelopeError::TooLong))
         );
         assert_eq!(out.next_seq(), 2, "the rejected body consumed a seq");
@@ -608,21 +589,9 @@ mod tests {
         }
     }
 
-    /// The wire bound is the typed bound plus what sealing adds, and not a
-    /// byte less.
-    ///
-    /// The two used to be one constant, which cost a paired thread the last
-    /// fifty-six characters of every message at the limit — refused with
-    /// "message body exceeds 8192 bytes" about a body that was exactly 8192.
-    #[test]
-    fn the_wire_bound_leaves_room_for_the_seal() {
-        assert_eq!(MAX_WIRE_BODY, MAX_BODY + SEAL_OVERHEAD);
-        assert!(ChatEnvelope::new(1, vec![b'x'; MAX_BODY + SEAL_OVERHEAD]).is_ok());
-    }
-
     #[test]
     fn an_oversized_body_is_refused_at_both_doors() {
-        let too_long = vec![b'x'; MAX_WIRE_BODY + 1];
+        let too_long = vec![b'x'; MAX_BODY + 1];
         assert_eq!(
             ChatEnvelope::new(1, too_long.clone()).err(),
             Some(EnvelopeError::TooLong)
@@ -639,7 +608,7 @@ mod tests {
         );
         // And the largest allowed body is allowed, so the bound is a bound and
         // not an off-by-one that quietly costs a character.
-        assert!(ChatEnvelope::new(1, vec![b'x'; MAX_WIRE_BODY]).is_ok());
+        assert!(ChatEnvelope::new(1, vec![b'x'; MAX_BODY]).is_ok());
     }
 
     #[test]

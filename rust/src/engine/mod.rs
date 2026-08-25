@@ -45,9 +45,7 @@ use crate::identity::{COLOUR_MASK, MAX_PERSONA_NAME_LEN};
 use crate::pairing::invite::Invite;
 use zeroize::Zeroizing;
 
-use crate::session::chat::{
-    ChatEnvelope, Delivery, Inbox, Outbox, MAX_BODY, MAX_UNACKED, MSG_ID_LEN,
-};
+use crate::session::chat::{ChatEnvelope, Delivery, Inbox, Outbox, MAX_UNACKED, MSG_ID_LEN};
 use crate::session::ratchet::{self, Ratchet};
 use crate::store::{
     Direction, InboxPosition, InsertOutcome, MessageState, NewContact, NewMessage, NewTransfer,
@@ -622,20 +620,8 @@ fn write_then_send(
     device_id: Option<String>,
     text: String,
 ) -> Result<ChatMessageDto, String> {
-    let (dto, envelope, held) = with_core_mut(|core| {
+    let (dto, envelope, wire, held) = with_core_mut(|core| {
         let now = now_millis();
-        // What a person may type, checked here because here is the last place
-        // it is still what they typed. `ChatEnvelope::new` bounds the *wire*
-        // body, which on a paired thread is this plus a header and a tag — and
-        // on a thread with no chain yet is empty, so the envelope would have
-        // had nothing to measure and an oversized message would have been taken
-        // down, held, and only refused at some later reunion by a different
-        // layer with a different reason.
-        if text.len() > MAX_BODY {
-            return Err(StoreError::Db(format!(
-                "a message may be at most {MAX_BODY} bytes"
-            )));
-        }
         let seq = core.store.next_seq(thread, Direction::Outgoing)?;
         // The envelope draws the id, so the number the row is stored under and
         // the number that goes on the wire are the same object rather than two
@@ -675,17 +661,22 @@ fn write_then_send(
         // advanced ratchet durable. See `commit_sent`: the counter must never
         // go backwards, and the only ordering that guarantees it is seal,
         // commit, send.
-        let sealed = seal_for_thread(core, thread, text.as_bytes())?;
+        // The envelope carries what the person typed, and the *whole* envelope
+        // is what gets sealed — `seq` and `msg_id` included. Sealing only the
+        // body left those two as the one part of a chat message the ratchet did
+        // not cover, and put the receiver's decode ahead of its open: every
+        // rejection that decode could make threw away a message that would have
+        // opened, and the chain step the sender had already taken with it.
+        let envelope = ChatEnvelope::new(seq_out, text.clone().into_bytes())
+            .map_err(|e| StoreError::Db(e.to_string()))?;
+        let sealed = seal_for_thread(core, thread, &envelope.encode())?;
         let held = matches!(sealed, Outgoing::NoChainYet);
-        let (wire_body, advanced) = match sealed {
+        let (wire, advanced) = match sealed {
             Outgoing::Ready { body, ratchet } => (body, ratchet),
-            // No body, because none can be built and none is going anywhere.
-            // The envelope below is here for the id it draws, and this one is
-            // never encoded — the send is skipped entirely.
+            // Nothing to send and nothing that could be sent. The envelope
+            // above still exists, for the id it draws and the row below.
             Outgoing::NoChainYet => (Vec::new(), None),
         };
-        let envelope =
-            ChatEnvelope::new(seq_out, wire_body).map_err(|e| StoreError::Db(e.to_string()))?;
         // Everything below reads the envelope. There is deliberately no second
         // copy of the id: the row, the value handed back to the caller and the
         // bytes on the wire are three uses of one value rather than three
@@ -721,7 +712,7 @@ fn write_then_send(
             created_at: now,
         };
 
-        Ok((dto, envelope, held))
+        Ok((dto, envelope, wire, held))
     })?;
 
     // Written down, and staying put. The other end of this thread has never
@@ -748,7 +739,7 @@ fn write_then_send(
     // is promoted to Sent only once the bytes are actually away — a caller
     // that sees Sent can trust it.
     let net = require_net()?;
-    match net.send_chat(&device_id, envelope.encode(), std::time::Instant::now()) {
+    match net.send_chat(&device_id, wire, std::time::Instant::now()) {
         Ok(()) => {
             with_core(|core| {
                 core.store
@@ -1331,23 +1322,23 @@ fn resend_queued(device_id: &str) -> Result<(), String> {
         // gives: a counter that rewinds reuses a nonce. Crashing between the
         // save and the send costs one message key and leaves the row `Queued`,
         // which the next reunion picks up.
-        let envelope = with_core_mut(|core| {
-            let Outgoing::Ready { body, ratchet } = seal_for_thread(core, thread, &envelope.body)?
+        let wire = with_core_mut(|core| {
+            // The whole envelope again, as on the first send: `seq` and
+            // `msg_id` are inside the seal, so a resend re-seals all three
+            // rather than re-wrapping a sealed body in a fresh header.
+            let Outgoing::Ready { body, ratchet } =
+                seal_for_thread(core, thread, &envelope.encode())?
             else {
                 return Ok(None);
             };
             if let Some(advanced) = &ratchet {
                 core.store.start_ratchet(thread, advanced, now_millis())?;
             }
-            Ok(Some(ChatEnvelope {
-                seq: envelope.seq,
-                msg_id: envelope.msg_id,
-                body,
-            }))
+            Ok(Some(body))
         })?;
         // Still nothing to seal with. Left `Queued`, which is where it was, and
         // picked up by the next reunion or by the opening that closes the gap.
-        let Some(envelope) = envelope else { continue };
+        let Some(wire) = wire else { continue };
         // One at a time, and the state moves per message: a send that fails
         // half way leaves the ones that got away marked `Sent` and the rest
         // still `Queued`, so the next reunion picks up exactly where this
@@ -1356,7 +1347,7 @@ fn resend_queued(device_id: &str) -> Result<(), String> {
         // opened, so there is no out-of-range case left to tell apart — a
         // refusal here is a refusal. Stopping is right either way, because
         // order matters and a peer who has dropped will not take the next one.
-        net.send_chat(device_id, envelope.encode(), std::time::Instant::now())
+        net.send_chat(device_id, wire, std::time::Instant::now())
             .map_err(|why| why.to_string())?;
         with_core(|core| {
             core.store.set_message_state(&msg_id, MessageState::Sent)?;
@@ -1554,9 +1545,9 @@ fn on_net_event(net: &Arc<net::Net>, event: net::NetEvent) {
                 reason: why,
             });
         }
-        net::NetEvent::ChatReceived { peer, envelope } => {
+        net::NetEvent::ChatReceived { peer, body } => {
             let _ = net;
-            if let Ok(Some(event)) = store_incoming_chat(&peer, &envelope) {
+            if let Ok(Some(event)) = store_incoming_chat(&peer, &body) {
                 emit(event);
             }
         }
@@ -1588,11 +1579,8 @@ pub fn thread_rows_for_test(thread_id: i64) -> Result<Vec<(i64, String)>, String
 /// are invisible to `tests/`, and the property worth testing here — that the
 /// same envelope arriving twice is one message — cannot be reached through the
 /// public API, which has no way to make a message arrive.
-pub fn receive_chat_for_test(
-    device_id: &str,
-    envelope: &ChatEnvelope,
-) -> Result<Option<CoreEvent>, String> {
-    store_incoming_chat(device_id, envelope)
+pub fn receive_chat_for_test(device_id: &str, body: &[u8]) -> Result<Option<CoreEvent>, String> {
+    store_incoming_chat(device_id, body)
 }
 
 /// Write an inbound chat line and return the event announcing it, or `None` if
@@ -1606,10 +1594,7 @@ pub fn receive_chat_for_test(
 /// second copy on the screen. That is the case `seq` and `msg_id` exist for,
 /// and the case the ratchet cannot catch, because a resend is genuinely fresh
 /// ciphertext it has never seen.
-fn store_incoming_chat(
-    device_id: &str,
-    envelope: &ChatEnvelope,
-) -> Result<Option<CoreEvent>, String> {
+fn store_incoming_chat(device_id: &str, body: &[u8]) -> Result<Option<CoreEvent>, String> {
     with_core_mut(|core| {
         let now = now_millis();
         let thread = ensure_thread(core, device_id, now)?;
@@ -1636,7 +1621,7 @@ fn store_incoming_chat(
         let Incoming {
             plaintext,
             ratchet: advanced,
-        } = match open_for_thread(core, thread, &envelope.body) {
+        } = match open_for_thread(core, thread, body) {
             Ok(opened) => opened,
             Err(why) => {
                 // Not fatal to the session. A body we cannot open is a body we
@@ -1649,6 +1634,23 @@ fn store_incoming_chat(
         };
         let advanced = advanced.as_ref().map(|s| s.as_slice());
 
+        // Only now is there an envelope to speak of. Everything below this line
+        // is a judgement about a message that has already been opened, which is
+        // what lets each of those judgements be made without costing the chain
+        // step the sender took to send it.
+        let envelope = match ChatEnvelope::decode(&plaintext) {
+            Ok(envelope) => envelope,
+            Err(why) => {
+                log::warn!("dropping an unreadable chat message: {why}");
+                // Opened, so the turn happened and is kept — the same rule as
+                // every other refusal below.
+                if let Some(advanced) = advanced {
+                    core.store.start_ratchet(thread, advanced, now)?;
+                }
+                return Ok(None);
+            }
+        };
+
         // Everything that says this message is not kept, in one place, because
         // the answer to all of them is the same: drop the message, keep the
         // turn.
@@ -1657,12 +1659,7 @@ fn store_incoming_chat(
         // than converted, anything above `i64::MAX` lands as a *negative* seq —
         // which sorts before every real message, and would let one frame
         // reorder a conversation permanently.
-        let kept: Result<i64, &str> = if plaintext.len() > MAX_BODY {
-            // The limit on what a person may have typed, applied to what they
-            // actually typed. `ChatEnvelope::decode` bounds the sealed body,
-            // which is this plus a header and a tag.
-            Err("longer than a message may be")
-        } else {
+        let kept: Result<i64, &str> = {
             match i64::try_from(envelope.seq) {
                 Err(_) => Err("numbered past what the store can hold"),
                 Ok(seq) => match inbox.receive(envelope.seq) {
@@ -1703,7 +1700,7 @@ fn store_incoming_chat(
                 // this safe to store directly (tech spec §8).
                 seq,
                 msg_id: envelope.msg_id.to_vec(),
-                body: plaintext.clone(),
+                body: envelope.body.clone(),
                 direction: Direction::Incoming,
                 state: MessageState::Delivered,
                 created_at: now,
@@ -1722,12 +1719,12 @@ fn store_incoming_chat(
         Ok(Some(CoreEvent::MessageReceived {
             thread_id: thread,
             msg_id: hex::encode(envelope.msg_id),
-            // The opened body, not what arrived. On a paired thread these are
-            // not the same bytes, and the event is what the screen draws the
-            // moment a message lands — so a thread already open showed a
-            // ratchet header and a block of ciphertext, and only reading it
-            // again put the real line there.
-            text: String::from_utf8_lossy(&plaintext).into_owned(),
+            // From the opened envelope, which on a paired thread is not what
+            // arrived on the wire. The event is what the screen draws the
+            // moment a message lands — built from the raw frame, a thread
+            // already open showed a ratchet header and a block of ciphertext,
+            // and only reading it again put the real line there.
+            text: String::from_utf8_lossy(&envelope.body).into_owned(),
         }))
     })
 }
