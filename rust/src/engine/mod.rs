@@ -1613,15 +1613,6 @@ fn store_incoming_chat(
     with_core_mut(|core| {
         let now = now_millis();
         let thread = ensure_thread(core, device_id, now)?;
-        // The peer chooses this number and `decode` accepts any `u64`, so the
-        // conversion is checked and a message that will not fit is dropped.
-        // Cast instead, anything above `i64::MAX` lands as a *negative* seq —
-        // which sorts before every real message, and would let one frame from
-        // a stranger reorder a conversation permanently.
-        let Ok(seq) = i64::try_from(envelope.seq) else {
-            log::warn!("dropping a chat message whose seq will not fit the store");
-            return Ok(None);
-        };
         // Where the thread had got to, restored from the store. A fresh
         // `Inbox` on every launch would forget everything already delivered,
         // so the first message after a restart would look new however many
@@ -1629,20 +1620,19 @@ fn store_incoming_chat(
         let position = core.store.inbox_position(thread)?.unwrap_or_default();
         let mut inbox = Inbox::resumed(position.through, position.ahead);
 
-        // Opened before anything is written, and the advanced state goes down
-        // with the message that advanced it. A message that will not open
-        // leaves the ratchet exactly as it was — `Ratchet::decrypt` spends
-        // nothing before the tag is checked — so a forged body cannot burn a
-        // key the real message needs.
+        // Opened first, before anything else has an opinion about this message.
+        // A body that will not open leaves the ratchet exactly as it was —
+        // `Ratchet::decrypt` spends nothing before the tag is checked — so a
+        // forged body cannot burn a key the real message needs.
         //
-        // Ahead of the inbox, and that ordering is load-bearing. A resend is
-        // freshly sealed — the row keeps plaintext, so `resend_queued` seals
-        // again — which means a duplicate `seq` still carries a message number
-        // this end has never stepped to. Dropped before opening, the sender
-        // advances and the receiver does not, and a chain that falls more than
-        // `MAX_SKIP` behind cannot be caught up: the next genuinely new message
-        // is refused and the thread is finished. So the body is opened first
-        // and the turn is kept even when the message itself is not.
+        // Ahead of *every* other check, and that ordering is load-bearing.
+        // Opening is what steps this end's chain, and each of the reasons below
+        // to refuse a message is a reason the sender knows nothing about: it
+        // stepped its own chain to send it. Refuse before opening and this end
+        // falls one behind, permanently, because `walk` will not close a gap
+        // past `MAX_SKIP`. A peer only has to be declined 257 times — resends
+        // it thinks were lost, or numbers this store cannot hold — and the next
+        // genuinely new message cannot be opened at all.
         let Incoming {
             plaintext,
             ratchet: advanced,
@@ -1651,45 +1641,58 @@ fn store_incoming_chat(
             Err(why) => {
                 // Not fatal to the session. A body we cannot open is a body we
                 // cannot show, and storing ciphertext as though somebody had
-                // written it would be worse than dropping it.
+                // written it would be worse than dropping it. Nothing moved, so
+                // there is nothing to keep.
                 log::warn!("dropping a chat message that would not open: {why}");
                 return Ok(None);
             }
         };
-        // The limit on what a person may have typed, applied to what they
-        // actually typed. `ChatEnvelope::decode` bounds the sealed body, which
-        // is this plus a header and a tag, so a peer could otherwise put a body
-        // over the limit in a row this device shows.
-        if plaintext.len() > MAX_BODY {
-            log::warn!("dropping a chat message longer than a message may be");
-            return Ok(None);
-        }
+        let advanced = advanced.as_ref().map(|s| s.as_slice());
 
-        let delivery = inbox.receive(envelope.seq);
-        match delivery {
-            Delivery::Accepted => {}
-            Delivery::Duplicate => log::debug!("dropping a chat message we already have"),
-            // Refused rather than accepted with an enormous gap behind it.
-            // Tracking that gap is memory a peer could ask for by picking a
-            // number, and closing over it silently is the loss R0-F5 exists
-            // to prevent — so the honest answer is to take neither.
-            Delivery::TooFarAhead => {
-                log::warn!("refusing a chat message too far ahead of the conversation")
+        // Everything that says this message is not kept, in one place, because
+        // the answer to all of them is the same: drop the message, keep the
+        // turn.
+        //
+        // The peer chooses `seq` and `decode` accepts any `u64`. Cast rather
+        // than converted, anything above `i64::MAX` lands as a *negative* seq —
+        // which sorts before every real message, and would let one frame
+        // reorder a conversation permanently.
+        let kept: Result<i64, &str> = if plaintext.len() > MAX_BODY {
+            // The limit on what a person may have typed, applied to what they
+            // actually typed. `ChatEnvelope::decode` bounds the sealed body,
+            // which is this plus a header and a tag.
+            Err("longer than a message may be")
+        } else {
+            match i64::try_from(envelope.seq) {
+                Err(_) => Err("numbered past what the store can hold"),
+                Ok(seq) => match inbox.receive(envelope.seq) {
+                    Delivery::Accepted => Ok(seq),
+                    Delivery::Duplicate => Err("one we already have"),
+                    // Refused rather than accepted with an enormous gap behind
+                    // it. Tracking that gap is memory a peer could ask for by
+                    // picking a number, and closing over it silently is the
+                    // loss R0-F5 exists to prevent — so take neither.
+                    Delivery::TooFarAhead => Err("too far ahead of the conversation"),
+                },
             }
-        }
-        if delivery != Delivery::Accepted {
-            // The message is not kept and the turn is. It opened, which is the
-            // sender proving it holds this chain — not a header anyone can
-            // write — and the key it spent is spent whatever the inbox thinks
-            // of the number on the outside.
-            if let Some(advanced) = &advanced {
-                core.store.start_ratchet(thread, advanced, now)?;
+        };
+        let seq = match kept {
+            Ok(seq) => seq,
+            Err(why) => {
+                log::debug!("dropping a chat message: {why}");
+                // The message is not kept and the turn is. It opened, which is
+                // the sender proving it holds this chain — not a header anyone
+                // can write — and the key it spent is spent whatever the rest
+                // of this decides about the number on the outside.
+                if let Some(advanced) = advanced {
+                    core.store.start_ratchet(thread, advanced, now)?;
+                }
+                return Ok(None);
             }
-            return Ok(None);
-        }
+        };
 
         let outcome = core.store.commit_received(
-            advanced.as_ref().map(|s| s.as_slice()),
+            advanced,
             &InboxPosition {
                 through: inbox.through(),
                 ahead: inbox.ahead(),

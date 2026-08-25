@@ -1035,6 +1035,19 @@ impl FullPeer {
         body
     }
 
+    /// Whether a ceremony has left this end a ratchet at all.
+    ///
+    /// Distinct from [`FullPeer::can_send`], which is false both before the
+    /// ceremony finishes and after it finishes on the responding side — two
+    /// states that need telling apart, because only one of them is worth
+    /// waiting for.
+    fn has_ratchet(&self) -> bool {
+        self.ratchet
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some()
+    }
+
     /// Whether this end could write on the thread right now.
     fn can_send(&self) -> bool {
         self.ratchet
@@ -1217,6 +1230,16 @@ fn meet_and_pair(peer: &FullPeer) -> String {
 /// wants two people who can talk to each other.
 fn pair_with(peer: &FullPeer) -> String {
     let device_id = pair_only(peer);
+    // `pair_only` waits for the *engine's* row, and the two ceremonies finish
+    // independently: the engine pairs on the peer's Layer-1 proof and the peer
+    // pairs on the engine's, so the engine's row can exist while this end has
+    // not finished. Offering before that finds no ratchet and does nothing —
+    // and in the arrangement where the peer is the one that owes an opening,
+    // nothing would ever offer again and the wait below would never end.
+    until("the peer's own ceremony to finish", || {
+        pump(peer);
+        peer.has_ratchet()
+    });
     // Whichever of the two ends can speak, speaks — the engine does its half
     // from the `PairingCompleted` arm, this is the peer's. Exactly one of them
     // has anything to send, and the thread is not two-way until it lands.
@@ -1642,7 +1665,7 @@ fn an_arriving_message_is_announced_as_what_was_written() {
     assert_eq!(text, "can you read this?");
 }
 
-/// A resend the inbox already has still turns the ratchet.
+/// A message this end declines still turns the ratchet.
 ///
 /// The row keeps plaintext, so `resend_queued` seals again — which means a
 /// duplicate `seq` carries a message number this end has never stepped to.
@@ -1654,7 +1677,7 @@ fn an_arriving_message_is_announced_as_what_was_written() {
 /// The message itself is still dropped — that is what the inbox is for, and
 /// `the_same_message_arriving_twice_is_one_message` says so.
 #[test]
-fn a_duplicate_still_turns_the_ratchet() {
+fn a_declined_message_still_turns_the_ratchet() {
     let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let h = fresh();
     let peer = full_peer(&h.air, "peer", "Ada");
@@ -1679,7 +1702,24 @@ fn a_duplicate_still_turns_the_ratchet() {
         "the ratchet did not step over a message it declined to keep"
     );
 
-    // And the conversation carries on from where the resend left it.
+    // The same for a number this store cannot hold. The sender stepped its
+    // chain to send it whatever we think of the number on the outside, and a
+    // peer only has to be declined 257 times — for any reason — before the next
+    // genuinely new message cannot be opened at all.
+    let before = ratchet_fingerprint_for_test(thread).unwrap().unwrap();
+    let unstorable = ChatEnvelope::new(u64::MAX, peer.seal(b"from the future")).unwrap();
+    assert!(
+        receive_chat_for_test(&device_id, &unstorable)
+            .unwrap()
+            .is_none(),
+        "a seq that cannot be stored was announced anyway"
+    );
+    assert!(
+        ratchet_fingerprint_for_test(thread).unwrap() != Some(before),
+        "the ratchet did not step over a message it declined to keep"
+    );
+
+    // And the conversation carries on from where the resends left it.
     let next = ChatEnvelope::new(2, peer.seal(b"still there?")).unwrap();
     let event = receive_chat_for_test(&device_id, &next)
         .unwrap()
