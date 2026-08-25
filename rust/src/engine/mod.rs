@@ -685,9 +685,14 @@ fn write_then_send(
         // stand up a second one to watch the wire — so the guarantee has to be
         // that there is nothing to diverge.
         // The row keeps the *plaintext*: it is what the screen draws, and the
-        // store is already encrypted at rest. The ciphertext is not kept —
-        // a resend seals again, which costs a message key and saves a second
-        // copy of every conversation.
+        // store is already encrypted at rest. The ciphertext is kept too, and
+        // separately, but only while the message is `Queued` — see
+        // `outbound_seals`. That is a reversal of what this comment used to
+        // say: re-sealing at every reunion looked like the frugal choice until
+        // it turned out to spend a message key each time, which is a budget
+        // that cannot be refilled. A second copy of the *backlog* is a much
+        // smaller thing than a second copy of every conversation, and it is
+        // bounded by `MAX_UNACKED` and gone the moment the message goes.
         core.store.commit_sent(
             advanced.as_ref().map(|s| s.as_slice()),
             &NewMessage {
@@ -702,6 +707,12 @@ fn write_then_send(
                 state: MessageState::Queued,
                 created_at: now,
             },
+            // What it will go out as, kept until it goes. Sealed once, so a
+            // resend is the same bytes and costs no message key — see
+            // `Store::commit_sent`. `None` on a thread whose chain has not
+            // opened yet, where there was nothing to seal with; `resend_queued`
+            // seals it when there is.
+            (!held).then_some(wire.as_slice()),
             now,
         )?;
         let dto = ChatMessageDto {
@@ -1293,9 +1304,12 @@ fn queued_for_resend(
                 ChatEnvelope {
                     seq,
                     msg_id,
-                    // Plaintext, as stored. The resend seals it — see
-                    // `resend_queued`, which must turn the ratchet and make the
-                    // turn durable before anything goes out.
+                    // Plaintext, as stored, and usually not what goes out:
+                    // `resend_queued` sends the bytes this message was sealed
+                    // as when it was written. This is the fallback it seals
+                    // from when there were none — a thread whose chain had not
+                    // opened yet — and that path still has to make the turn
+                    // durable before anything leaves.
                     body: m.body.clone(),
                 },
             ))
@@ -1312,28 +1326,43 @@ fn resend_queued(device_id: &str) -> Result<(), String> {
     let net = require_net()?;
     log::info!("resending {} queued messages on reunion", pending.len());
     for (msg_id, thread, envelope) in pending {
-        // Sealed now, not when it was written. The row keeps plaintext, so a
-        // resend turns the ratchet again — one message key per attempt, which
-        // is the price of not keeping a second, ciphertext copy of every
-        // conversation. The receiver's ratchet handles the skipped keys and
-        // `seq` still says the person already has it.
+        // The bytes this message was sealed as when it was written, not a fresh
+        // sealing of the same words.
         //
-        // Persisted before the bytes leave, for the reason `commit_sent`
-        // gives: a counter that rewinds reuses a nonce. Crashing between the
-        // save and the send costs one message key and leaves the row `Queued`,
-        // which the next reunion picks up.
+        // Re-sealing drew a new message key on every attempt, so a frame the
+        // transport accepted and then lost left the receiver's chain one behind
+        // for good — and `walk` will not close a gap past `MAX_SKIP`, so a long
+        // enough run of unlucky reunions ended the conversation with no way
+        // back. Byte-identical, a resend costs no key: a receiver that never
+        // got it opens it exactly as it would have the first time, and one that
+        // did sees a replay and refuses it without spending anything either.
+        //
+        // Absent only where there was nothing to seal with when the row was
+        // written — a paired thread whose chain had not opened yet. Sealed here
+        // instead, and kept, so the attempt after this one is identical to this
+        // one.
         let wire = with_core_mut(|core| {
-            // The whole envelope again, as on the first send: `seq` and
-            // `msg_id` are inside the seal, so a resend re-seals all three
-            // rather than re-wrapping a sealed body in a fresh header.
+            if let Some(wire) = core.store.seal_for(&msg_id)? {
+                return Ok(Some(wire));
+            }
             let Outgoing::Ready { body, ratchet } =
                 seal_for_thread(core, thread, &envelope.encode())?
             else {
                 return Ok(None);
             };
-            if let Some(advanced) = &ratchet {
-                core.store.start_ratchet(thread, advanced, now_millis())?;
-            }
+            // Both before the bytes leave, for the reason `commit_sent` gives:
+            // a counter that rewinds reuses a nonce. And both in one write, for
+            // a reason of their own — see `seal_queued`. Crashing between the
+            // save and the send costs nothing now: the seal is on disk, so the
+            // next reunion sends these same bytes rather than drawing another
+            // key.
+            core.store.seal_queued(
+                thread,
+                ratchet.as_ref().map(|s| s.as_slice()),
+                &msg_id,
+                &body,
+                now_millis(),
+            )?;
             Ok(Some(body))
         })?;
         // Still nothing to seal with. Left `Queued`, which is where it was, and

@@ -1872,6 +1872,62 @@ fn an_unreadable_chat_message_is_dropped_and_leaves_no_row() {
         .is_some());
 }
 
+/// A resend goes out as the bytes it was first sealed as, and costs no key.
+///
+/// The bound this slice exists to remove. Re-sealing at every reunion drew a
+/// fresh message key each time, so a frame the transport accepted and then lost
+/// left the receiver's chain one behind — permanently, because `walk` will not
+/// close a gap past `MAX_SKIP` and a reply does not heal it either: the turn
+/// walks the old chain up to `previous_chain_len` first, and that walk is what
+/// trips the bound.
+///
+/// The fingerprint standing still is the whole assertion. It says no message
+/// key was drawn, which is what makes a lost resend cost nothing at all rather
+/// than one step of a budget that cannot be refilled.
+#[test]
+fn a_resend_costs_no_message_key() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = fresh();
+    let peer = full_peer(&h.air, "peer", "Ada");
+    let device_id = meet_and_pair(&peer);
+    let thread = list_threads().unwrap()[0].thread_id;
+
+    // A message that cannot leave: with Discovery off the peer is not
+    // addressable, so the row is written and sealed and stays `Queued`. That is
+    // R0-F5's ordinary case, and the only one where a resend exists to be
+    // watched.
+    set_discovery(false).unwrap();
+    send_chat_to_thread(thread, "for later".into()).expect("a message that had to wait");
+    assert_eq!(
+        queued_on_thread_for_test(thread).unwrap(),
+        1,
+        "the message did not wait"
+    );
+    let after_sealing = ratchet_fingerprint_for_test(thread).unwrap().unwrap();
+
+    // The reunion.
+    set_discovery(true).unwrap();
+    until("the peer to be reachable again", || {
+        pump(&peer);
+        nearby_devices()
+            .unwrap()
+            .iter()
+            .any(|d| d.device_id.as_deref() == Some(peer.id.as_str()))
+    });
+    resend_queued_for_test(&device_id).expect("a reunion that could not send");
+
+    assert!(
+        ratchet_fingerprint_for_test(thread).unwrap() == Some(after_sealing),
+        "the resend drew a fresh message key"
+    );
+    // And the bytes it sent are ones the other device can open — a seal kept
+    // from an earlier chain position is no use if it no longer decrypts.
+    until("the peer to read it", || {
+        pump(&peer);
+        peer.heard().iter().any(|t| t == "for later")
+    });
+}
+
 /// A pairing outlives the session that made it.
 ///
 /// The case that matters most and the one the first version got wrong: pair,
