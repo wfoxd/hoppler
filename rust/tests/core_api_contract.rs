@@ -28,13 +28,15 @@ use rust_lib_hoppler::api::transfers::offer_drop;
 use rust_lib_hoppler::api::types::CoreEvent;
 use rust_lib_hoppler::discovery::Discovery;
 use rust_lib_hoppler::engine::{
-    has_session, init_with_transport, mark_sent_for_test, queued_for_resend_for_test,
-    queued_on_thread_for_test, ratchet_size_for_test, receive_chat_for_test,
+    has_session, init_with_transport, layer1_public_for_test, mark_sent_for_test,
+    queued_for_resend_for_test, queued_on_thread_for_test, ratchet_can_send_for_test,
+    ratchet_fingerprint_for_test, ratchet_size_for_test, receive_chat_for_test,
     resend_queued_for_test, thread_rows_for_test,
 };
 use rust_lib_hoppler::identity::Identity;
 use rust_lib_hoppler::pairing::invite::Invite;
-use rust_lib_hoppler::session::chat::{ChatEnvelope, MAX_AHEAD, MAX_UNACKED};
+use rust_lib_hoppler::session::chat::{ChatEnvelope, MAX_AHEAD, MAX_BODY, MAX_UNACKED};
+use rust_lib_hoppler::session::ratchet::{self, Header, Ratchet};
 use rust_lib_hoppler::transport::loopback::LoopbackNet;
 use rust_lib_hoppler::transport::{Transport, TransportError, TransportEvent};
 
@@ -964,16 +966,182 @@ struct FullPeer {
     rx: Receiver<TransportEvent>,
     identity: Arc<Mutex<Identity>>,
     id: String,
+    /// This end's own ratchet, once a ceremony has seeded one.
+    ///
+    /// The engine keeps its half in the store; the harness has no store, so it
+    /// keeps its half here. Without it the peer is a device that pairs and then
+    /// never opens anything it is sent, which is not a second end of a
+    /// conversation — it is an echo the engine cannot get wrong.
+    ratchet: Mutex<Option<Ratchet>>,
+    /// Every body this end has opened, in order.
+    ///
+    /// What makes "the engine sent it" and "the other device could read it"
+    /// two different assertions. They come apart exactly where this slice is
+    /// most dangerous: a sender whose advanced ratchet never reached the store
+    /// rewinds its message counter on the next send, which reuses a key and a
+    /// nonce — and the only place that shows is here, as a body that will not
+    /// open.
+    heard: Mutex<Vec<Vec<u8>>>,
+}
+
+impl FullPeer {
+    /// Play this end's half of the opening, the way the engine plays its own.
+    ///
+    /// Which side of a pairing gets the ratchet's initiator role is decided by
+    /// comparing two freshly generated Layer-1 keys, so it lands here half the
+    /// time — and when it does, the engine is the responder and cannot write
+    /// until this peer speaks. Without this the harness is only ever half a
+    /// conversation, and every test that sends on a paired thread passes on a
+    /// coin flip.
+    ///
+    /// Deliberately the same three steps as `engine::opening_for_thread` rather
+    /// than a call into it: this is the *other device*, and a test that reached
+    /// into the engine to produce what it is supposed to be receiving would
+    /// prove only that one function agrees with itself.
+    fn open_the_chain(&self) {
+        let owed = self
+            .ratchet
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .is_some_and(|r| r.owes_an_opening());
+        if owed {
+            self.send_opening();
+        }
+    }
+
+    /// Seal an empty body and send it, the way an initiator does.
+    fn send_opening(&self) {
+        let mut held = self.ratchet.lock().unwrap_or_else(|p| p.into_inner());
+        let ratchet = held.as_mut().expect("a ceremony has run");
+        let (header, sealed) = ratchet.encrypt(&[]).expect("a chain that can send");
+        let mut body = header.to_bytes().to_vec();
+        body.extend_from_slice(&sealed);
+        self.net
+            .send_opening("core", body, Instant::now())
+            .expect("a session that just carried a whole ceremony");
+    }
+
+    /// Seal a body the way this device would send it.
+    ///
+    /// What the engine has to open. A test that handed it plaintext on a paired
+    /// thread would be testing a message no real peer can send.
+    fn seal(&self, plaintext: &[u8]) -> Vec<u8> {
+        let mut held = self.ratchet.lock().unwrap_or_else(|p| p.into_inner());
+        let ratchet = held.as_mut().expect("a ceremony has run");
+        let (header, sealed) = ratchet.encrypt(plaintext).expect("a chain that can send");
+        let mut body = header.to_bytes().to_vec();
+        body.extend_from_slice(&sealed);
+        body
+    }
+
+    /// Whether a ceremony has left this end a ratchet at all.
+    ///
+    /// Distinct from [`FullPeer::can_send`], which is false both before the
+    /// ceremony finishes and after it finishes on the responding side — two
+    /// states that need telling apart, because only one of them is worth
+    /// waiting for.
+    fn has_ratchet(&self) -> bool {
+        self.ratchet
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some()
+    }
+
+    /// Whether this end could write on the thread right now.
+    fn can_send(&self) -> bool {
+        self.ratchet
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .is_some_and(|r| r.can_send())
+    }
+
+    /// Open whatever the engine just sent, so this end keeps up with its own
+    /// conversation.
+    ///
+    /// A body that will not open is ignored rather than fatal: most tests here
+    /// chat over *unpaired* threads, where nothing is ratcheted and the bytes
+    /// are the message.
+    fn absorb(&self, events: &[rust_lib_hoppler::engine::net::NetEvent]) {
+        use rust_lib_hoppler::engine::net::NetEvent;
+        let mut held = self.ratchet.lock().unwrap_or_else(|p| p.into_inner());
+        // Claimed here rather than after the pump, because the engine's opening
+        // can arrive in the same batch of bytes as the ceremony that seeded
+        // this: `Net` hands both back from one `handle`. Claiming it later
+        // meant a peer that dropped the very message it was waiting for.
+        if held.is_none() {
+            if let Some(state) = self.net.take_pairing_ratchet("core") {
+                *held = Some(Ratchet::from_state(&state).expect("the ceremony's ratchet"));
+            }
+        }
+        let Some(ratchet) = held.as_mut() else { return };
+        for event in events {
+            let body = match event {
+                NetEvent::ChainOpening { body, .. } => body,
+                NetEvent::ChatReceived { envelope, .. } => &envelope.body,
+                _ => continue,
+            };
+            let Some(header) = body
+                .get(..ratchet::HEADER_LEN)
+                .and_then(|h| <[u8; ratchet::HEADER_LEN]>::try_from(h).ok())
+            else {
+                continue;
+            };
+            if let Ok(plaintext) =
+                ratchet.decrypt(Header::from_bytes(&header), &body[ratchet::HEADER_LEN..])
+            {
+                self.heard
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(plaintext.to_vec());
+            }
+        }
+    }
+
+    /// Everything this end has managed to open, as text.
+    fn heard(&self) -> Vec<String> {
+        self.heard
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .collect()
+    }
 }
 
 fn full_peer(air: &LoopbackNet, id: &str, name: &str) -> FullPeer {
+    full_peer_with(air, id, Identity::generate(name, 0x00_44_88))
+}
+
+/// A peer whose identity puts the *engine* on the named side of the ratchet.
+///
+/// `speaks_first` settles the two roles by comparing Layer-1 keys, smaller half
+/// first, and both are generated fresh — so a test that takes whichever role
+/// falls out exercises one of the two arrangements per run and cannot say which.
+/// The arrangement is the entire subject of this slice: one side can write the
+/// moment it pairs and the other cannot write until it is written to.
+///
+/// Rejection sampling, which is a coin flip per attempt and needs no cleverness
+/// about where in the keyspace this device's key happens to sit.
+fn full_peer_facing(air: &LoopbackNet, id: &str, name: &str, engine_initiates: bool) -> FullPeer {
+    let ours = layer1_public_for_test().expect("an engine to compare against");
+    loop {
+        let identity = Identity::generate(name, 0x00_44_88);
+        if (ours < identity.layer1_public().0) == engine_initiates {
+            return full_peer_with(air, id, identity);
+        }
+    }
+}
+
+fn full_peer_with(air: &LoopbackNet, id: &str, identity: Identity) -> FullPeer {
     let (tx, rx) = channel();
     let tx = Mutex::new(tx);
     let sink: Box<dyn Fn(TransportEvent) + Send + Sync> = Box::new(move |e| {
         let _ = tx.lock().unwrap_or_else(|p| p.into_inner()).send(e);
     });
     let transport: Arc<dyn Transport> = Arc::new(air.join(id, sink));
-    let identity = Arc::new(Mutex::new(Identity::generate(name, 0x00_44_88)));
+    let identity = Arc::new(Mutex::new(identity));
     let net = rust_lib_hoppler::engine::net::Net::new(
         transport.clone(),
         identity.clone(),
@@ -986,6 +1154,8 @@ fn full_peer(air: &LoopbackNet, id: &str, name: &str) -> FullPeer {
         rx,
         identity,
         id: id.to_string(),
+        ratchet: Mutex::new(None),
+        heard: Mutex::new(Vec::new()),
     }
 }
 
@@ -996,7 +1166,11 @@ fn full_peer(air: &LoopbackNet, id: &str, name: &str) -> FullPeer {
 /// The steps in order, with no assertions in between — a test that wants to
 /// watch the middle of a ceremony should not use this, and one that only needs
 /// two people paired should not carry fifty lines to say so.
-fn pair_with(peer: &FullPeer) -> String {
+///
+/// Stops the moment the pairing is written down, which is *before* either end
+/// can necessarily write: one of the two has no sending chain until the other
+/// opens it. [`pair_with`] is the one to reach for unless that gap is the point.
+fn pair_only(peer: &FullPeer) -> String {
     let invite = Invite::fresh(
         peer.identity
             .lock()
@@ -1028,11 +1202,62 @@ fn pair_with(peer: &FullPeer) -> String {
     device_id
 }
 
+/// See the peer, pair with it, and come back with the device id.
+///
+/// The preamble every test that needs two paired devices was carrying verbatim.
+fn meet_and_pair(peer: &FullPeer) -> String {
+    set_discovery(true).unwrap();
+    peer.net
+        .discovery()
+        .set_enabled(true, Instant::now())
+        .unwrap();
+    peer.net.discovery().start_scanning().unwrap();
+    until("the engine to see the peer", || {
+        pump(peer);
+        nearby_devices()
+            .unwrap()
+            .iter()
+            .any(|d| d.device_id.as_deref() == Some(peer.id.as_str()))
+    });
+    pair_with(peer)
+}
+
+/// Pair, and then wait until both devices can actually write.
+///
+/// The two are separate because the gap between them is a real state with real
+/// behaviour in it — see `a_message_written_before_the_chain_opens_is_held`,
+/// which is the only test that wants to stop in the middle. Everything else
+/// wants two people who can talk to each other.
+fn pair_with(peer: &FullPeer) -> String {
+    let device_id = pair_only(peer);
+    // `pair_only` waits for the *engine's* row, and the two ceremonies finish
+    // independently: the engine pairs on the peer's Layer-1 proof and the peer
+    // pairs on the engine's, so the engine's row can exist while this end has
+    // not finished. Offering before that finds no ratchet and does nothing —
+    // and in the arrangement where the peer is the one that owes an opening,
+    // nothing would ever offer again and the wait below would never end.
+    until("the peer's own ceremony to finish", || {
+        pump(peer);
+        peer.has_ratchet()
+    });
+    // Whichever of the two ends can speak, speaks — the engine does its half
+    // from the `PairingCompleted` arm, this is the peer's. Exactly one of them
+    // has anything to send, and the thread is not two-way until it lands.
+    peer.open_the_chain();
+    let thread = list_threads().unwrap()[0].thread_id;
+    until("both ends of the ratchet to open", || {
+        pump(peer);
+        ratchet_can_send_for_test(thread).unwrap() == Some(true) && peer.can_send()
+    });
+    device_id
+}
+
 fn pump(peer: &FullPeer) -> Vec<rust_lib_hoppler::engine::net::NetEvent> {
     let mut out = Vec::new();
     while let Ok(event) = peer.rx.recv_timeout(Duration::from_millis(30)) {
         out.extend(peer.net.handle(event, Instant::now()));
     }
+    peer.absorb(&out);
     out
 }
 
@@ -1157,6 +1382,400 @@ fn pairing_leaves_a_ratchet_on_the_thread() {
     assert!(
         size.is_some_and(|n| n > 0),
         "a paired thread has no ratchet: {size:?}"
+    );
+}
+
+/// Writing on a paired thread turns its ratchet.
+///
+/// The slice that made the ratchet do something. Until now it was seeded,
+/// stored and never touched — every test passed because unpaired threads have
+/// no ratchet, so nothing about them changed.
+///
+/// The fingerprint moving is what says a message key was drawn and the chain
+/// stepped. It is also the property the nonce depends on: `nonce_for` derives
+/// from the message number, so a counter that failed to advance — or failed to
+/// persist and rewound — would reuse a key *and* a nonce on different
+/// plaintext, which is an AEAD break rather than a degraded ratchet.
+#[test]
+fn writing_on_a_paired_thread_turns_the_ratchet() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = fresh();
+    let peer = full_peer(&h.air, "peer", "Ada");
+
+    set_discovery(true).unwrap();
+    peer.net
+        .discovery()
+        .set_enabled(true, Instant::now())
+        .unwrap();
+    peer.net.discovery().start_scanning().unwrap();
+    until("the engine to see the peer", || {
+        pump(&peer);
+        nearby_devices()
+            .unwrap()
+            .iter()
+            .any(|d| d.device_id.as_deref() == Some(peer.id.as_str()))
+    });
+    let device_id = pair_with(&peer);
+
+    let thread = list_threads().unwrap()[0].thread_id;
+    let before = ratchet_fingerprint_for_test(thread)
+        .unwrap()
+        .expect("a paired thread with no ratchet");
+
+    send_chat(device_id, "are you there?".into()).unwrap();
+
+    let after = ratchet_fingerprint_for_test(thread).unwrap().unwrap();
+    assert!(
+        before != after,
+        "the ratchet did not move when a message was sealed"
+    );
+
+    // And the row still holds what the person typed, not what went on the wire.
+    // The screen reads this, and the store is already encrypted at rest.
+    let msgs = thread_messages(thread).unwrap();
+    assert_eq!(msgs.last().unwrap().text, "are you there?");
+}
+
+/// An opening turns the ratchet and leaves nothing behind it.
+///
+/// The cost of the design, made into a test rather than a comment. An opening
+/// is a message that must not be stored and must not be shown, and that rule
+/// lives in two places — the sender's decision to send one and the receiver's
+/// decision to keep nothing — which is exactly the shape of rule this project
+/// keeps finding one copy of rotted. The receiver's copy is the one worth
+/// pinning: a sender that stops sending openings breaks a conversation
+/// visibly, where a receiver that starts storing them puts an empty line in
+/// somebody's thread.
+///
+/// Both halves are asserted, because either alone is passable by accident. A
+/// ratchet that did not move would leave no message either, and a thread that
+/// was never written to would have nothing to count.
+#[test]
+fn an_opening_leaves_no_message_behind() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = fresh();
+    let peer = full_peer(&h.air, "peer", "Ada");
+
+    set_discovery(true).unwrap();
+    peer.net
+        .discovery()
+        .set_enabled(true, Instant::now())
+        .unwrap();
+    peer.net.discovery().start_scanning().unwrap();
+    until("the engine to see the peer", || {
+        pump(&peer);
+        nearby_devices()
+            .unwrap()
+            .iter()
+            .any(|d| d.device_id.as_deref() == Some(peer.id.as_str()))
+    });
+    pair_with(&peer);
+
+    let thread = list_threads().unwrap()[0].thread_id;
+    let before = ratchet_fingerprint_for_test(thread)
+        .unwrap()
+        .expect("a paired thread with no ratchet");
+
+    // Sent from the peer, not the engine, and after `pair_with` has already
+    // settled which of them opened which. Both chains are two-way by now, so
+    // this one lands whichever role the ceremony handed out — which is what
+    // makes the test say the same thing on every run.
+    peer.send_opening();
+    until("the engine to take the opening", || {
+        pump(&peer);
+        ratchet_fingerprint_for_test(thread).unwrap() != Some(before)
+    });
+
+    assert!(
+        thread_messages(thread).unwrap().is_empty(),
+        "an opening put a message in the thread"
+    );
+}
+
+/// Both ends of a pairing can write when the engine is the one that speaks
+/// first.
+///
+/// Half of the requirement this slice exists for, and the easy half: this end
+/// takes the ratchet's initiator role, so it could already write the moment it
+/// paired. What is under test is that its opening reached the other device and
+/// left that one able to write too.
+#[test]
+fn both_ends_can_write_with_the_engine_speaking_first() {
+    both_ends_can_write(true);
+}
+
+/// Both ends of a pairing can write when the *peer* is the one that speaks
+/// first.
+///
+/// The half the slice was written for. A `Ratchet::responder` has no sending
+/// chain of its own, so before there was an opening frame this end paired and
+/// then could not send a single message until the other person happened to
+/// write — and nothing on screen said why. Without `full_peer_facing` this case
+/// ran on a coin flip.
+#[test]
+fn both_ends_can_write_with_the_peer_speaking_first() {
+    both_ends_can_write(false);
+}
+
+/// Pair with a peer placed on the chosen side of the ratchet, then check that
+/// both devices can actually write.
+///
+/// The flag alone is not the property. A message the engine seals has to be one
+/// the other device can open, and the two come apart exactly where this slice is
+/// most dangerous: an engine that sealed its opening and never wrote the turn
+/// down rewinds its message counter on the next send, reusing a key *and* a
+/// nonce, and the message lands looking perfectly ordinary and refuses to open.
+fn both_ends_can_write(engine_initiates: bool) {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = fresh();
+    let peer = full_peer_facing(&h.air, "peer", "Ada", engine_initiates);
+
+    set_discovery(true).unwrap();
+    peer.net
+        .discovery()
+        .set_enabled(true, Instant::now())
+        .unwrap();
+    peer.net.discovery().start_scanning().unwrap();
+    until("the engine to see the peer", || {
+        pump(&peer);
+        nearby_devices()
+            .unwrap()
+            .iter()
+            .any(|d| d.device_id.as_deref() == Some(peer.id.as_str()))
+    });
+    let device_id = pair_with(&peer);
+
+    let thread = list_threads().unwrap()[0].thread_id;
+    assert_eq!(ratchet_can_send_for_test(thread).unwrap(), Some(true));
+    assert!(peer.can_send(), "the other end cannot write");
+    if engine_initiates {
+        // What the engine sent to open the chain, seen from the other device.
+        // An opening is defined to carry nothing, and this is the only place
+        // that can say whether it does — the receiver drops the plaintext, so a
+        // sender that started putting something in one would go unnoticed on
+        // the side that has to be trusted not to store it.
+        assert_eq!(
+            peer.heard().first().map(String::as_str),
+            Some(""),
+            "the engine's opening carried a body"
+        );
+    }
+
+    let text = "so, which of us was the initiator?";
+    send_chat(device_id, text.into()).unwrap();
+    until("the peer to read it", || {
+        pump(&peer);
+        peer.heard().iter().any(|t| t == text)
+    });
+}
+
+/// A message typed before the other end opens the chain is held, not lost.
+///
+/// The window this design pays for. The two devices finish the same ceremony
+/// milliseconds apart, and for those milliseconds the responder is paired,
+/// looking at a thread, and holds no sending chain. Somebody can type into that.
+///
+/// Sealing is the first thing `write_then_send` does, so a refusal there would
+/// mean no row at all: what they wrote would be gone, and what they would see is
+/// "message could not be decrypted" — frightening, and about something else.
+/// R0-F5 already has the right answer for a message that cannot leave yet, and
+/// this is one more reason it cannot.
+#[test]
+fn a_message_written_before_the_chain_opens_is_held() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = fresh();
+    // The engine on the responding side, so it is the one that cannot write.
+    let peer = full_peer_facing(&h.air, "peer", "Ada", false);
+
+    set_discovery(true).unwrap();
+    peer.net
+        .discovery()
+        .set_enabled(true, Instant::now())
+        .unwrap();
+    peer.net.discovery().start_scanning().unwrap();
+    until("the engine to see the peer", || {
+        pump(&peer);
+        nearby_devices()
+            .unwrap()
+            .iter()
+            .any(|d| d.device_id.as_deref() == Some(peer.id.as_str()))
+    });
+    let device_id = pair_only(&peer);
+
+    let thread = list_threads().unwrap()[0].thread_id;
+    assert_eq!(
+        ratchet_can_send_for_test(thread).unwrap(),
+        Some(false),
+        "the engine was given a sending chain it should not have yet"
+    );
+
+    // The limit still applies on this path, and this is the only place it can
+    // be seen: `ChatEnvelope::new` bounds the wire body, and the wire body here
+    // is empty because nothing could be sealed. Without a check on the
+    // plaintext an oversized message would be taken down, held, and refused
+    // later by the frame layer for a different reason.
+    assert!(
+        send_chat(device_id.clone(), "x".repeat(MAX_BODY + 1)).is_err(),
+        "an oversized message was held rather than refused"
+    );
+
+    // Not an error, and not a lost message.
+    send_chat(device_id, "typed too soon".into()).expect("a send that had to be held");
+    assert_eq!(
+        thread_messages(thread).unwrap().len(),
+        1,
+        "what was typed is not in the thread"
+    );
+    assert_eq!(
+        queued_on_thread_for_test(thread).unwrap(),
+        1,
+        "a message that cannot have left was marked as sent"
+    );
+
+    // And it goes out on its own the moment the other end opens the chain —
+    // no second tap, which is the same promise R0-F5 makes about a reunion.
+    peer.open_the_chain();
+    until("the held message to go out", || {
+        pump(&peer);
+        peer.heard().iter().any(|t| t == "typed too soon")
+    });
+}
+
+/// A message that arrives on a paired thread is announced as what was written.
+///
+/// The event and the row are two different pieces of code reading two different
+/// values, and only one of them was ratcheted. The row held the opened body and
+/// the event held `envelope.body` — so a thread already on screen drew a ratchet
+/// header and a block of ciphertext, and only leaving the thread and coming
+/// back put the real line there. Every test passed: they all read the row.
+#[test]
+fn an_arriving_message_is_announced_as_what_was_written() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = fresh();
+    let peer = full_peer(&h.air, "peer", "Ada");
+    let device_id = meet_and_pair(&peer);
+
+    let envelope = ChatEnvelope::new(1, peer.seal(b"can you read this?")).unwrap();
+    let event = receive_chat_for_test(&device_id, &envelope)
+        .unwrap()
+        .expect("a message the engine kept");
+    let CoreEvent::MessageReceived { text, .. } = event else {
+        panic!("a chat message was announced as something else");
+    };
+    assert_eq!(text, "can you read this?");
+}
+
+/// A message this end declines still turns the ratchet.
+///
+/// The row keeps plaintext, so `resend_queued` seals again — which means a
+/// duplicate `seq` carries a message number this end has never stepped to.
+/// Dropped before opening, the sender advances and the receiver does not, and
+/// the gap is permanent: `walk` refuses more than `MAX_SKIP` at once, so enough
+/// resends and the next genuinely new message is undecryptable with nothing to
+/// be done about it.
+///
+/// The message itself is still dropped — that is what the inbox is for, and
+/// `the_same_message_arriving_twice_is_one_message` says so.
+#[test]
+fn a_declined_message_still_turns_the_ratchet() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = fresh();
+    let peer = full_peer(&h.air, "peer", "Ada");
+    let device_id = meet_and_pair(&peer);
+    let thread = list_threads().unwrap()[0].thread_id;
+
+    let first = ChatEnvelope::new(1, peer.seal(b"hello")).unwrap();
+    receive_chat_for_test(&device_id, &first)
+        .unwrap()
+        .expect("the first message");
+    let before = ratchet_fingerprint_for_test(thread).unwrap().unwrap();
+
+    // The same position in the sender's stream, freshly sealed — which is
+    // exactly what a resend is.
+    let again = ChatEnvelope::new(1, peer.seal(b"hello")).unwrap();
+    assert!(
+        receive_chat_for_test(&device_id, &again).unwrap().is_none(),
+        "a resend was shown twice"
+    );
+    assert!(
+        ratchet_fingerprint_for_test(thread).unwrap() != Some(before),
+        "the ratchet did not step over a message it declined to keep"
+    );
+
+    // The same for a number this store cannot hold. The sender stepped its
+    // chain to send it whatever we think of the number on the outside, and a
+    // peer only has to be declined 257 times — for any reason — before the next
+    // genuinely new message cannot be opened at all.
+    let before = ratchet_fingerprint_for_test(thread).unwrap().unwrap();
+    let unstorable = ChatEnvelope::new(u64::MAX, peer.seal(b"from the future")).unwrap();
+    assert!(
+        receive_chat_for_test(&device_id, &unstorable)
+            .unwrap()
+            .is_none(),
+        "a seq that cannot be stored was announced anyway"
+    );
+    assert!(
+        ratchet_fingerprint_for_test(thread).unwrap() != Some(before),
+        "the ratchet did not step over a message it declined to keep"
+    );
+
+    // And the conversation carries on from where the resends left it.
+    let next = ChatEnvelope::new(2, peer.seal(b"still there?")).unwrap();
+    let event = receive_chat_for_test(&device_id, &next)
+        .unwrap()
+        .expect("the message after the resend");
+    let CoreEvent::MessageReceived { text, .. } = event else {
+        panic!("a chat message was announced as something else");
+    };
+    assert_eq!(text, "still there?");
+}
+
+/// A body longer than a message may be is refused at both doors, and the
+/// longest allowed one is not.
+///
+/// `MAX_BODY` is a limit on what a person types, and the envelope that used to
+/// enforce it sees what goes on the wire — which on a paired thread is the same
+/// bytes plus a header and a tag, and on a thread with no chain yet is empty.
+/// So the limit both shrank by fifty-six characters where it was checked and
+/// vanished where it was not.
+#[test]
+fn a_message_longer_than_a_message_may_be_is_refused() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = fresh();
+    let peer = full_peer(&h.air, "peer", "Ada");
+    let device_id = meet_and_pair(&peer);
+    let thread = list_threads().unwrap()[0].thread_id;
+
+    assert!(
+        send_chat(device_id.clone(), "x".repeat(MAX_BODY + 1)).is_err(),
+        "an oversized message was taken down"
+    );
+    assert!(
+        thread_messages(thread).unwrap().is_empty(),
+        "a refused message left a row behind"
+    );
+    // The bound is a bound, and not an off-by-one that quietly costs the last
+    // fifty-six characters of a long message.
+    send_chat(device_id.clone(), "x".repeat(MAX_BODY)).expect("a message at the limit");
+
+    // And on the way in. The reachable case is an *unpaired* thread, where the
+    // body is not sealed and the wire bound is therefore fifty-six bytes of
+    // slack a stranger can spend on the plaintext itself. A sealed body cannot
+    // get past the envelope, because the overhead it leaves room for is exactly
+    // the overhead sealing adds.
+    let huge = ChatEnvelope::new(1, vec![b'x'; MAX_BODY + 1]).unwrap();
+    assert!(
+        receive_chat_for_test("a-stranger", &huge)
+            .unwrap()
+            .is_none(),
+        "an oversized body arrived into a row"
+    );
+    let at_the_limit = ChatEnvelope::new(1, vec![b'x'; MAX_BODY]).unwrap();
+    assert!(
+        receive_chat_for_test("a-stranger", &at_the_limit)
+            .unwrap()
+            .is_some(),
+        "a message at the limit was refused"
     );
 }
 

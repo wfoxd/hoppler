@@ -409,23 +409,26 @@ impl Store {
 
     // ── pairings ────────────────────────────────────────────────────────────
 
-    /// Record that a ceremony completed, and open the persistent thread it
-    /// entitles (R0-F4: "a completed ceremony creates a persistent thread").
+    /// A paired contact and its thread, with no ceremony behind it and no
+    /// ratchet — **test scaffolding**, and named so at every call site.
+    ///
+    /// [`Store::record_pairing`] is the production path and it takes a ratchet
+    /// it cannot be called without, because a paired thread with no ratchet is
+    /// read by the send path as a thread that is *not* paired and answered with
+    /// plaintext. This writes exactly that state, which is why it says what it
+    /// is: a store test wanting "a thread that exists" should not have to
+    /// invent a ceremony, and a shipped build should never reach this.
     ///
     /// One transaction, because the pairing and the thread are one fact. A
     /// pairing row with no thread is a contact the UI cannot open; a thread
     /// with no pairing is a conversation claiming a ceremony that did not
-    /// finish. Neither is a state anything downstream knows how to read, and
-    /// both are reachable if these are two calls and the second fails.
+    /// finish.
     ///
     /// Idempotent on the pairing: re-pairing the same two people replaces the
-    /// Layer-1 key and the timestamp rather than failing. That is not
-    /// hypothetical tidiness — a ceremony can be run again after one side
-    /// wipes (R0-F9) and regenerates, and the honest reading of the second
-    /// ceremony is that it supersedes the first.
+    /// Layer-1 key and the timestamp rather than failing.
     ///
     /// Returns the thread id.
-    pub fn pair_contact(
+    pub fn pair_contact_for_test(
         &self,
         contact_id: i64,
         l1_pub: &[u8; 32],
@@ -439,15 +442,22 @@ impl Store {
     }
 
     /// Everything a completed ceremony writes, in **one** transaction: the
-    /// identity it proved, the persona it carried, the pairing, and the thread.
+    /// identity it proved, the persona it carried, the pairing, the thread, and
+    /// the ratchet the conversation hangs off.
     ///
-    /// One call because it is one fact. Done as four — update the Layer-2 key,
-    /// update the persona, insert the pairing, open the thread — a failure
-    /// partway leaves a contact wearing a name and a Layer-2 key that came from
-    /// a ceremony which did not finish. Nothing downstream reads that as
-    /// paired, since every paired lookup joins `pairings`, so it is not
-    /// dangerous; it is simply a row asserting something that never happened,
-    /// which is the class of thing this schema was just rewritten to stop.
+    /// One call because it is one fact. Done as five — update the Layer-2 key,
+    /// update the persona, insert the pairing, open the thread, seed the
+    /// ratchet — a failure partway leaves a contact wearing a name and a
+    /// Layer-2 key that came from a ceremony which did not finish, and the last
+    /// of the five is worse than the others: a durable paired thread with no
+    /// ratchet, which the send path reads as "not paired" and answers by
+    /// putting **plaintext** on the wire. The caller would have reported the
+    /// pairing as failed and the row would still be there.
+    ///
+    /// `ratchet` is not optional for that reason. A paired thread without one
+    /// is a state this build should not be able to write down, and a parameter
+    /// that cannot be left out is a stronger statement of that than any check
+    /// downstream.
     ///
     /// The **contact row itself** is deliberately outside: it may have existed
     /// for weeks, because people chat and Ping long before they pair (R0-F3,
@@ -462,6 +472,7 @@ impl Store {
         colour: u32,
         persona_version: u32,
         l1_pub: &[u8; 32],
+        ratchet: &[u8],
         paired_at: i64,
     ) -> Result<i64, StoreError> {
         self.require_contact(contact_id)?;
@@ -499,6 +510,7 @@ impl Store {
             ],
         )?;
         let thread = self.write_pairing(contact_id, l1_pub, paired_at)?;
+        self.write_ratchet(thread, ratchet, paired_at)?;
         tx.commit()?;
         Ok(thread)
     }
@@ -593,11 +605,35 @@ impl Store {
     /// so does R0-F9 in part. Deliberately does **not** delete the thread: the
     /// messages are the person's, and a block is not a request to destroy what
     /// was said. Returns whether there was a pairing to revoke.
+    ///
+    /// # The ratchet goes with it, and the thread does not
+    ///
+    /// Two reasons, and the second is the one that bites. A ratchet is the
+    /// paired conversation's key material — its root, both live chains, and
+    /// every key still owed — so leaving it behind means revoking a pairing and
+    /// keeping the ability to read and write it, which is not what anyone
+    /// pressing "block" is asking for.
+    ///
+    /// And the engine reads "does this thread have a ratchet" as "is this
+    /// thread paired": `seal_for_thread` has no other question to ask. Left in
+    /// place, a revoked pairing would keep sealing with the old root and keep
+    /// offering openings to a person this device has blocked, while the peer —
+    /// who revoked too, or was told — has stopped listening.
+    ///
+    /// One transaction, because a revocation that took the pairing and left the
+    /// keys is worse than one that did neither.
     pub fn unpair_contact(&self, contact_id: i64) -> Result<bool, StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        // Before the pairing goes, so the thread is still findable through it.
+        if let Some(thread) = self.thread_for_contact(contact_id)? {
+            self.conn
+                .execute("DELETE FROM ratchets WHERE thread_id = ?1", params![thread])?;
+        }
         let n = self.conn.execute(
             "DELETE FROM pairings WHERE contact_id = ?1",
             params![contact_id],
         )?;
+        tx.commit()?;
         Ok(n > 0)
     }
 
@@ -903,6 +939,40 @@ impl Store {
             self.write_ratchet(thread_id, ratchet, now)?;
         }
         self.write_inbox(thread_id, inbox)?;
+        let outcome = self.add_message(message)?;
+        tx.commit()?;
+        Ok(outcome)
+    }
+
+    /// Write an outgoing message and the ratchet that sealed it, together.
+    ///
+    /// The send-side twin of [`Store::commit_received`], and it exists for a
+    /// sharper reason than symmetry. `nonce_for` derives the AEAD nonce from
+    /// the message number alone, so the counter must never go backwards: if a
+    /// message is sealed and the advanced state is not durable before the bytes
+    /// leave, a restart rewinds the counter and the next message reuses a key
+    /// *and* a nonce on different plaintext. That is not a degraded ratchet, it
+    /// is a broken AEAD — the two plaintexts XOR out and the tag stops meaning
+    /// anything.
+    ///
+    /// So the caller's order is fixed and this is the middle of it: seal,
+    /// commit, *then* send. Crashing before the commit loses the message, which
+    /// is recoverable — the row is not there and nobody was told it was. Any
+    /// other order risks the key.
+    pub fn commit_sent(
+        &self,
+        ratchet: Option<&[u8]>,
+        message: &NewMessage,
+        now: i64,
+    ) -> Result<InsertOutcome, StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        // State first, message last — the same order as `commit_received`, and
+        // for the same reason: written the other way round, a failing message
+        // insert leaves nothing to roll back and the transaction stops being
+        // load-bearing.
+        if let Some(ratchet) = ratchet {
+            self.write_ratchet(message.thread_id, ratchet, now)?;
+        }
         let outcome = self.add_message(message)?;
         tx.commit()?;
         Ok(outcome)
@@ -1226,7 +1296,7 @@ mod tests {
         assert!(s.pairing_for_contact(id).unwrap().is_none());
         assert!(s.thread_for_contact(id).unwrap().is_none());
 
-        let thread = s.pair_contact(id, &[9u8; 32], 2000).unwrap();
+        let thread = s.pair_contact_for_test(id, &[9u8; 32], 2000).unwrap();
         assert_eq!(s.thread_for_contact(id).unwrap(), Some(thread));
         assert_eq!(
             s.pairing_for_contact(id).unwrap().unwrap(),
@@ -1258,7 +1328,10 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(s.pair_contact(id, &[9u8; 32], 2000).unwrap(), existing);
+        assert_eq!(
+            s.pair_contact_for_test(id, &[9u8; 32], 2000).unwrap(),
+            existing
+        );
         assert_eq!(s.messages_for_thread(existing).unwrap().len(), 1);
     }
 
@@ -1269,8 +1342,11 @@ mod tests {
     fn pairing_again_replaces_the_key_and_keeps_the_thread() {
         let (s, _d) = store();
         let id = s.add_contact(&a_contact()).unwrap();
-        let thread = s.pair_contact(id, &[9u8; 32], 2000).unwrap();
-        assert_eq!(s.pair_contact(id, &[8u8; 32], 3000).unwrap(), thread);
+        let thread = s.pair_contact_for_test(id, &[9u8; 32], 2000).unwrap();
+        assert_eq!(
+            s.pair_contact_for_test(id, &[8u8; 32], 3000).unwrap(),
+            thread
+        );
 
         assert_eq!(
             s.pairing_for_contact(id).unwrap().unwrap().l1_pub,
@@ -1299,7 +1375,7 @@ mod tests {
             .unwrap();
         // Someone paired whose Layer-1 key happens to equal the stranger's
         // pseudonym.
-        s.pair_contact(other, &[1u8; 32], 2000).unwrap();
+        s.pair_contact_for_test(other, &[1u8; 32], 2000).unwrap();
 
         assert_eq!(
             s.contact_by_pseudonym(&[1u8; 32]).unwrap().unwrap().id,
@@ -1314,7 +1390,9 @@ mod tests {
         let (s, _d) = store();
         let id = s.add_contact(&a_contact()).unwrap();
         let thread = s
-            .record_pairing(id, &[7u8; 32], "Ada", 0x00_ff_00, 4, &[9u8; 32], 2000)
+            .record_pairing(
+                id, &[7u8; 32], "Ada", 0x00_ff_00, 4, &[9u8; 32], b"ratchet", 2000,
+            )
             .unwrap();
 
         let c = s.contact_by_id(id).unwrap().unwrap();
@@ -1325,6 +1403,41 @@ mod tests {
         assert_eq!(s.contact_by_l1(&[9u8; 32]).unwrap().unwrap().id, id);
         assert_eq!(s.thread_for_contact(id).unwrap(), Some(thread));
         assert_eq!(s.paired_contact_by_l2(&[7u8; 32]).unwrap().unwrap().id, id);
+        // The ratchet is part of the same fact and the same transaction.
+        // Written separately, a failure between the two leaves a durable paired
+        // thread with no ratchet — which the send path reads as a thread that
+        // is not paired and answers by putting plaintext on the wire, while the
+        // caller reports the pairing as failed and the row stays.
+        assert_eq!(
+            s.ratchet_state(thread).unwrap().unwrap()[..],
+            b"ratchet"[..],
+            "a pairing was written down without the ratchet it agreed"
+        );
+    }
+
+    /// Pairing again replaces the ratchet as well as the key.
+    ///
+    /// Not tidiness: a second ceremony can follow a wipe (R0-F9), and it agrees
+    /// a *new* root. Left alone, the thread would keep chaining off the root
+    /// from the ceremony that has just been superseded, and neither person
+    /// could read the other.
+    #[test]
+    fn pairing_again_replaces_the_ratchet_too() {
+        let (s, _d) = store();
+        let id = s.add_contact(&a_contact()).unwrap();
+        let first = s
+            .record_pairing(id, &[7u8; 32], "Ada", 1, 1, &[9u8; 32], b"the first", 2000)
+            .unwrap();
+        let again = s
+            .record_pairing(id, &[7u8; 32], "Ada", 1, 2, &[9u8; 32], b"the second", 3000)
+            .unwrap();
+
+        assert_eq!(again, first, "pairing again opened a second thread");
+        assert_eq!(
+            s.ratchet_state(first).unwrap().unwrap()[..],
+            b"the second"[..],
+            "the thread kept the root the superseded ceremony agreed"
+        );
     }
 
     /// One Layer-1 key, one person.
@@ -1347,9 +1460,9 @@ mod tests {
                 ..a_contact()
             })
             .unwrap();
-        s.pair_contact(first, &[9u8; 32], 2000).unwrap();
+        s.pair_contact_for_test(first, &[9u8; 32], 2000).unwrap();
 
-        assert!(s.pair_contact(second, &[9u8; 32], 3000).is_err());
+        assert!(s.pair_contact_for_test(second, &[9u8; 32], 3000).is_err());
         // Rolled back whole: no pairing, and no thread opened on the way past.
         assert!(s.pairing_for_contact(second).unwrap().is_none());
         assert!(s.thread_for_contact(second).unwrap().is_none());
@@ -1389,7 +1502,7 @@ mod tests {
                 ..a_contact()
             })
             .unwrap();
-        s.pair_contact(friend, &[9u8; 32], 2000).unwrap();
+        s.pair_contact_for_test(friend, &[9u8; 32], 2000).unwrap();
 
         assert!(
             s.paired_contact_by_l2(&[0u8; 32]).unwrap().is_none(),
@@ -1412,7 +1525,7 @@ mod tests {
     fn unpairing_keeps_the_thread_and_its_messages() {
         let (s, _d) = store();
         let id = s.add_contact(&a_contact()).unwrap();
-        let thread = s.pair_contact(id, &[9u8; 32], 2000).unwrap();
+        let thread = s.pair_contact_for_test(id, &[9u8; 32], 2000).unwrap();
         s.add_message(&NewMessage {
             thread_id: thread,
             seq: 1,
@@ -1423,12 +1536,26 @@ mod tests {
             created_at: 2100,
         })
         .unwrap();
+        // Seeded by hand: `pair_contact_for_test` writes a pairing with no
+        // ratchet, so without this the assertion below passes on a thread that
+        // never had one — which is how it read at first, saying nothing.
+        s.start_ratchet(thread, b"live keys", 2100).unwrap();
 
         assert!(s.unpair_contact(id).unwrap());
         assert!(s.pairing_for_contact(id).unwrap().is_none());
         assert!(s.contact_by_l1(&[9u8; 32]).unwrap().is_none());
         assert_eq!(s.thread_for_contact(id).unwrap(), Some(thread));
         assert_eq!(s.messages_for_thread(thread).unwrap().len(), 1);
+        // What was said stays; the ability to say more does not. The engine has
+        // no question to ask about a thread other than "does it have a
+        // ratchet", so a revoked pairing that kept one would go on sealing with
+        // the old root and go on offering openings to somebody this device has
+        // just blocked.
+        assert_eq!(
+            s.ratchet_state(thread).unwrap(),
+            None,
+            "revoking a pairing left its keys behind"
+        );
         // Reports rather than pretends, like every other revoking call here.
         assert!(!s.unpair_contact(id).unwrap());
     }
@@ -1445,7 +1572,7 @@ mod tests {
     fn pairing_an_unknown_contact_says_which_contact() {
         let (s, _d) = store();
         let err = s
-            .pair_contact(4242, &[9u8; 32], 2000)
+            .pair_contact_for_test(4242, &[9u8; 32], 2000)
             .unwrap_err()
             .to_string();
         assert!(err.contains("4242"), "unhelpful error: {err}");
@@ -1464,7 +1591,7 @@ mod tests {
                 ..a_contact()
             })
             .unwrap();
-        s.pair_contact(go, &[9u8; 32], 2000).unwrap();
+        s.pair_contact_for_test(go, &[9u8; 32], 2000).unwrap();
 
         s.merge_contact(go, keep).unwrap();
         assert!(s.contact_by_l1(&[9u8; 32]).unwrap().is_none());
@@ -1928,7 +2055,7 @@ mod tests {
         // How they are known from an earlier encounter, with history.
         let old = s.add_contact(&a_contact()).unwrap();
         let old_thread = s
-            .record_pairing(old, &[2u8; 32], "Wanda", 1, 1, &l1, 10)
+            .record_pairing(old, &[2u8; 32], "Wanda", 1, 1, &l1, b"ratchet", 10)
             .unwrap();
         s.add_message(&NewMessage {
             thread_id: old_thread,
@@ -1952,7 +2079,7 @@ mod tests {
             .unwrap();
 
         let thread = s
-            .record_pairing(current, &[2u8; 32], "Wanda", 1, 2, &l1, 20)
+            .record_pairing(current, &[2u8; 32], "Wanda", 1, 2, &l1, b"ratchet", 20)
             .expect("pairing someone we already knew was refused");
 
         // One person, one row — the one the caller is talking to.
@@ -2041,7 +2168,7 @@ mod tests {
     /// A paired thread with nothing received yet.
     fn a_thread(s: &Store) -> i64 {
         let id = s.add_contact(&a_contact()).unwrap();
-        s.pair_contact(id, &[9u8; 32], 2000).unwrap()
+        s.pair_contact_for_test(id, &[9u8; 32], 2000).unwrap()
     }
 
     fn an_incoming(thread_id: i64, seq: i64, msg_id: u8) -> NewMessage {
@@ -2226,7 +2353,7 @@ mod tests {
     fn deleting_a_contact_takes_the_ratchet_with_it() {
         let (s, _d) = store();
         let contact = s.add_contact(&a_contact()).unwrap();
-        let thread = s.pair_contact(contact, &[9u8; 32], 2000).unwrap();
+        let thread = s.pair_contact_for_test(contact, &[9u8; 32], 2000).unwrap();
         s.start_ratchet(thread, b"state one", 3000).unwrap();
 
         // Straight to SQL, as the messages cascade test next door does: there

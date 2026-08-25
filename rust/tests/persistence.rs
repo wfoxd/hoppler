@@ -83,7 +83,9 @@ fn a_conversation_survives_a_restart() {
                 first_seen: 1000,
             })
             .unwrap();
-        let thread = store.pair_contact(contact, &[8u8; 32], 2000).unwrap();
+        let thread = store
+            .pair_contact_for_test(contact, &[8u8; 32], 2000)
+            .unwrap();
         store
             .commit_received(
                 Some(b"ratchet state"),
