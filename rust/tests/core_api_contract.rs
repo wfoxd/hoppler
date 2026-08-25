@@ -1077,6 +1077,17 @@ impl FullPeer {
         body
     }
 
+    /// Forget this end's ratchet, so a second ceremony can seed a new one.
+    ///
+    /// Harness bookkeeping, not a device behaviour: `absorb` claims the
+    /// ceremony's ratchet only when it is holding none, so a peer that pairs
+    /// twice would otherwise keep chaining off the first root while the engine
+    /// moved to the second.
+    fn forget_ratchet(&self) {
+        *self.ratchet.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        self.heard.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    }
+
     /// Whether a ceremony has left this end a ratchet at all.
     ///
     /// Distinct from [`FullPeer::can_send`], which is false both before the
@@ -1226,6 +1237,7 @@ fn full_peer_with(air: &LoopbackNet, id: &str, identity: Identity) -> FullPeer {
 /// can necessarily write: one of the two has no sending chain until the other
 /// opens it. [`pair_with`] is the one to reach for unless that gap is the point.
 fn pair_only(peer: &FullPeer) -> String {
+    let threads_before = list_threads().unwrap().len();
     let invite = Invite::fresh(
         peer.identity
             .lock()
@@ -1250,9 +1262,13 @@ fn pair_only(peer: &FullPeer) -> String {
     });
     confirm_pairing(device_id.clone()).unwrap();
     peer.net.confirm_pairing("core", Instant::now()).unwrap();
+    // One *more* thread than before, not one thread. Pairing again opens a new
+    // conversation rather than reopening the old one, so a device that has
+    // paired twice has two — and a wait for `len() == 1` would sit there
+    // through the second ceremony for ever.
     until("the pairing to be written down", || {
         pump(peer);
-        list_threads().unwrap().len() == 1
+        list_threads().unwrap().len() > threads_before
     });
     device_id
 }
@@ -1299,7 +1315,11 @@ fn pair_with(peer: &FullPeer) -> String {
     // from the `PairingCompleted` arm, this is the peer's. Exactly one of them
     // has anything to send, and the thread is not two-way until it lands.
     peer.open_the_chain();
-    let thread = list_threads().unwrap()[0].thread_id;
+    // The thread this ceremony opened, asked for by device rather than taken as
+    // the only one: a device that has paired twice has two.
+    let thread = thread_for_device(device_id.clone())
+        .unwrap()
+        .expect("a pairing with no thread");
     until("both ends of the ratchet to open", || {
         pump(peer);
         ratchet_can_send_for_test(thread).unwrap() == Some(true) && peer.can_send()
@@ -1926,6 +1946,68 @@ fn a_resend_costs_no_message_key() {
         pump(&peer);
         peer.heard().iter().any(|t| t == "for later")
     });
+}
+
+/// Pairing again opens a new conversation and closes the old one.
+///
+/// The case this exists for is narrower than it first looks, and worth stating
+/// exactly. A peer that crypto-erases (R0-F9) comes back with a *new* Layer-1
+/// identity, which is a new contact and a new thread already — nothing to fix.
+/// The one that bites is a peer whose **identity survives while its store does
+/// not**, which on Android is an ordinary thing rather than a corner: the
+/// keystore-backed key lives outside the app's data, so clearing that data
+/// leaves the same person with an empty outbox. Their numbering restarts at
+/// `seq = 1` into an inbox that has already seen a hundred, and their first
+/// message home is dropped as a duplicate of something said before it knew
+/// this device.
+///
+/// Both halves matter and they pull against each other: the new conversation
+/// has to work from nothing, and the old one has to still be there, because
+/// what somebody said does not stop having been said.
+#[test]
+fn pairing_again_opens_a_second_conversation() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = fresh();
+
+    let peer = full_peer(&h.air, "peer", "Ada");
+    let device_id = meet_and_pair(&peer);
+    let first = thread_for_device(device_id.clone()).unwrap().unwrap();
+    send_chat(device_id.clone(), "before".into()).expect("a message on the first thread");
+
+    // The same identity, a second ceremony. This is the peer that kept its keys
+    // and lost its messages.
+    peer.forget_ratchet();
+    let device_again = pair_with(&peer);
+    let second = thread_for_device(device_again.clone()).unwrap().unwrap();
+    assert_ne!(second, first, "the second pairing reused the first thread");
+
+    // The new conversation counts from nothing, which is the whole point: their
+    // `seq = 1` has to land here rather than be refused by an inbox that
+    // remembers a conversation this one never had.
+    assert!(
+        thread_messages(second).unwrap().is_empty(),
+        "the new conversation started with the old one's messages in it"
+    );
+    receive_chat_for_test(&device_again, &peer.seal_chat(1, b"after"))
+        .unwrap()
+        .expect("their first message home was refused");
+    assert_eq!(thread_messages(second).unwrap().len(), 1);
+
+    // And the old one is intact, and closed.
+    assert_eq!(
+        thread_messages(first).unwrap().len(),
+        1,
+        "the first conversation lost what was said in it"
+    );
+    assert!(
+        send_chat_to_thread(first, "still there?".into()).is_err(),
+        "a finished conversation took a message it can never send"
+    );
+    assert_eq!(
+        thread_messages(first).unwrap().len(),
+        1,
+        "the refusal left a row behind"
+    );
 }
 
 /// A pairing outlives the session that made it.

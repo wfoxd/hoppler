@@ -606,8 +606,38 @@ pub fn send_chat(device_id: String, text: String) -> Result<ChatMessageDto, Stri
 /// is why this is one function and not two: "write to Wren" should not behave
 /// differently depending on whether the radio can see her this second.
 pub fn send_chat_to_thread(thread_id: i64, text: String) -> Result<ChatMessageDto, String> {
+    // A conversation that ended when the two of you paired again cannot be
+    // written to, and says so rather than taking the message.
+    //
+    // Refused rather than held, which is the opposite of what every other
+    // "cannot send right now" does here — because this one is never going to
+    // become sendable. Held, it would sit `Queued` for ever behind a peer who
+    // is perfectly reachable on the thread next to it. And it is not only a
+    // matter of tidiness: a superseded thread has no ratchet, `seal_for_thread`
+    // reads that as an unpaired stranger, and the body would go out in the
+    // clear if anything ever did send it.
+    if let Some(why) = with_core(|core| superseded(core, thread_id))? {
+        return Err(why);
+    }
     let device_id = with_core(|core| device_for_thread(core, thread_id))?;
     write_then_send(thread_id, device_id, text)
+}
+
+/// Why this thread cannot be written to, if it cannot.
+///
+/// `None` for the ordinary case — a stranger's thread, or the current one for a
+/// paired contact. A thread belonging to a contact whose newest thread is some
+/// other one is a finished conversation: pairing again opened its successor.
+fn superseded(core: &Core, thread_id: i64) -> Result<Option<String>, StoreError> {
+    let Some(contact) = core.store.contact_for_thread(thread_id)? else {
+        return Ok(Some("that conversation is not on this device".into()));
+    };
+    if core.store.thread_for_contact(contact)? == Some(thread_id) {
+        return Ok(None);
+    }
+    Ok(Some(
+        "this conversation ended when you paired again — the newer one is open".into(),
+    ))
 }
 
 /// The rest of a send, once the conversation is known.

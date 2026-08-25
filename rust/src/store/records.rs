@@ -524,12 +524,44 @@ impl Store {
         l1_pub: &[u8; 32],
         paired_at: i64,
     ) -> Result<i64, StoreError> {
+        // Asked before the pairing is written, because the answer is "was this
+        // person already paired" and the row below is about to say yes either
+        // way.
+        let repairing = self.pairing_for_contact(contact_id)?.is_some();
         self.conn.execute(
             "INSERT INTO pairings (contact_id, l1_pub, paired_at) VALUES (?1, ?2, ?3)
              ON CONFLICT(contact_id) DO UPDATE SET l1_pub = ?2, paired_at = ?3",
             params![contact_id, &l1_pub[..], paired_at],
         )?;
-        match self.thread_for_contact(contact_id)? {
+        let existing = self.thread_for_contact(contact_id)?;
+
+        // Pairing *again* starts a new conversation, because numbering belongs
+        // to a pairing. Reusing the thread meant a peer who wiped (R0-F9) and
+        // came back began at `seq = 1` into an inbox that had already seen a
+        // hundred, and was dropped as a duplicate of something said before it
+        // knew this device.
+        //
+        // The old thread keeps everything said in it and is never written to
+        // again. Its ratchet goes: key material for a conversation that cannot
+        // continue, which is the rule `unpair_contact` follows too.
+        if repairing {
+            if let Some(previous) = existing {
+                self.conn.execute(
+                    "DELETE FROM ratchets WHERE thread_id = ?1",
+                    params![previous],
+                )?;
+            }
+            return self.create_thread(contact_id, paired_at);
+        }
+
+        // A *first* pairing adopts whatever thread is already there, which is
+        // the separate decision recorded in T12: people chat and Ping before
+        // they pair (R0-F3, R0-F5), and pairing somebody is not a reason to put
+        // what you already said to them behind a divider. Their numbering runs
+        // straight on through it — the same outbox on their side, the next
+        // `seq` after the last — so there is nothing here for a new thread to
+        // fix.
+        match existing {
             Some(t) => Ok(t),
             None => self.create_thread(contact_id, paired_at),
         }
@@ -647,15 +679,58 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// The contact's **current** thread — the newest one.
+    ///
+    /// A contact can have several now, because pairing again starts a new
+    /// conversation rather than reopening the old one. Everything that asks
+    /// this question wants the current one: what to send on, what a sighting
+    /// resolves to, what a tap opens. The older ones are still there and still
+    /// readable; nothing writes to them again.
+    ///
+    /// Newest by `id`, not by `created_at`. The timestamp comes from the
+    /// device's clock and two ceremonies seconds apart can carry the same
+    /// millisecond, or the clock can go backwards; the rowid only ever
+    /// increases, and "which of these did we open last" is exactly what it
+    /// records.
     pub fn thread_for_contact(&self, contact_id: i64) -> Result<Option<i64>, StoreError> {
         self.conn
             .query_row(
-                "SELECT id FROM threads WHERE contact_id = ?1",
+                "SELECT id FROM threads WHERE contact_id = ?1 ORDER BY id DESC LIMIT 1",
                 params![contact_id],
                 |r| r.get(0),
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    /// Which contact a thread belongs to.
+    ///
+    /// The reverse of [`Store::thread_for_contact`], and needed now that the
+    /// forward direction is one-to-many: "is this the conversation we are
+    /// currently having with this person, or one we finished when we paired
+    /// again" cannot be answered from the thread alone.
+    pub fn contact_for_thread(&self, thread_id: i64) -> Result<Option<i64>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT contact_id FROM threads WHERE id = ?1",
+                params![thread_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Every thread a contact has, newest first.
+    ///
+    /// One per pairing, so this is the list of conversations that have been had
+    /// with one person — and it is more than one only for people who have
+    /// paired twice.
+    pub fn threads_for_contact(&self, contact_id: i64) -> Result<Vec<i64>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM threads WHERE contact_id = ?1 ORDER BY id DESC")?;
+        let rows = stmt.query_map(params![contact_id], |r| r.get(0))?;
+        rows.map(|r| r.map_err(Into::into)).collect()
     }
 
     /// All threads as `(thread_id, contact_id)`, newest first — for the T07
@@ -1426,14 +1501,11 @@ mod tests {
     /// back with a new Layer-1 identity, and the second ceremony is the current
     /// truth. The old key must not still resolve to them.
     #[test]
-    fn pairing_again_replaces_the_key_and_keeps_the_thread() {
+    fn pairing_again_replaces_the_key() {
         let (s, _d) = store();
         let id = s.add_contact(&a_contact()).unwrap();
-        let thread = s.pair_contact_for_test(id, &[9u8; 32], 2000).unwrap();
-        assert_eq!(
-            s.pair_contact_for_test(id, &[8u8; 32], 3000).unwrap(),
-            thread
-        );
+        s.pair_contact_for_test(id, &[9u8; 32], 2000).unwrap();
+        s.pair_contact_for_test(id, &[8u8; 32], 3000).unwrap();
 
         assert_eq!(
             s.pairing_for_contact(id).unwrap().unwrap().l1_pub,
@@ -1441,6 +1513,46 @@ mod tests {
         );
         assert!(s.contact_by_l1(&[9u8; 32]).unwrap().is_none());
         assert_eq!(s.contact_by_l1(&[8u8; 32]).unwrap().unwrap().id, id);
+    }
+
+    /// Pairing again opens a new thread, and leaves the old one alone.
+    ///
+    /// Numbering belongs to a pairing. Reusing the thread meant a peer who
+    /// wiped and came back began at `seq = 1` into an inbox that had already
+    /// seen a hundred, and was dropped as a duplicate of something said before
+    /// it knew this device — while clearing that inbox instead would have left
+    /// old rows numbered 1..N beside new rows numbered from 1, ordered by `seq`,
+    /// so today's message sorted into the middle of last year.
+    ///
+    /// What was said in the old conversation stays in it, and stays readable.
+    /// That is the half of this worth being careful about: a new pairing is not
+    /// a reason to lose what somebody said.
+    #[test]
+    fn pairing_again_opens_a_new_thread() {
+        let (s, _d) = store();
+        let id = s.add_contact(&a_contact()).unwrap();
+        let first = s.pair_contact_for_test(id, &[9u8; 32], 2000).unwrap();
+        s.add_message(&an_incoming(first, 1, 1)).unwrap();
+
+        let second = s.pair_contact_for_test(id, &[8u8; 32], 3000).unwrap();
+        assert_ne!(second, first, "the second pairing reused the first thread");
+        assert_eq!(
+            s.thread_for_contact(id).unwrap(),
+            Some(second),
+            "the current thread is not the one the last ceremony opened"
+        );
+        assert_eq!(
+            s.threads_for_contact(id).unwrap(),
+            vec![second, first],
+            "newest first, and both still there"
+        );
+
+        // The old conversation is intact, and the new one starts empty and
+        // starts counting again.
+        assert_eq!(s.messages_for_thread(first).unwrap().len(), 1);
+        assert!(s.messages_for_thread(second).unwrap().is_empty());
+        assert_eq!(s.inbox_position(second).unwrap(), None);
+        assert_eq!(s.next_seq(second, Direction::Incoming).unwrap(), 1);
     }
 
     /// The reason pairings are a separate table.
@@ -1502,14 +1614,15 @@ mod tests {
         );
     }
 
-    /// Pairing again replaces the ratchet as well as the key.
+    /// The new thread gets the new root, and the old one is left with none.
     ///
-    /// Not tidiness: a second ceremony can follow a wipe (R0-F9), and it agrees
-    /// a *new* root. Left alone, the thread would keep chaining off the root
-    /// from the ceremony that has just been superseded, and neither person
-    /// could read the other.
+    /// Two halves. The new conversation must chain off the root the second
+    /// ceremony agreed, or neither person can read the other. And the old
+    /// thread must not keep its own: it is key material for a conversation that
+    /// cannot continue, which under R0-F9 is exactly what should not be sitting
+    /// on the disk — the same rule `unpair_contact` follows.
     #[test]
-    fn pairing_again_replaces_the_ratchet_too() {
+    fn pairing_again_moves_the_root_to_the_new_thread() {
         let (s, _d) = store();
         let id = s.add_contact(&a_contact()).unwrap();
         let first = s
@@ -1519,11 +1632,16 @@ mod tests {
             .record_pairing(id, &[7u8; 32], "Ada", 1, 2, &[9u8; 32], b"the second", 3000)
             .unwrap();
 
-        assert_eq!(again, first, "pairing again opened a second thread");
+        assert_ne!(again, first, "pairing again reused the thread");
         assert_eq!(
-            s.ratchet_state(first).unwrap().unwrap()[..],
+            s.ratchet_state(again).unwrap().unwrap()[..],
             b"the second"[..],
-            "the thread kept the root the superseded ceremony agreed"
+            "the new conversation is chaining off the superseded root"
+        );
+        assert_eq!(
+            s.ratchet_state(first).unwrap(),
+            None,
+            "the superseded conversation kept its keys"
         );
     }
 
