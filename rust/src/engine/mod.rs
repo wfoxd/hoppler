@@ -45,7 +45,9 @@ use crate::identity::{COLOUR_MASK, MAX_PERSONA_NAME_LEN};
 use crate::pairing::invite::Invite;
 use zeroize::Zeroizing;
 
-use crate::session::chat::{ChatEnvelope, Delivery, Inbox, Outbox, MAX_UNACKED, MSG_ID_LEN};
+use crate::session::chat::{
+    ChatEnvelope, Delivery, Inbox, Outbox, MAX_BODY, MAX_UNACKED, MSG_ID_LEN,
+};
 use crate::session::ratchet::{self, Ratchet};
 use crate::store::{
     Direction, InboxPosition, InsertOutcome, MessageState, NewContact, NewMessage, NewTransfer,
@@ -622,6 +624,18 @@ fn write_then_send(
 ) -> Result<ChatMessageDto, String> {
     let (dto, envelope, held) = with_core_mut(|core| {
         let now = now_millis();
+        // What a person may type, checked here because here is the last place
+        // it is still what they typed. `ChatEnvelope::new` bounds the *wire*
+        // body, which on a paired thread is this plus a header and a tag — and
+        // on a thread with no chain yet is empty, so the envelope would have
+        // had nothing to measure and an oversized message would have been taken
+        // down, held, and only refused at some later reunion by a different
+        // layer with a different reason.
+        if text.len() > MAX_BODY {
+            return Err(StoreError::Db(format!(
+                "a message may be at most {MAX_BODY} bytes"
+            )));
+        }
         let seq = core.store.next_seq(thread, Direction::Outgoing)?;
         // The envelope draws the id, so the number the row is stored under and
         // the number that goes on the wire are the same object rather than two
@@ -1601,27 +1615,20 @@ fn store_incoming_chat(
         let position = core.store.inbox_position(thread)?.unwrap_or_default();
         let mut inbox = Inbox::resumed(position.through, position.ahead);
 
-        match inbox.receive(envelope.seq) {
-            Delivery::Accepted => {}
-            Delivery::Duplicate => {
-                log::debug!("dropping a chat message we already have");
-                return Ok(None);
-            }
-            Delivery::TooFarAhead => {
-                // Refused rather than accepted with an enormous gap behind it.
-                // Tracking that gap is memory a peer could ask for by picking a
-                // number, and closing over it silently is the loss R0-F5 exists
-                // to prevent — so the honest answer is to take neither.
-                log::warn!("refusing a chat message too far ahead of the conversation");
-                return Ok(None);
-            }
-        }
-
         // Opened before anything is written, and the advanced state goes down
         // with the message that advanced it. A message that will not open
         // leaves the ratchet exactly as it was — `Ratchet::decrypt` spends
         // nothing before the tag is checked — so a forged body cannot burn a
         // key the real message needs.
+        //
+        // Ahead of the inbox, and that ordering is load-bearing. A resend is
+        // freshly sealed — the row keeps plaintext, so `resend_queued` seals
+        // again — which means a duplicate `seq` still carries a message number
+        // this end has never stepped to. Dropped before opening, the sender
+        // advances and the receiver does not, and a chain that falls more than
+        // `MAX_SKIP` behind cannot be caught up: the next genuinely new message
+        // is refused and the thread is finished. So the body is opened first
+        // and the turn is kept even when the message itself is not.
         let Incoming {
             plaintext,
             ratchet: advanced,
@@ -1635,6 +1642,37 @@ fn store_incoming_chat(
                 return Ok(None);
             }
         };
+        // The limit on what a person may have typed, applied to what they
+        // actually typed. `ChatEnvelope::decode` bounds the sealed body, which
+        // is this plus a header and a tag, so a peer could otherwise put a body
+        // over the limit in a row this device shows.
+        if plaintext.len() > MAX_BODY {
+            log::warn!("dropping a chat message longer than a message may be");
+            return Ok(None);
+        }
+
+        let delivery = inbox.receive(envelope.seq);
+        match delivery {
+            Delivery::Accepted => {}
+            Delivery::Duplicate => log::debug!("dropping a chat message we already have"),
+            // Refused rather than accepted with an enormous gap behind it.
+            // Tracking that gap is memory a peer could ask for by picking a
+            // number, and closing over it silently is the loss R0-F5 exists
+            // to prevent — so the honest answer is to take neither.
+            Delivery::TooFarAhead => {
+                log::warn!("refusing a chat message too far ahead of the conversation")
+            }
+        }
+        if delivery != Delivery::Accepted {
+            // The message is not kept and the turn is. It opened, which is the
+            // sender proving it holds this chain — not a header anyone can
+            // write — and the key it spent is spent whatever the inbox thinks
+            // of the number on the outside.
+            if let Some(advanced) = &advanced {
+                core.store.start_ratchet(thread, advanced, now)?;
+            }
+            return Ok(None);
+        }
 
         let outcome = core.store.commit_received(
             advanced.as_ref().map(|s| s.as_slice()),
@@ -1667,7 +1705,12 @@ fn store_incoming_chat(
         Ok(Some(CoreEvent::MessageReceived {
             thread_id: thread,
             msg_id: hex::encode(envelope.msg_id),
-            text: String::from_utf8_lossy(&envelope.body).into_owned(),
+            // The opened body, not what arrived. On a paired thread these are
+            // not the same bytes, and the event is what the screen draws the
+            // moment a message lands — so a thread already open showed a
+            // ratchet header and a block of ciphertext, and only reading it
+            // again put the real line there.
+            text: String::from_utf8_lossy(&plaintext).into_owned(),
         }))
     })
 }

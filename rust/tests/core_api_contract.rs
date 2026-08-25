@@ -35,7 +35,7 @@ use rust_lib_hoppler::engine::{
 };
 use rust_lib_hoppler::identity::Identity;
 use rust_lib_hoppler::pairing::invite::Invite;
-use rust_lib_hoppler::session::chat::{ChatEnvelope, MAX_AHEAD, MAX_UNACKED};
+use rust_lib_hoppler::session::chat::{ChatEnvelope, MAX_AHEAD, MAX_BODY, MAX_UNACKED};
 use rust_lib_hoppler::session::ratchet::{self, Header, Ratchet};
 use rust_lib_hoppler::transport::loopback::LoopbackNet;
 use rust_lib_hoppler::transport::{Transport, TransportError, TransportEvent};
@@ -1022,6 +1022,19 @@ impl FullPeer {
             .expect("a session that just carried a whole ceremony");
     }
 
+    /// Seal a body the way this device would send it.
+    ///
+    /// What the engine has to open. A test that handed it plaintext on a paired
+    /// thread would be testing a message no real peer can send.
+    fn seal(&self, plaintext: &[u8]) -> Vec<u8> {
+        let mut held = self.ratchet.lock().unwrap_or_else(|p| p.into_inner());
+        let ratchet = held.as_mut().expect("a ceremony has run");
+        let (header, sealed) = ratchet.encrypt(plaintext).expect("a chain that can send");
+        let mut body = header.to_bytes().to_vec();
+        body.extend_from_slice(&sealed);
+        body
+    }
+
     /// Whether this end could write on the thread right now.
     fn can_send(&self) -> bool {
         self.ratchet
@@ -1174,6 +1187,26 @@ fn pair_only(peer: &FullPeer) -> String {
         list_threads().unwrap().len() == 1
     });
     device_id
+}
+
+/// See the peer, pair with it, and come back with the device id.
+///
+/// The preamble every test that needs two paired devices was carrying verbatim.
+fn meet_and_pair(peer: &FullPeer) -> String {
+    set_discovery(true).unwrap();
+    peer.net
+        .discovery()
+        .set_enabled(true, Instant::now())
+        .unwrap();
+    peer.net.discovery().start_scanning().unwrap();
+    until("the engine to see the peer", || {
+        pump(peer);
+        nearby_devices()
+            .unwrap()
+            .iter()
+            .any(|d| d.device_id.as_deref() == Some(peer.id.as_str()))
+    });
+    pair_with(peer)
 }
 
 /// Pair, and then wait until both devices can actually write.
@@ -1553,6 +1586,16 @@ fn a_message_written_before_the_chain_opens_is_held() {
         "the engine was given a sending chain it should not have yet"
     );
 
+    // The limit still applies on this path, and this is the only place it can
+    // be seen: `ChatEnvelope::new` bounds the wire body, and the wire body here
+    // is empty because nothing could be sealed. Without a check on the
+    // plaintext an oversized message would be taken down, held, and refused
+    // later by the frame layer for a different reason.
+    assert!(
+        send_chat(device_id.clone(), "x".repeat(MAX_BODY + 1)).is_err(),
+        "an oversized message was held rather than refused"
+    );
+
     // Not an error, and not a lost message.
     send_chat(device_id, "typed too soon".into()).expect("a send that had to be held");
     assert_eq!(
@@ -1573,6 +1616,127 @@ fn a_message_written_before_the_chain_opens_is_held() {
         pump(&peer);
         peer.heard().iter().any(|t| t == "typed too soon")
     });
+}
+
+/// A message that arrives on a paired thread is announced as what was written.
+///
+/// The event and the row are two different pieces of code reading two different
+/// values, and only one of them was ratcheted. The row held the opened body and
+/// the event held `envelope.body` — so a thread already on screen drew a ratchet
+/// header and a block of ciphertext, and only leaving the thread and coming
+/// back put the real line there. Every test passed: they all read the row.
+#[test]
+fn an_arriving_message_is_announced_as_what_was_written() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = fresh();
+    let peer = full_peer(&h.air, "peer", "Ada");
+    let device_id = meet_and_pair(&peer);
+
+    let envelope = ChatEnvelope::new(1, peer.seal(b"can you read this?")).unwrap();
+    let event = receive_chat_for_test(&device_id, &envelope)
+        .unwrap()
+        .expect("a message the engine kept");
+    let CoreEvent::MessageReceived { text, .. } = event else {
+        panic!("a chat message was announced as something else");
+    };
+    assert_eq!(text, "can you read this?");
+}
+
+/// A resend the inbox already has still turns the ratchet.
+///
+/// The row keeps plaintext, so `resend_queued` seals again — which means a
+/// duplicate `seq` carries a message number this end has never stepped to.
+/// Dropped before opening, the sender advances and the receiver does not, and
+/// the gap is permanent: `walk` refuses more than `MAX_SKIP` at once, so enough
+/// resends and the next genuinely new message is undecryptable with nothing to
+/// be done about it.
+///
+/// The message itself is still dropped — that is what the inbox is for, and
+/// `the_same_message_arriving_twice_is_one_message` says so.
+#[test]
+fn a_duplicate_still_turns_the_ratchet() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = fresh();
+    let peer = full_peer(&h.air, "peer", "Ada");
+    let device_id = meet_and_pair(&peer);
+    let thread = list_threads().unwrap()[0].thread_id;
+
+    let first = ChatEnvelope::new(1, peer.seal(b"hello")).unwrap();
+    receive_chat_for_test(&device_id, &first)
+        .unwrap()
+        .expect("the first message");
+    let before = ratchet_fingerprint_for_test(thread).unwrap().unwrap();
+
+    // The same position in the sender's stream, freshly sealed — which is
+    // exactly what a resend is.
+    let again = ChatEnvelope::new(1, peer.seal(b"hello")).unwrap();
+    assert!(
+        receive_chat_for_test(&device_id, &again).unwrap().is_none(),
+        "a resend was shown twice"
+    );
+    assert!(
+        ratchet_fingerprint_for_test(thread).unwrap() != Some(before),
+        "the ratchet did not step over a message it declined to keep"
+    );
+
+    // And the conversation carries on from where the resend left it.
+    let next = ChatEnvelope::new(2, peer.seal(b"still there?")).unwrap();
+    let event = receive_chat_for_test(&device_id, &next)
+        .unwrap()
+        .expect("the message after the resend");
+    let CoreEvent::MessageReceived { text, .. } = event else {
+        panic!("a chat message was announced as something else");
+    };
+    assert_eq!(text, "still there?");
+}
+
+/// A body longer than a message may be is refused at both doors, and the
+/// longest allowed one is not.
+///
+/// `MAX_BODY` is a limit on what a person types, and the envelope that used to
+/// enforce it sees what goes on the wire — which on a paired thread is the same
+/// bytes plus a header and a tag, and on a thread with no chain yet is empty.
+/// So the limit both shrank by fifty-six characters where it was checked and
+/// vanished where it was not.
+#[test]
+fn a_message_longer_than_a_message_may_be_is_refused() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = fresh();
+    let peer = full_peer(&h.air, "peer", "Ada");
+    let device_id = meet_and_pair(&peer);
+    let thread = list_threads().unwrap()[0].thread_id;
+
+    assert!(
+        send_chat(device_id.clone(), "x".repeat(MAX_BODY + 1)).is_err(),
+        "an oversized message was taken down"
+    );
+    assert!(
+        thread_messages(thread).unwrap().is_empty(),
+        "a refused message left a row behind"
+    );
+    // The bound is a bound, and not an off-by-one that quietly costs the last
+    // fifty-six characters of a long message.
+    send_chat(device_id.clone(), "x".repeat(MAX_BODY)).expect("a message at the limit");
+
+    // And on the way in. The reachable case is an *unpaired* thread, where the
+    // body is not sealed and the wire bound is therefore fifty-six bytes of
+    // slack a stranger can spend on the plaintext itself. A sealed body cannot
+    // get past the envelope, because the overhead it leaves room for is exactly
+    // the overhead sealing adds.
+    let huge = ChatEnvelope::new(1, vec![b'x'; MAX_BODY + 1]).unwrap();
+    assert!(
+        receive_chat_for_test("a-stranger", &huge)
+            .unwrap()
+            .is_none(),
+        "an oversized body arrived into a row"
+    );
+    let at_the_limit = ChatEnvelope::new(1, vec![b'x'; MAX_BODY]).unwrap();
+    assert!(
+        receive_chat_for_test("a-stranger", &at_the_limit)
+            .unwrap()
+            .is_some(),
+        "a message at the limit was refused"
+    );
 }
 
 /// A pairing outlives the session that made it.
