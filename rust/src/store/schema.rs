@@ -125,6 +125,33 @@ const MIGRATIONS: &[&str] = &[
         ahead     BLOB NOT NULL
     );
     "#,
+    // v3 -> v4: what a queued message will go out as, kept until it goes.
+    //
+    // A message waiting for its peer used to be re-sealed at every reunion,
+    // which drew a fresh message key each time. A frame the transport accepted
+    // and then lost therefore left the receiver's chain one behind for good,
+    // and `walk` refuses a gap past `MAX_SKIP` — so a long enough run of
+    // unlucky reunions ends the conversation with no way back. Sealed once and
+    // kept, a resend is byte-identical: it costs no key, and a receiver that
+    // already had it sees the replay for what it is.
+    //
+    // Its own table, for the reason `ratchets` has one. This is ciphertext, and
+    // `messages` is what the screen reads — a blob on that row would be
+    // returned by every query that draws a conversation, to be ignored each
+    // time. Keyed on `msg_id` rather than the rowid because `msg_id` is what a
+    // resend, an acknowledgement and a gap are all matched on, and `UNIQUE`
+    // already makes it a key.
+    //
+    // The row lives exactly as long as the message is `Queued`:
+    // `set_message_state` drops it on the way out, and `ON DELETE CASCADE`
+    // drops it with the message.
+    r#"
+    CREATE TABLE outbound_seals (
+        msg_id     BLOB PRIMARY KEY REFERENCES messages(msg_id) ON DELETE CASCADE,
+        wire       BLOB NOT NULL,
+        created_at INTEGER NOT NULL
+    );
+    "#,
 ];
 
 /// The schema version this build migrates to.

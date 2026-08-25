@@ -814,15 +814,30 @@ impl Store {
 
     /// Update a message's delivery state. Returns whether a row matched, so a
     /// state transition against an unknown `msg_id` is detectable.
+    ///
+    /// A message that stops being `Queued` loses the bytes it was going to go
+    /// out as. That is the whole lifetime rule for `outbound_seals` and it is
+    /// enforced here rather than at the call sites, because the cost of getting
+    /// it wrong is asymmetric: a seal kept too long is ciphertext for a
+    /// conversation nobody is going to resend, held until the contact is
+    /// deleted, and there is no second place that would notice.
     pub fn set_message_state(
         &self,
         msg_id: &[u8],
         state: MessageState,
     ) -> Result<bool, StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
         let changed = self.conn.execute(
             "UPDATE messages SET state = ?1 WHERE msg_id = ?2",
             params![state.to_i64(), msg_id],
         )?;
+        if state != MessageState::Queued {
+            self.conn.execute(
+                "DELETE FROM outbound_seals WHERE msg_id = ?1",
+                params![msg_id],
+            )?;
+        }
+        tx.commit()?;
         Ok(changed > 0)
     }
 
@@ -963,6 +978,7 @@ impl Store {
         &self,
         ratchet: Option<&[u8]>,
         message: &NewMessage,
+        wire: Option<&[u8]>,
         now: i64,
     ) -> Result<InsertOutcome, StoreError> {
         let tx = self.conn.unchecked_transaction()?;
@@ -974,8 +990,51 @@ impl Store {
             self.write_ratchet(message.thread_id, ratchet, now)?;
         }
         let outcome = self.add_message(message)?;
+        // After the message, because it references it. `None` where nothing
+        // could be sealed — an outgoing message on a thread whose chain has not
+        // opened yet, which `resend_queued` seals when it can.
+        if let Some(wire) = wire {
+            self.write_seal(&message.msg_id, wire, now)?;
+        }
         tx.commit()?;
         Ok(outcome)
+    }
+
+    /// What a queued message will go out as, so a resend is the same bytes.
+    ///
+    /// Sealed once. Re-sealing at every reunion drew a fresh message key each
+    /// time, so a frame the transport accepted and then lost left the
+    /// receiver's chain one behind permanently — and `walk` will not close a
+    /// gap past `MAX_SKIP`. Byte-identical, a resend costs no key at all, and a
+    /// receiver that already had the message sees the replay for what it is and
+    /// refuses it without spending anything either.
+    fn write_seal(&self, msg_id: &[u8], wire: &[u8], now: i64) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO outbound_seals (msg_id, wire, created_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(msg_id) DO UPDATE SET wire = ?2, created_at = ?3",
+            params![msg_id, wire, now],
+        )?;
+        Ok(())
+    }
+
+    /// Save the bytes a queued message will go out as, on its own.
+    ///
+    /// The path where sealing could not happen when the row was written — a
+    /// thread whose chain had not opened yet — and happens later instead.
+    pub fn seal_queued(&self, msg_id: &[u8], wire: &[u8], now: i64) -> Result<(), StoreError> {
+        self.write_seal(msg_id, wire, now)
+    }
+
+    /// The bytes a queued message was sealed as, if it still has them.
+    pub fn seal_for(&self, msg_id: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT wire FROM outbound_seals WHERE msg_id = ?1",
+                params![msg_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     /// Save a thread's ratchet on its own — the pairing case, where there is a
@@ -2169,6 +2228,89 @@ mod tests {
     fn a_thread(s: &Store) -> i64 {
         let id = s.add_contact(&a_contact()).unwrap();
         s.pair_contact_for_test(id, &[9u8; 32], 2000).unwrap()
+    }
+
+    fn a_queued_outgoing(thread_id: i64, seq: i64, msg_id: u8) -> NewMessage {
+        NewMessage {
+            thread_id,
+            seq,
+            msg_id: vec![msg_id; 16],
+            body: b"waiting".to_vec(),
+            direction: Direction::Outgoing,
+            state: MessageState::Queued,
+            created_at: 3000,
+        }
+    }
+
+    /// A queued message keeps the bytes it will go out as, and loses them the
+    /// moment it goes.
+    ///
+    /// The whole lifetime of `outbound_seals`. Sealing once is what makes a
+    /// resend byte-identical, and byte-identical is what makes it free: the
+    /// old behaviour drew a fresh message key on every attempt, so a frame the
+    /// transport accepted and then lost left the far side's chain one behind
+    /// for good.
+    ///
+    /// Kept no longer than that, because the seal is ciphertext for a
+    /// conversation, and holding it past the send would be a second copy of
+    /// every message anyone ever queued, for as long as the contact exists.
+    #[test]
+    fn a_queued_message_keeps_its_seal_until_it_goes() {
+        let (s, _d) = store();
+        let thread = a_thread(&s);
+        let id = vec![7u8; 16];
+
+        s.commit_sent(
+            None,
+            &a_queued_outgoing(thread, 1, 7),
+            Some(b"what goes on the wire"),
+            3000,
+        )
+        .unwrap();
+        assert_eq!(
+            s.seal_for(&id).unwrap().as_deref(),
+            Some(&b"what goes on the wire"[..]),
+            "a queued message has nothing to resend"
+        );
+
+        assert!(s.set_message_state(&id, MessageState::Sent).unwrap());
+        assert_eq!(
+            s.seal_for(&id).unwrap(),
+            None,
+            "a message that has gone is still holding its ciphertext"
+        );
+    }
+
+    /// Deleting the message takes its seal, without anyone remembering to.
+    ///
+    /// The same rule as `deleting_a_contact_takes_the_ratchet_with_it`, and the
+    /// same reason: this is ciphertext belonging to a conversation, and under
+    /// R0-F9 it must not outlive it.
+    #[test]
+    fn deleting_a_contact_takes_the_seals_with_it() {
+        let (s, _d) = store();
+        let contact = s.add_contact(&a_contact()).unwrap();
+        let thread = s.pair_contact_for_test(contact, &[9u8; 32], 2000).unwrap();
+        let id = vec![7u8; 16];
+        s.commit_sent(
+            None,
+            &a_queued_outgoing(thread, 1, 7),
+            Some(b"sealed"),
+            3000,
+        )
+        .unwrap();
+        assert!(s.seal_for(&id).unwrap().is_some());
+
+        // Straight to SQL, as the ratchet cascade test does: there is no public
+        // delete, and the property under test is the schema's.
+        s.conn
+            .execute("DELETE FROM contacts WHERE id = ?1", params![contact])
+            .unwrap();
+        assert_eq!(
+            s.seal_for(&id).unwrap(),
+            None,
+            "a deleted conversation left its ciphertext behind"
+        );
     }
 
     fn an_incoming(thread_id: i64, seq: i64, msg_id: u8) -> NewMessage {
