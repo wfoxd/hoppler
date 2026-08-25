@@ -165,17 +165,24 @@ fn chat_crosses_a_real_session() {
     assert!(
         b_events.contains(&NetEvent::ChatReceived {
             peer: alice.id.clone(),
-            envelope: sent.clone(),
+            body: sent.encode(),
         }),
         "chat did not arrive as it was sent: {b_events:?}"
     );
 }
 
 /// A peer can put anything in a chat frame. One unreadable message is one
-/// unreadable message: it must not end the session, and it must not surface as
-/// an empty line on somebody's screen.
+/// unreadable message: it must not end the session.
+///
+/// Whether it is *readable* is no longer a question this layer can answer. A
+/// chat frame is a sealed envelope and only the engine holds the thread's
+/// ratchet, so `Net` hands the bytes on and the engine decides — see
+/// `an_unreadable_chat_message_is_dropped_and_leaves_no_row` in the contract
+/// tests. Deciding here meant every rejection this layer could make threw away
+/// a message that would have opened, and the chain step the sender had already
+/// taken with it.
 #[test]
-fn a_chat_frame_that_is_not_an_envelope_is_dropped_and_the_session_survives() {
+fn a_chat_frame_that_is_not_an_envelope_does_not_end_the_session() {
     let air = air();
     let now = Instant::now();
     let alice = node(&air, "alice", "Alice", now);
@@ -189,10 +196,11 @@ fn a_chat_frame_that_is_not_an_envelope_is_dropped_and_the_session_survives() {
     alice.net.send_chat(&bob.id, vec![0xff; 8], now).unwrap();
     let (_, b_events) = settle(&alice, &bob, now);
     assert!(
-        !b_events
-            .iter()
-            .any(|e| matches!(e, NetEvent::ChatReceived { .. })),
-        "garbage surfaced as a message: {b_events:?}"
+        b_events.contains(&NetEvent::ChatReceived {
+            peer: alice.id.clone(),
+            body: vec![0xff; 8],
+        }),
+        "the bytes were judged by a layer that cannot read them: {b_events:?}"
     );
 
     // And the session is still there: a good message straight after arrives.
@@ -202,7 +210,7 @@ fn a_chat_frame_that_is_not_an_envelope_is_dropped_and_the_session_survives() {
     assert!(
         b_events.contains(&NetEvent::ChatReceived {
             peer: alice.id.clone(),
-            envelope: good,
+            body: good.encode(),
         }),
         "one bad frame took the session with it: {b_events:?}"
     );
