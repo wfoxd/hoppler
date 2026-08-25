@@ -212,6 +212,27 @@ pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
     // id would leave rows pointing at nothing, and turning enforcement back on
     // would not notice.
     conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+    // Read back, because setting it is not the same as it being off and the
+    // difference is a database. `PRAGMA foreign_keys` is silently a no-op
+    // inside a transaction, and there is no error to catch — the statement
+    // succeeds and enforcement stays on. A rebuild then reaches `DROP TABLE
+    // threads` with enforcement live, which SQLite treats as deleting every
+    // row, and the cascade takes `messages`, `ratchets` and `inboxes` with it
+    // while leaving `contacts` and `pairings` untouched.
+    //
+    // That is not a hypothetical shape. It is what two phones looked like after
+    // v5: every contact still paired, every conversation gone. The tests here
+    // could not produce it — not from v3, not from v4, not on a WAL database
+    // with enforcement already on — which is the whole argument for checking
+    // the state rather than trusting the statement.
+    let enforcing: i64 = conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0))?;
+    if enforcing != 0 {
+        return Err(StoreError::Db(
+            "refusing to migrate: foreign keys could not be turned off, and a \
+             rebuild would delete every row it references"
+                .into(),
+        ));
+    }
     let out = migrate_steps(conn);
     let checked = out.and_then(|()| {
         let mut stmt = conn.prepare("PRAGMA foreign_key_check")?;
@@ -278,6 +299,112 @@ mod tests {
         }
         conn.execute_batch(&format!("PRAGMA user_version = {version};"))
             .unwrap();
+    }
+
+    /// The same, on a WAL database with foreign keys already on.
+    ///
+    /// What the phones run, and the one difference from the test above that a
+    /// desk cannot see: `Store::open` sets `journal_mode = WAL` before it
+    /// migrates, and `PRAGMA foreign_keys` is a no-op inside a transaction. If
+    /// enforcement survived into the rebuild, `DROP TABLE threads` would be an
+    /// implicit delete of every row and the cascade would take the messages,
+    /// the ratchets and the inboxes with it — leaving contacts and pairings
+    /// untouched, which is exactly what an empty conversation list looks like.
+    #[test]
+    fn a_wal_database_survives_the_threads_rebuild_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        at_version(&conn, 3);
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute(
+            "INSERT INTO contacts (id, pseudonym, l2_pub, name, colour, persona_version, first_seen)
+             VALUES (1, ?1, ?2, 'Ada', 0, 1, 1)",
+            rusqlite::params![&[7u8; 32][..], &[8u8; 32][..]],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO threads (id, contact_id, created_at) VALUES (5, 1, 2)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (thread_id, seq, msg_id, body, direction, state, created_at)
+             VALUES (5, 1, ?1, ?2, 0, 2, 3)",
+            rusqlite::params![&[3u8; 16][..], &b"said before the upgrade"[..]],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let threads: i64 = conn
+            .query_row("SELECT count(*) FROM threads", [], |r| r.get(0))
+            .unwrap();
+        let msgs: i64 = conn
+            .query_row("SELECT count(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(threads, 1, "the rebuild emptied the threads table");
+        assert_eq!(msgs, 1, "the cascade took the conversation");
+    }
+
+    /// A conversation survives the v5 rebuild.
+    ///
+    /// v5 rebuilds `threads` to drop a UNIQUE constraint, and four tables
+    /// reference it. Every test until now started from a *fresh* schema at the
+    /// latest version, so none of them ever carried a message across a
+    /// migration — which is exactly the thing a table rebuild can lose.
+    #[test]
+    fn messages_survive_the_threads_rebuild() {
+        let conn = Connection::open_in_memory().unwrap();
+        at_version(&conn, 3);
+        conn.execute(
+            "INSERT INTO contacts (id, pseudonym, l2_pub, name, colour, persona_version, first_seen)
+             VALUES (1, ?1, ?2, 'Ada', 0, 1, 1)",
+            rusqlite::params![&[7u8; 32][..], &[8u8; 32][..]],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO threads (id, contact_id, created_at) VALUES (5, 1, 2)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (thread_id, seq, msg_id, body, direction, state, created_at)
+             VALUES (5, 1, ?1, ?2, 0, 2, 3)",
+            rusqlite::params![&[3u8; 16][..], &b"said before the upgrade"[..]],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ratchets (thread_id, state, updated_at) VALUES (5, ?1, 4)",
+            rusqlite::params![&b"keys"[..]],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let threads: i64 = conn
+            .query_row("SELECT count(*) FROM threads WHERE id = 5", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(threads, 1, "the thread did not come across");
+        let msgs: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM messages WHERE thread_id = 5",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(msgs, 1, "the conversation was lost in the rebuild");
+        let ratchets: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM ratchets WHERE thread_id = 5",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ratchets, 1, "the thread's keys were lost in the rebuild");
     }
 
     /// The v2 migration has to move data, not just columns.

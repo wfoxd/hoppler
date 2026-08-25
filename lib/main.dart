@@ -187,6 +187,23 @@ class _HomePageState extends State<HomePage> {
       setState(() => _canTap = true);
       _taps = nfcEvents().listen(_onTap);
     });
+    // Ask once for the list as it stands, then keep it current from events.
+    //
+    // `_devices` is only ever written by `DiscoveryUpdated`, and nothing emits
+    // one at startup — so until this, opening the app showed an empty list
+    // until something happened to fire one. Turning Discovery on did, which is
+    // why it looked fine every time anyone tested it that way.
+    //
+    // It is R0-F5's promise that suffers: a paired friend is meant to stay
+    // listed with Discovery *off* (they show as away), and that is precisely
+    // the case where no event is coming. Somebody who opens the app to write to
+    // a friend who is not nearby saw nobody at all.
+    nearbyDevices().then((devices) {
+      if (!mounted) return;
+      setState(() => _devices = devices);
+    }).catchError((Object e) {
+      if (mounted) setState(() => _log.insert(0, 'Error: $e'));
+    });
   }
 
   /// A code read off another phone, or a tap that produced nothing.
