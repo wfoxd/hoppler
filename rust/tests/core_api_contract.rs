@@ -1042,14 +1042,25 @@ impl FullPeer {
             .expect("a session that just carried a whole ceremony");
     }
 
-    /// A whole chat frame, the way this device would send one: an envelope
-    /// carrying the text, encoded, and sealed entire.
+    /// A whole chat frame, the way this device would send a *new* message: a
+    /// fresh envelope carrying the text, encoded, and sealed entire.
     ///
-    /// `seq` is the caller's, so a test can send the same position twice —
-    /// which is what a resend is, and the `msg_id` is drawn fresh each time,
-    /// exactly as `ChatEnvelope::new` does on the real send path.
+    /// Each call draws a new `msg_id`, as `ChatEnvelope::new` does on the send
+    /// path. A resend is not this — see [`FullPeer::seal_envelope`], which is
+    /// what `resend_queued` does and keeps both identifiers.
     fn seal_chat(&self, seq: u64, text: &[u8]) -> Vec<u8> {
         let envelope = ChatEnvelope::new(seq, text.to_vec()).expect("a sendable message");
+        self.seal_envelope(&envelope)
+    }
+
+    /// Seal an envelope that already exists — a resend.
+    ///
+    /// The distinction is the whole reason a resend is hard: it carries the
+    /// `seq` *and* the `msg_id` it was first sent under, so the far side can
+    /// tell it from a new message, and it is freshly sealed, so the ratchet has
+    /// never seen these bytes. A helper that drew a new `msg_id` would be
+    /// simulating a second message rather than the same one twice.
+    fn seal_envelope(&self, envelope: &ChatEnvelope) -> Vec<u8> {
         self.seal(&envelope.encode())
     }
 
@@ -1727,15 +1738,19 @@ fn a_declined_message_still_turns_the_ratchet() {
     let device_id = meet_and_pair(&peer);
     let thread = list_threads().unwrap()[0].thread_id;
 
-    receive_chat_for_test(&device_id, &peer.seal_chat(1, b"hello"))
+    let first = ChatEnvelope::new(1, b"hello".to_vec()).unwrap();
+    receive_chat_for_test(&device_id, &peer.seal_envelope(&first))
         .unwrap()
         .expect("the first message");
     let before = ratchet_fingerprint_for_test(thread).unwrap().unwrap();
 
-    // The same position in the sender's stream, freshly sealed — which is
-    // exactly what a resend is.
+    // The same envelope — same `seq`, same `msg_id` — sealed again. That is
+    // exactly what `resend_queued` puts on the wire, and the reason it is not
+    // simply a replay: the ciphertext is new every time, so the ratchet has
+    // never seen these bytes even though the message is one this end already
+    // has.
     assert!(
-        receive_chat_for_test(&device_id, &peer.seal_chat(1, b"hello"))
+        receive_chat_for_test(&device_id, &peer.seal_envelope(&first))
             .unwrap()
             .is_none(),
         "a resend was shown twice"

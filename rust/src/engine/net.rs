@@ -117,16 +117,19 @@ pub enum NetEvent {
     /// the two together made a tap look answered only when the other person
     /// happened to nudge back, and never otherwise.
     PingAcked { peer: PeerId },
-    /// A chat line arrived, still sealed.
+    /// A chat line arrived. Opaque bytes, and deliberately so.
     ///
-    /// Bytes rather than a decoded envelope, and that is the whole point of the
-    /// shape. On a paired thread the payload is a ratchet header and a sealed
-    /// [`ChatEnvelope`](crate::session::chat::ChatEnvelope) — so there is
-    /// nothing to decode until it has been opened, and only the engine has the
-    /// thread's ratchet. Decoding here instead meant every rejection this layer
-    /// could make (`seq == 0`, a short `msg_id`, an over-long body) threw away
-    /// a message that would have opened, and with it the chain step the sender
-    /// had already taken.
+    /// What they are depends on the thread, and `Net` does not know which
+    /// thread this is: on a paired one a ratchet header and a sealed
+    /// [`ChatEnvelope`](crate::session::chat::ChatEnvelope), on an unpaired one
+    /// that envelope encoded in the clear — R0-F5 lets strangers chat, and a
+    /// stranger's thread has no ratchet to seal with. Only the engine holds
+    /// both the thread and its keys, so only the engine can tell the two apart.
+    ///
+    /// That is the whole point of the shape. Decoding here instead meant every
+    /// rejection this layer could make (`seq == 0`, a short `msg_id`, an
+    /// over-long body) threw away a message that would have opened, and with it
+    /// the chain step the sender had already taken.
     ChatReceived { peer: PeerId, body: Vec<u8> },
     /// A peer opened its end of a paired thread's ratchet chain
     /// ([`FrameKind::Opening`]).
