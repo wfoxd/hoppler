@@ -152,6 +152,40 @@ const MIGRATIONS: &[&str] = &[
         created_at INTEGER NOT NULL
     );
     "#,
+    // v4 -> v5: a contact may have more than one thread, because pairing again
+    // starts a new conversation.
+    //
+    // `threads.contact_id` was `UNIQUE`, so a second ceremony reused the first
+    // one's thread — and with it that thread's inbox position. A peer who wiped
+    // (R0-F9), re-paired and started again at `seq = 1` was therefore dropped
+    // as a duplicate of something said before it ever knew this device.
+    //
+    // Clearing the inbox instead would have been two lines and wrong: the
+    // thread would hold old rows numbered 1..N and new rows numbered from 1
+    // again, and `messages_for_thread` orders by `seq`, so a message from today
+    // would sort into the middle of last year. A pairing is what numbering
+    // belongs to, so a new pairing gets a new thread and the old one keeps
+    // everything that was said in it.
+    //
+    // A rebuild, because SQLite cannot drop a constraint. The ids are carried
+    // across unchanged, which is what keeps `messages`, `ratchets`, `inboxes`
+    // and `transfers` pointing at the right rows — they reference `threads(id)`
+    // by name, and the name resolves to the new table once it is in place.
+    // `migrate` runs with foreign keys off for exactly this: `DROP TABLE
+    // threads` with them on is an implicit delete of every row, and every one
+    // of those references cascades.
+    r#"
+    CREATE TABLE threads_rebuilt (
+        id         INTEGER PRIMARY KEY,
+        contact_id INTEGER NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
+        created_at INTEGER NOT NULL
+    );
+    INSERT INTO threads_rebuilt (id, contact_id, created_at)
+        SELECT id, contact_id, created_at FROM threads;
+    DROP TABLE threads;
+    ALTER TABLE threads_rebuilt RENAME TO threads;
+    CREATE INDEX idx_threads_contact ON threads(contact_id, id);
+    "#,
 ];
 
 /// The schema version this build migrates to.
@@ -165,8 +199,37 @@ pub fn current_version(conn: &Connection) -> rusqlite::Result<i64> {
 /// atomically, so an interruption never leaves a half-applied version. Refuses
 /// to run against a database newer than this build understands.
 pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
+    // Off for the duration, on again at the end, with a check in between. This
+    // is SQLite's own recipe for a schema change and not a way around the
+    // constraints: a step that rebuilds a table has to drop the old one, and
+    // `DROP TABLE` with foreign keys on is an implicit delete of every row —
+    // which for `threads` would cascade through `messages`, `ratchets`,
+    // `inboxes` and `transfers` and take the whole database with it.
+    //
+    // The pragma is a no-op inside a transaction, so it has to be set out here
+    // rather than in a step. `PRAGMA foreign_key_check` before it goes back on
+    // is what makes this safe rather than merely quiet: a rebuild that lost an
+    // id would leave rows pointing at nothing, and turning enforcement back on
+    // would not notice.
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+    let out = migrate_steps(conn);
+    let checked = out.and_then(|()| {
+        let mut stmt = conn.prepare("PRAGMA foreign_key_check")?;
+        let dangling = stmt.query_map([], |_| Ok(()))?.count();
+        if dangling > 0 {
+            return Err(StoreError::Db(format!(
+                "migration left {dangling} rows referring to something that is not there"
+            )));
+        }
+        Ok(())
+    });
+    // On again whatever happened, so a failed migration does not leave the
+    // connection quietly unenforced for the rest of its life.
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    checked
+}
 
+fn migrate_steps(conn: &Connection) -> Result<(), StoreError> {
     // user_version is a signed integer; a negative value is corrupt, not a
     // valid version to cast into usize.
     let current = current_version(conn)?;
