@@ -606,19 +606,6 @@ pub fn send_chat(device_id: String, text: String) -> Result<ChatMessageDto, Stri
 /// is why this is one function and not two: "write to Wren" should not behave
 /// differently depending on whether the radio can see her this second.
 pub fn send_chat_to_thread(thread_id: i64, text: String) -> Result<ChatMessageDto, String> {
-    // A conversation that ended when the two of you paired again cannot be
-    // written to, and says so rather than taking the message.
-    //
-    // Refused rather than held, which is the opposite of what every other
-    // "cannot send right now" does here — because this one is never going to
-    // become sendable. Held, it would sit `Queued` for ever behind a peer who
-    // is perfectly reachable on the thread next to it. And it is not only a
-    // matter of tidiness: a superseded thread has no ratchet, `seal_for_thread`
-    // reads that as an unpaired stranger, and the body would go out in the
-    // clear if anything ever did send it.
-    if let Some(why) = with_core(|core| superseded(core, thread_id))? {
-        return Err(why);
-    }
     let device_id = with_core(|core| device_for_thread(core, thread_id))?;
     write_then_send(thread_id, device_id, text)
 }
@@ -652,6 +639,26 @@ fn write_then_send(
 ) -> Result<ChatMessageDto, String> {
     let (dto, envelope, wire, held) = with_core_mut(|core| {
         let now = now_millis();
+        // A conversation that ended when the two of you paired again cannot be
+        // written to, and says so rather than taking the message.
+        //
+        // Refused rather than held, which is the opposite of what every other
+        // "cannot send right now" does here — because this one is never going
+        // to become sendable. Held, it would sit `Queued` for ever behind a
+        // peer who is perfectly reachable on the thread next to it. And it is
+        // not only tidiness: a superseded thread has no ratchet,
+        // `seal_for_thread` reads that as an unpaired stranger, and the body
+        // would go out in the clear if anything ever did send it.
+        //
+        // Inside this lock, and immediately before the seal, because that is
+        // the only place the answer stays true. Asked in `send_chat_to_thread`
+        // it was two lock acquisitions earlier: a re-pairing arriving on the
+        // net thread in between supersedes the thread and deletes its ratchet,
+        // and the send that had just been told it was fine goes out in the
+        // clear.
+        if let Some(why) = superseded(core, thread)? {
+            return Err(StoreError::Db(why));
+        }
         let seq = core.store.next_seq(thread, Direction::Outgoing)?;
         // The envelope draws the id, so the number the row is stored under and
         // the number that goes on the wire are the same object rather than two

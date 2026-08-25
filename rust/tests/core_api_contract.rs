@@ -1237,7 +1237,6 @@ fn full_peer_with(air: &LoopbackNet, id: &str, identity: Identity) -> FullPeer {
 /// can necessarily write: one of the two has no sending chain until the other
 /// opens it. [`pair_with`] is the one to reach for unless that gap is the point.
 fn pair_only(peer: &FullPeer) -> String {
-    let threads_before = list_threads().unwrap().len();
     let invite = Invite::fresh(
         peer.identity
             .lock()
@@ -1262,13 +1261,24 @@ fn pair_only(peer: &FullPeer) -> String {
     });
     confirm_pairing(device_id.clone()).unwrap();
     peer.net.confirm_pairing("core", Instant::now()).unwrap();
-    // One *more* thread than before, not one thread. Pairing again opens a new
-    // conversation rather than reopening the old one, so a device that has
-    // paired twice has two — and a wait for `len() == 1` would sit there
-    // through the second ceremony for ever.
+    // Waited for by the *ratchet*, not by a count of threads.
+    //
+    // Counting was wrong in both directions. `len() == 1` sits through a second
+    // ceremony for ever, because pairing again opens another conversation. And
+    // "one more than before" hangs on a first pairing that adopts a thread that
+    // was already there — which is what happens whenever two people chatted
+    // before they paired, and is a decision T12 made on purpose.
+    //
+    // A thread gains a ratchet exactly when `record_pairing` writes one, so
+    // this is the pairing landing rather than a proxy for it, and it holds
+    // whichever of the two shapes the ceremony took.
     until("the pairing to be written down", || {
         pump(peer);
-        list_threads().unwrap().len() > threads_before
+        thread_for_device(device_id.clone())
+            .ok()
+            .flatten()
+            .and_then(|t| ratchet_can_send_for_test(t).ok().flatten())
+            .is_some()
     });
     device_id
 }
@@ -1946,6 +1956,55 @@ fn a_resend_costs_no_message_key() {
         pump(&peer);
         peer.heard().iter().any(|t| t == "for later")
     });
+}
+
+/// Pairing somebody you were already chatting with keeps the conversation.
+///
+/// T12 decided this on purpose: people chat and Ping before they pair (R0-F3,
+/// R0-F5), and pairing is not a reason to put what you already said behind a
+/// divider. Their numbering runs straight on through the ceremony — the same
+/// outbox on their side, the next `seq` after the last — so there is nothing
+/// here for a new thread to fix.
+///
+/// Which makes it the exception to the rule beside it, and the reason that rule
+/// is "pairing *again*" rather than "pairing". Only covered at the store level
+/// before; a first pairing that adopts an existing thread is also the shape
+/// that used to hang the harness, because the thread count does not move.
+#[test]
+fn pairing_someone_you_already_chat_with_keeps_the_conversation() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = fresh();
+    let peer = full_peer(&h.air, "peer", "Ada");
+
+    // A stranger, said before any ceremony.
+    receive_chat_for_test(
+        "peer",
+        &ChatEnvelope::new(1, b"we have not met".to_vec())
+            .unwrap()
+            .encode(),
+    )
+    .unwrap()
+    .expect("a stranger's message");
+    let before = thread_for_device("peer".into()).unwrap().unwrap();
+    assert_eq!(thread_messages(before).unwrap().len(), 1);
+
+    let device_id = meet_and_pair(&peer);
+
+    assert_eq!(
+        thread_for_device(device_id).unwrap(),
+        Some(before),
+        "pairing put what was already said behind a divider"
+    );
+    assert_eq!(
+        thread_messages(before).unwrap().len(),
+        1,
+        "the conversation lost what was said before the ceremony"
+    );
+    assert_eq!(
+        list_threads().unwrap().len(),
+        1,
+        "a first pairing opened a second conversation"
+    );
 }
 
 /// Pairing again opens a new conversation and closes the old one.
