@@ -685,9 +685,14 @@ fn write_then_send(
         // stand up a second one to watch the wire — so the guarantee has to be
         // that there is nothing to diverge.
         // The row keeps the *plaintext*: it is what the screen draws, and the
-        // store is already encrypted at rest. The ciphertext is not kept —
-        // a resend seals again, which costs a message key and saves a second
-        // copy of every conversation.
+        // store is already encrypted at rest. The ciphertext is kept too, and
+        // separately, but only while the message is `Queued` — see
+        // `outbound_seals`. That is a reversal of what this comment used to
+        // say: re-sealing at every reunion looked like the frugal choice until
+        // it turned out to spend a message key each time, which is a budget
+        // that cannot be refilled. A second copy of the *backlog* is a much
+        // smaller thing than a second copy of every conversation, and it is
+        // bounded by `MAX_UNACKED` and gone the moment the message goes.
         core.store.commit_sent(
             advanced.as_ref().map(|s| s.as_slice()),
             &NewMessage {
@@ -1299,9 +1304,12 @@ fn queued_for_resend(
                 ChatEnvelope {
                     seq,
                     msg_id,
-                    // Plaintext, as stored. The resend seals it — see
-                    // `resend_queued`, which must turn the ratchet and make the
-                    // turn durable before anything goes out.
+                    // Plaintext, as stored, and usually not what goes out:
+                    // `resend_queued` sends the bytes this message was sealed
+                    // as when it was written. This is the fallback it seals
+                    // from when there were none — a thread whose chain had not
+                    // opened yet — and that path still has to make the turn
+                    // durable before anything leaves.
                     body: m.body.clone(),
                 },
             ))

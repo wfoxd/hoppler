@@ -1009,9 +1009,16 @@ impl Store {
     /// receiver that already had the message sees the replay for what it is and
     /// refuses it without spending anything either.
     fn write_seal(&self, msg_id: &[u8], wire: &[u8], now: i64) -> Result<(), StoreError> {
+        // `DO NOTHING`, so the first seal wins. Nothing should reach here
+        // twice — `commit_sent` inserts a fresh `msg_id`, and the resend path
+        // only seals when `seal_for` came back empty — so a conflict means a
+        // bug, and of the two ways to be wrong this is the survivable one.
+        // Overwriting would replace bytes the peer may already hold with bytes
+        // sealed further along the chain, which is precisely the byte-identical
+        // resend this table exists to guarantee, quietly undone.
         self.conn.execute(
             "INSERT INTO outbound_seals (msg_id, wire, created_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT(msg_id) DO UPDATE SET wire = ?2, created_at = ?3",
+             ON CONFLICT(msg_id) DO NOTHING",
             params![msg_id, wire, now],
         )?;
         Ok(())
@@ -2278,6 +2285,37 @@ mod tests {
             s.seal_for(&id).unwrap(),
             None,
             "a message that has gone is still holding its ciphertext"
+        );
+    }
+
+    /// The first seal wins.
+    ///
+    /// Nothing should seal a message twice — `commit_sent` inserts a fresh
+    /// `msg_id`, and the resend path only seals when there was nothing there —
+    /// so a second attempt means a bug somewhere else. Of the two ways to
+    /// handle it this is the survivable one: overwriting would replace bytes
+    /// the peer may already hold with bytes sealed further along the chain,
+    /// undoing the byte-identical resend this table exists to guarantee, and
+    /// nothing would say so.
+    #[test]
+    fn a_second_seal_does_not_replace_the_first() {
+        let (s, _d) = store();
+        let thread = a_thread(&s);
+        let id = vec![7u8; 16];
+
+        s.commit_sent(
+            None,
+            &a_queued_outgoing(thread, 1, 7),
+            Some(b"the first"),
+            3000,
+        )
+        .unwrap();
+        s.seal_queued(&id, b"a later one", 4000).unwrap();
+
+        assert_eq!(
+            s.seal_for(&id).unwrap().as_deref(),
+            Some(&b"the first"[..]),
+            "the bytes the peer may already hold were replaced"
         );
     }
 
