@@ -9,7 +9,6 @@ import 'package:hoppler/features/pairing/pairing_surface.dart';
 import 'package:hoppler/features/pairing/sas_view.dart';
 import 'package:hoppler/features/pairing/scanner.dart';
 import 'package:hoppler/features/threads/thread_view.dart';
-import 'package:hoppler/features/threads/threads_view.dart';
 import 'package:hoppler/features/ping/ping_service.dart';
 import 'package:hoppler/src/rust/api/core.dart';
 import 'package:hoppler/src/rust/api/discovery.dart';
@@ -362,13 +361,6 @@ class _HomePageState extends State<HomePage> {
       appBar: AppBar(
         backgroundColor: _personaColour,
         title: Text('Hoppler — ${widget.persona.name}'),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.forum_outlined),
-            tooltip: 'Conversations',
-            onPressed: _openConversations,
-          ),
-        ],
       ),
       body: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -609,23 +601,11 @@ class _HomePageState extends State<HomePage> {
     return NearbyTile(
       device: d,
       pingService: _pingService,
-      // Addressed by device when they are here and by thread when they are
-      // not. Both end in the same row on the same conversation — R0-F5 keeps
-      // what was written either way — so writing to somebody must not depend on
-      // whether the radio can see them this second.
-      onChat: (text) => _run(() {
-        final id = d.deviceId;
-        if (id != null) return sendChat(deviceId: id, text: text);
-        final thread = d.threadId;
-        if (thread != null) {
-          return sendChatToThread(threadId: thread, text: text);
-        }
-        // No handle and no conversation is not a state the core produces: an
-        // away row exists only for a paired contact, and R0-F4 gives every one
-        // of those a thread. Reported rather than dropped, because if it ever
-        // happens the invariant has moved.
-        throw StateError('no way to reach ${d.name}');
-      }),
+      onOpen: () => _openConversation(
+        threadId: d.threadId,
+        deviceId: d.deviceId,
+        title: d.name.isEmpty ? 'Unknown device' : d.name,
+      ),
       onDrop: () => _run(
         () => offerDrop(
           deviceId: d.deviceId!,
@@ -636,52 +616,54 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  /// Open the conversation list.
-  ///
-  /// Read on the way in rather than held in this page's state: threads change
-  /// underneath us — a reunion delivers a backlog, a pairing opens a thread —
-  /// and a list captured when the app started would be quietly stale by the
-  /// time anyone looked at it.
-  Future<void> _openConversations() async {
-    try {
-      final threads = await listThreads();
-      if (!mounted) return;
-      await Navigator.of(context).push(
-        MaterialPageRoute<void>(
-          builder: (_) => Scaffold(
-            appBar: AppBar(title: const Text('Conversations')),
-            body: ThreadsView<ThreadSummary>(
-              threads: threads,
-              tile: (t) => ListTile(
-                leading: CircleAvatar(
-                  backgroundColor: Color(0xFF000000 | t.colour),
-                ),
-                title: Text(t.name.isEmpty ? 'Unknown' : t.name),
-                onTap: () => _openThread(t),
-              ),
-            ),
-          ),
-        ),
-      );
-    } catch (e) {
-      if (mounted) setState(() => _log.insert(0, 'Error: $e'));
-    }
-  }
-
   /// Open one conversation.
   ///
-  /// Rebuilt from the store after every send and on every arrival, rather than
-  /// appending locally. What the store holds is the truth about a conversation
-  /// — it is what survives a restart, what a resend is drawn from, and what
-  /// dedupes a message that arrives twice — so a screen that kept its own list
-  /// beside it would be a second answer able to disagree with the first.
-  Future<void> _openThread(ThreadSummary t) async {
-    Future<List<ThreadLine>> read() async => (await threadMessages(
-      threadId: t.threadId,
-    )).map((m) => ThreadLine(text: m.text, outgoing: m.outgoing)).toList();
+  /// Reached by tapping somebody on the nearby list — their name and their
+  /// colour — which replaced both a Chat button that could only send a fixed
+  /// greeting and a separate Conversations list in the app bar. The list is
+  /// gone because the nearby screen already holds everyone it held: R0-F4
+  /// makes pairing durable, so a paired friend has a row whether the radio can
+  /// see them or not.
+  ///
+  /// **A stranger you have not written to yet has no thread.** That is not an
+  /// error state — `threadId` is null until the first message creates the row —
+  /// so this opens on an empty conversation and lets the first send bring it
+  /// into being, addressed by device id. After that the thread is what
+  /// everything reads and writes.
+  ///
+  /// Messages are rebuilt from the store after every send and on every arrival
+  /// rather than appended locally. What the store holds is the truth about a
+  /// conversation — it is what survives a restart, what a resend is drawn from,
+  /// and what dedupes a message that arrives twice — so a screen keeping its
+  /// own list beside it would be a second answer able to disagree with the
+  /// first.
+  Future<void> _openConversation({
+    required int? threadId,
+    required String? deviceId,
+    required String title,
+  }) async {
+    // Mutable: a conversation with a stranger gains its thread on the first
+    // send, and everything after that has to read the thread that now exists
+    // rather than the absence it opened with.
+    var thread = threadId;
 
-    var lines = await read();
+    Future<List<ThreadLine>> read() async {
+      final id = thread;
+      if (id == null) return <ThreadLine>[];
+      return (await threadMessages(
+        threadId: id,
+      )).map((m) => ThreadLine(text: m.text, outgoing: m.outgoing)).toList();
+    }
+
+    List<ThreadLine> lines;
+    try {
+      lines = await read();
+    } catch (e) {
+      if (mounted) setState(() => _log.insert(0, 'Error: $e'));
+      return;
+    }
     if (!mounted) return;
+
     await Navigator.of(context).push(
       MaterialPageRoute<void>(
         builder: (_) => StatefulBuilder(
@@ -692,16 +674,29 @@ class _HomePageState extends State<HomePage> {
             // opening a second one: the event stream is single-subscription,
             // and two listeners would mean the first one silently winning.
             _onThreadArrival = (arrived) async {
-              if (arrived != t.threadId) return;
+              if (arrived != thread) return;
               final fresh = await read();
               setLocal(() => lines = fresh);
             };
             return ThreadView(
-              title: t.name.isEmpty ? 'Unknown' : t.name,
+              title: title,
               lines: lines,
+              // Nothing to write to and nobody to write to: a row with neither
+              // a thread nor a handle is not a state the core produces, but
+              // saying so beats a send that vanishes.
+              canSend: thread != null || deviceId != null,
+              cannotSendReason: 'there is no way to reach them',
               onSend: (text) async {
                 try {
-                  await sendChatToThread(threadId: t.threadId, text: text);
+                  final id = thread;
+                  if (id != null) {
+                    await sendChatToThread(threadId: id, text: text);
+                  } else {
+                    // The first line to a stranger. This is what creates the
+                    // conversation, so take the thread it made.
+                    final sent = await sendChat(deviceId: deviceId!, text: text);
+                    thread = sent.threadId;
+                  }
                   final fresh = await read();
                   if (!context.mounted) return;
                   setLocal(() => lines = fresh);

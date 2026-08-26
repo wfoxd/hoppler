@@ -14,16 +14,23 @@ class NearbyTile extends StatelessWidget {
     super.key,
     required this.device,
     required this.pingService,
-    required this.onChat,
+    required this.onOpen,
     required this.onDrop,
   });
 
   final NearbyDevice device;
   final PingService pingService;
 
-  /// Given the greeting to send, so the caller keeps the Core API and this
-  /// stays testable without it.
-  final void Function(String text) onChat;
+  /// Open the conversation with this person.
+  ///
+  /// The row itself is the way in — their name and their colour, which is what
+  /// somebody looks at when they mean "talk to them". It replaced a Chat button
+  /// that sent a fixed greeting, so the only thing you could say to a person on
+  /// this screen was `Hey <name>!` and saying it twice sent it twice.
+  ///
+  /// Kept as a callback rather than the Core API, so this stays testable
+  /// without the Rust bridge.
+  final VoidCallback onOpen;
   final VoidCallback onDrop;
 
   /// Whether we know who this is yet.
@@ -48,14 +55,42 @@ class NearbyTile extends StatelessWidget {
   /// What a paired friend who is not in range can still be told.
   ///
   /// R0-F5 says a message written out of range is kept and delivered at the
-  /// next encounter, so Chat stays live. Ping and Drop do not: a Ping is a
-  /// nudge someone answers now, and a Drop needs both phones present. Offering
-  /// them anyway would mean a tap that quietly does nothing.
+  /// next encounter, so the conversation stays open. Ping and Drop do not: a
+  /// Ping is a nudge someone answers now, and a Drop needs both phones
+  /// present. Offering them anyway would mean a tap that quietly does
+  /// nothing.
   static const awayHint = 'Ping and Drop need them nearby.';
+
+  /// A disabled control that still swallows the tap that lands on it.
+  ///
+  /// An `IconButton` with no callback registers no gesture, so the tap carries
+  /// straight through to whatever is behind — here the row, which would open a
+  /// conversation. That is the one reading a person would least expect from a
+  /// control shown greyed out beside the words "Ping and Drop need them
+  /// nearby": they tapped the thing that says it is unavailable, and something
+  /// else happened.
+  ///
+  /// A `GestureDetector` rather than an `AbsorbPointer`, so the long press that
+  /// shows the tooltip still gets through. Taps compete in the gesture arena
+  /// and the deepest recogniser wins, which is this one.
+  ///
+  /// `excludeFromSemantics` because the handler exists only to swallow. Without
+  /// it the wrapper advertises a tap action, so a screen reader offers to
+  /// activate a control the same tree describes as disabled — and activating it
+  /// does nothing, which is a worse answer than the button gives on its own.
+  /// What is silenced is this wrapper, not the button: the `IconButton` keeps
+  /// its own semantics, including that it is unavailable.
+  static Widget _unavailable(Widget button) =>
+      GestureDetector(onTap: () {}, excludeFromSemantics: true, child: button);
 
   @override
   Widget build(BuildContext context) {
     return ListTile(
+      // The whole row bar the buttons: avatar, name and subtitle. An enabled
+      // control keeps its own hit target and wins the gesture arena by being
+      // deeper in the tree — a *disabled* one does not, which is why the two
+      // below are wrapped. See [`_unavailable`].
+      onTap: onOpen,
       leading: CircleAvatar(
         // Colour arrives with the persona. Until then it is 0, which renders as
         // flat black and looks like a rendering fault rather than an absence.
@@ -81,26 +116,30 @@ class NearbyTile extends StatelessWidget {
               deviceId: device.deviceId!,
             )
           else
-            const IconButton(
-              icon: Icon(Icons.notifications_none),
-              tooltip: awayHint,
-              // Deliberately shown and disabled rather than removed. A row that
-              // loses its buttons when somebody walks away looks broken; one
-              // whose buttons are visibly unavailable says what changed.
-              onPressed: null,
+            // Deliberately shown and disabled rather than removed. A row that
+            // loses its buttons when somebody walks away looks broken; one
+            // whose buttons are visibly unavailable says what changed.
+            _unavailable(
+              const IconButton(
+                icon: Icon(Icons.notifications_none),
+                tooltip: awayHint,
+                onPressed: null,
+              ),
             ),
-          IconButton(
-            icon: const Icon(Icons.chat_bubble_outline),
-            tooltip: 'Chat',
-            // Without the guard this greets an unnamed peer as "Hey !", which
-            // is what actually arrived on the far phone during the LAN run.
-            onPressed: () => onChat(isKnown ? 'Hey ${device.name}!' : 'Hey!'),
-          ),
-          IconButton(
-            icon: const Icon(Icons.upload_file_outlined),
-            tooltip: isHere ? 'Drop' : awayHint,
-            onPressed: isHere ? onDrop : null,
-          ),
+          if (isHere)
+            IconButton(
+              icon: const Icon(Icons.upload_file_outlined),
+              tooltip: 'Drop',
+              onPressed: onDrop,
+            )
+          else
+            _unavailable(
+              const IconButton(
+                icon: Icon(Icons.upload_file_outlined),
+                tooltip: awayHint,
+                onPressed: null,
+              ),
+            ),
         ],
       ),
     );
