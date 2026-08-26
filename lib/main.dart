@@ -107,6 +107,10 @@ class _HomePageState extends State<HomePage> {
   bool _discovery = false;
   List<NearbyDevice> _devices = [];
 
+  /// Whether `_devices` has been set by an event rather than by the one-shot
+  /// read at startup. See `initState`.
+  bool _devicesAreLive = false;
+
   /// Why the radio cannot be used, or null when it can.
   ///
   /// Held apart from [_devices] because an empty list is what "the radio is
@@ -187,6 +191,11 @@ class _HomePageState extends State<HomePage> {
       setState(() => _canTap = true);
       _taps = nfcEvents().listen(_onTap);
     });
+    // Whether an event has delivered a list, so the startup snapshot below
+    // knows not to overwrite one. Not `_devices.isEmpty`: an event carrying an
+    // empty list is a fact — nobody is nearby — and treating it as "nothing has
+    // arrived yet" would let a stale snapshot put people back on the screen.
+    //
     // Ask once for the list as it stands, then keep it current from events.
     //
     // `_devices` is only ever written by `DiscoveryUpdated`, and nothing emits
@@ -199,7 +208,11 @@ class _HomePageState extends State<HomePage> {
     // the case where no event is coming. Somebody who opens the app to write to
     // a friend who is not nearby saw nobody at all.
     nearbyDevices().then((devices) {
-      if (!mounted) return;
+      // Dropped if an event got here first. This is a snapshot taken before the
+      // call was made, so applying it over a live update would move the list
+      // backwards — and on a device that finds a peer while the app is opening,
+      // that is exactly the order things happen in.
+      if (!mounted || _devicesAreLive) return;
       setState(() => _devices = devices);
     }).catchError((Object e) {
       if (mounted) setState(() => _log.insert(0, 'Error: $e'));
@@ -234,6 +247,7 @@ class _HomePageState extends State<HomePage> {
       switch (event) {
         case CoreEvent_DiscoveryUpdated(:final devices):
           _devices = devices;
+          _devicesAreLive = true;
         case CoreEvent_Pinged(:final name):
           _log.insert(0, 'Ping from $name');
         // The answer to one of ours. The button shows it too, via PingService;
