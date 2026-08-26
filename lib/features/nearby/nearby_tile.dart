@@ -14,16 +14,23 @@ class NearbyTile extends StatelessWidget {
     super.key,
     required this.device,
     required this.pingService,
-    required this.onChat,
+    required this.onOpen,
     required this.onDrop,
   });
 
   final NearbyDevice device;
   final PingService pingService;
 
-  /// Given the greeting to send, so the caller keeps the Core API and this
-  /// stays testable without it.
-  final void Function(String text) onChat;
+  /// Open the conversation with this person.
+  ///
+  /// The row itself is the way in — their name and their colour, which is what
+  /// somebody looks at when they mean "talk to them". It replaced a Chat button
+  /// that sent a fixed greeting, so the only thing you could say to a person on
+  /// this screen was `Hey <name>!` and saying it twice sent it twice.
+  ///
+  /// Kept as a callback rather than the Core API, so this stays testable
+  /// without the Rust bridge.
+  final VoidCallback onOpen;
   final VoidCallback onDrop;
 
   /// Whether we know who this is yet.
@@ -48,14 +55,19 @@ class NearbyTile extends StatelessWidget {
   /// What a paired friend who is not in range can still be told.
   ///
   /// R0-F5 says a message written out of range is kept and delivered at the
-  /// next encounter, so Chat stays live. Ping and Drop do not: a Ping is a
-  /// nudge someone answers now, and a Drop needs both phones present. Offering
-  /// them anyway would mean a tap that quietly does nothing.
+  /// next encounter, so the conversation stays open. Ping and Drop do not: a
+  /// Ping is a nudge someone answers now, and a Drop needs both phones
+  /// present. Offering them anyway would mean a tap that quietly does
+  /// nothing.
   static const awayHint = 'Ping and Drop need them nearby.';
 
   @override
   Widget build(BuildContext context) {
     return ListTile(
+      // The whole row bar the buttons: avatar, name and subtitle. Flutter gives
+      // the trailing controls their own hit targets, so Ping and Drop still do
+      // their own thing rather than opening a conversation by accident.
+      onTap: onOpen,
       leading: CircleAvatar(
         // Colour arrives with the persona. Until then it is 0, which renders as
         // flat black and looks like a rendering fault rather than an absence.
@@ -89,13 +101,6 @@ class NearbyTile extends StatelessWidget {
               // whose buttons are visibly unavailable says what changed.
               onPressed: null,
             ),
-          IconButton(
-            icon: const Icon(Icons.chat_bubble_outline),
-            tooltip: 'Chat',
-            // Without the guard this greets an unnamed peer as "Hey !", which
-            // is what actually arrived on the far phone during the LAN run.
-            onPressed: () => onChat(isKnown ? 'Hey ${device.name}!' : 'Hey!'),
-          ),
           IconButton(
             icon: const Icon(Icons.upload_file_outlined),
             tooltip: isHere ? 'Drop' : awayHint,

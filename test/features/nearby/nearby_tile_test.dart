@@ -35,21 +35,22 @@ NearbyDevice _away({required String name}) => NearbyDevice(
 );
 
 void main() {
-  Future<List<String>> pump(WidgetTester tester, NearbyDevice device) async {
-    final chats = <String>[];
+  /// Returns a counter of how many times the row asked to be opened.
+  Future<List<int>> pump(WidgetTester tester, NearbyDevice device) async {
+    final opened = <int>[];
     await tester.pumpWidget(
       MaterialApp(
         home: Scaffold(
           body: NearbyTile(
             device: device,
             pingService: _StubPingService(),
-            onChat: chats.add,
+            onOpen: () => opened.add(opened.length),
             onDrop: () {},
           ),
         ),
       ),
     );
-    return chats;
+    return opened;
   }
 
   // A device is listed before anyone knows who it is: the advertisement carries
@@ -85,19 +86,33 @@ void main() {
     expect(avatar.backgroundColor, isNot(const Color(0xFF000000)));
   });
 
-  // "Hey !" is what actually arrived on the far phone during the LAN run.
-  testWidgets('chatting to an unnamed device does not greet an empty name', (tester) async {
-    final chats = await pump(tester, _device(name: ''));
+  // Their name is the way in. It replaced a Chat button that could only send a
+  // fixed greeting — so the only thing you could say to somebody from this
+  // screen was "Hey <name>!", and tapping twice said it twice.
+  testWidgets('tapping a name opens the conversation', (tester) async {
+    final opened = await pump(tester, _device(name: 'Margo'));
 
-    await tester.tap(find.byTooltip('Chat'));
-    expect(chats, ['Hey!']);
+    await tester.tap(find.text('Margo'));
+    expect(opened, hasLength(1));
   });
 
-  testWidgets('chatting to a named device greets them by name', (tester) async {
-    final chats = await pump(tester, _device(name: 'Margo'));
+  // The avatar as much as the name: it is the more obvious target of the two on
+  // a row for somebody whose name has not arrived yet.
+  testWidgets('tapping the colour opens the conversation', (tester) async {
+    final opened = await pump(tester, _device(name: ''));
 
-    await tester.tap(find.byTooltip('Chat'));
-    expect(chats, ['Hey Margo!']);
+    await tester.tap(find.byType(CircleAvatar));
+    expect(opened, hasLength(1));
+  });
+
+  // Ping and Drop sit on the same row and mean different things. A row-wide tap
+  // target that swallowed them would turn a nudge into an opened conversation.
+  testWidgets('the buttons on the row are not the row', (tester) async {
+    final opened = await pump(tester, _device(name: 'Margo'));
+
+    await tester.tap(find.byTooltip('Drop'));
+    await tester.pump();
+    expect(opened, isEmpty, reason: 'Drop opened a conversation instead');
   });
 
   // R0-F2 rotates ids and R0-F4 makes pairing durable, so a paired friend is on
@@ -112,18 +127,22 @@ void main() {
     expect(find.text('nearby'), findsNothing);
   });
 
-  // Chat keeps working because R0-F5 says what happens to it: kept, and
-  // delivered when they next meet. Ping and Drop cannot be kept — a nudge
-  // answered tomorrow is not a nudge — so they are visibly unavailable rather
-  // than live buttons that quietly do nothing.
+  // The conversation keeps opening because R0-F5 says what happens to what is
+  // written there: kept, and delivered when they next meet. Ping and Drop
+  // cannot be kept — a nudge answered tomorrow is not a nudge — so they are
+  // visibly unavailable rather than live buttons that quietly do nothing.
   testWidgets('an away friend can be written to but not pinged or dropped', (
     tester,
   ) async {
-    final chats = await pump(tester, _away(name: 'Wren'));
+    final opened = await pump(tester, _away(name: 'Wren'));
 
-    await tester.tap(find.byTooltip('Chat'));
+    await tester.tap(find.text('Wren'));
     await tester.pump();
-    expect(chats, ['Hey Wren!'], reason: 'writing to an away friend was lost');
+    expect(
+      opened,
+      hasLength(1),
+      reason: 'an away friend could not be written to',
+    );
 
     // Both Ping and Drop, found by the reason they carry rather than by
     // position, so a reordered row still tests the right two buttons.
