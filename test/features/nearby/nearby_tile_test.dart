@@ -174,6 +174,11 @@ void main() {
     }
 
     findOwner(tester.binding.rootPipelineOwner);
+    expect(
+      root,
+      isNotNull,
+      reason: 'no semantics tree was built, so this test proves nothing',
+    );
     walk(root!);
     expect(
       tappable,
