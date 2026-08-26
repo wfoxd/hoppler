@@ -37,10 +37,11 @@ use crate::api::types::{
     ChatMessageDto, CoreEvent, NearbyDevice, PersonaDto, SasColourDto, ThreadSummary,
 };
 use crate::crypto::rng;
+use crate::discovery::{hint, Sighting};
 use crate::frb_generated::StreamSink;
 use crate::identity::filekeystore::FileKeystore;
 use crate::identity::keystore::Keystore;
-use crate::identity::{Identity, Persona, VerifiedPersona};
+use crate::identity::{Identity, Persona};
 use crate::identity::{COLOUR_MASK, MAX_PERSONA_NAME_LEN};
 use crate::pairing::invite::Invite;
 use zeroize::Zeroizing;
@@ -49,7 +50,7 @@ use crate::session::chat::{ChatEnvelope, Delivery, Inbox, Outbox, MAX_UNACKED, M
 use crate::session::ratchet::{self, Ratchet};
 use crate::store::{
     Direction, InboxPosition, InsertOutcome, MessageState, NewContact, NewMessage, NewTransfer,
-    Store, StoreError, TransferState,
+    Pairing, Store, StoreError, TransferState,
 };
 
 struct Core {
@@ -459,10 +460,11 @@ pub fn nearby_devices() -> Result<Vec<NearbyDevice>, String> {
         _ => Vec::new(),
     };
     with_core(|core| {
+        let known = Recogniser::read(core)?;
         let mut rows = Vec::new();
         let mut in_front_of_us = Vec::new();
         for s in sightings {
-            let contact = contact_for_sighting(core, &s.peer, s.persona.as_ref())?;
+            let contact = contact_for_sighting(core, &s, &known)?;
             if let Some(id) = contact {
                 in_front_of_us.push(id);
             }
@@ -1851,8 +1853,9 @@ fn device_for_thread(core: &Core, thread: i64) -> Result<Option<String>, StoreEr
     if !net.discovery().is_on() {
         return Ok(None);
     }
+    let known = Recogniser::read(core)?;
     for s in net.discovery().sightings() {
-        if let Some(contact) = contact_for_sighting(core, &s.peer, s.persona.as_ref())? {
+        if let Some(contact) = contact_for_sighting(core, &s, &known)? {
             if core.store.thread_for_contact(contact)? == Some(thread) {
                 return Ok(Some(s.peer));
             }
@@ -2080,26 +2083,72 @@ fn open_for_thread(core: &Core, thread: i64, body: &[u8]) -> Result<Incoming, St
 
 /// Which contact a sighting belongs to, if we have one on file.
 ///
-/// Two routes, in this order. A session pseudonym is proved, so it wins; the
-/// persona a sighting carries is only claimed, and is consulted when no session
-/// has answered — which is the ordinary case for someone who has just appeared.
+/// Three routes, in this order, weakest claim last. A session pseudonym is
+/// proved, so it wins. The persona a sighting carries is only claimed, and is
+/// consulted when no session has answered. The advert hint is last because it
+/// is the only one that arrives without anybody having connected at all — and
+/// last is not the same as weak: forging one means guessing eight bytes keyed
+/// on a Layer-1 key you would have had to attend a ceremony to learn.
+///
+/// The hint route is what stops a paired friend appearing twice. Before it,
+/// somebody merely advertising offered no route at all — R0-F2 rotates their
+/// id every twelve minutes precisely so an advert cannot be attributed — so the
+/// list drew them once as an unknown device and again, from disk, as a contact
+/// who is away. Both rows were the same phone on the same desk.
+///
 /// Creates nothing: a stranger stays a stranger, and drawing the nearby list is
 /// not the moment to start writing rows.
+/// `known` is read once for a whole list and handed down — see [`Recogniser`].
 fn contact_for_sighting(
     core: &Core,
-    device_id: &str,
-    persona: Option<&VerifiedPersona>,
+    sighting: &Sighting,
+    known: &Recogniser,
 ) -> Result<Option<i64>, StoreError> {
-    if let Some(id) = contact_id_for_device(core, device_id)? {
+    if let Some(id) = contact_id_for_device(core, &sighting.peer)? {
         return Ok(Some(id));
     }
-    let Some(persona) = persona else {
-        return Ok(None);
-    };
-    Ok(core
-        .store
-        .paired_contact_by_l2(&persona.l2_pub.0)?
-        .map(|c| c.id))
+    if let Some(persona) = sighting.persona.as_ref() {
+        if let Some(c) = core.store.paired_contact_by_l2(&persona.l2_pub.0)? {
+            return Ok(Some(c.id));
+        }
+    }
+    Ok(known.whose(&sighting.peer, sighting.hint.as_ref()))
+}
+
+/// The Layer-1 keys an advert hint can be tried against, and the moment the
+/// whole list is being drawn at.
+///
+/// Built once per list and reused for every row, for two reasons that pull the
+/// same way. A hint is not a lookup key — every pairing has to be tried, since
+/// only somebody holding the key can recognise what it generated, which is the
+/// property that makes the hint safe to broadcast at all — so doing it per
+/// sighting reads the whole table once per device in range. And the epoch is a
+/// division of *now*: a list built across a twelve-minute boundary would judge
+/// its first rows against one epoch and its last against another, so a friend
+/// could be recognised in one row of a redraw and not the next.
+///
+/// One read, one clock, one answer for the whole screen.
+struct Recogniser {
+    pairings: Vec<Pairing>,
+    now_ms: i64,
+}
+
+impl Recogniser {
+    fn read(core: &Core) -> Result<Self, StoreError> {
+        Ok(Self {
+            pairings: core.store.pairings()?,
+            now_ms: now_millis(),
+        })
+    }
+
+    /// The paired contact whose Layer-1 key generated this hint, if one did.
+    fn whose(&self, device_id: &str, hint: Option<&[u8; hint::HINT_LEN]>) -> Option<i64> {
+        let hint = hint?;
+        self.pairings
+            .iter()
+            .find(|p| hint::written_by(&p.l1_pub, device_id, hint, self.now_ms))
+            .map(|p| p.contact_id)
+    }
 }
 
 /// The peer's durable identity, if a session has authenticated one.

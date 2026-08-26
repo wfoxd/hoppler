@@ -17,7 +17,7 @@ mod schema;
 
 pub use records::{
     BlockEntry, Contact, Direction, InboxPosition, InsertOutcome, Message, MessageState,
-    NewContact, NewMessage, NewTransfer, Transfer, TransferState,
+    NewContact, NewMessage, NewTransfer, Pairing, Transfer, TransferState,
 };
 
 use std::path::{Path, PathBuf};
