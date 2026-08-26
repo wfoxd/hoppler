@@ -1871,12 +1871,23 @@ fn device_for_thread(core: &Core, thread: i64) -> Result<Option<String>, StoreEr
     if !net.discovery().is_on() {
         return Ok(None);
     }
+    // Whose conversation this is, asked once.
+    //
+    // This used to compare each sighting's contact against `thread_for_contact`
+    // — the contact's *newest* thread — which since T12 is one of several a
+    // person may have. The two spellings agree today, because `superseded`
+    // refuses a write to any older thread and `nearby_devices` only ever offers
+    // the newest, so no caller can reach the difference and the mutation
+    // between them survives. Kept as the owner question anyway: it is one store
+    // read instead of one per sighting, and it does not quietly depend on an
+    // invariant enforced two modules away.
+    let Some(owner) = core.store.contact_for_thread(thread)? else {
+        return Ok(None);
+    };
     let known = Recogniser::read(core)?;
     for s in net.discovery().sightings() {
-        if let Some(contact) = contact_for_sighting(core, &s, &known)? {
-            if core.store.thread_for_contact(contact)? == Some(thread) {
-                return Ok(Some(s.peer));
-            }
+        if contact_for_sighting(core, &s, &known)? == Some(owner) {
+            return Ok(Some(s.peer));
         }
     }
     Ok(None)
@@ -2122,7 +2133,10 @@ fn contact_for_sighting(
     sighting: &Sighting,
     known: &Recogniser,
 ) -> Result<Option<i64>, StoreError> {
-    if let Some(id) = contact_id_for_device(core, &sighting.peer)? {
+    if let Some(id) = proved_contact(core, &sighting.peer)? {
+        return Ok(Some(id));
+    }
+    if let Some(id) = known.whose(&sighting.peer, sighting.hint.as_ref()) {
         return Ok(Some(id));
     }
     if let Some(persona) = sighting.persona.as_ref() {
@@ -2130,7 +2144,7 @@ fn contact_for_sighting(
             return Ok(Some(c.id));
         }
     }
-    Ok(known.whose(&sighting.peer, sighting.hint.as_ref()))
+    contact_by_device_id(core, &sighting.peer)
 }
 
 /// The Layer-1 keys an advert hint can be tried against, and the moment the
@@ -2185,15 +2199,54 @@ fn pseudonym_of(core: &Core, device_id: &str) -> Option<[u8; 32]> {
 /// that had already moved onto its session key, and report no conversation for
 /// someone the user has been talking to all afternoon.
 fn contact_id_for_device(core: &Core, device_id: &str) -> Result<Option<i64>, StoreError> {
-    if let Some(real) = pseudonym_of(core, device_id) {
-        if let Some(c) = core.store.contact_by_pseudonym(&real)? {
-            return Ok(Some(c.id));
+    if let Some(id) = proved_contact(core, device_id)? {
+        return Ok(Some(id));
+    }
+    // The same advert hint the nearby list resolves by. Without it this
+    // function and `contact_for_sighting` disagreed about who a device is: the
+    // list called them Ada while every *send* to that id fell through to the
+    // placeholder below, minted a stranger named "Unknown", and started a
+    // second conversation. Worse, the stranger then held the placeholder key,
+    // so it won this lookup ever after and displaced the paired friend for
+    // good — one tap on a screen that had correctly recognised her.
+    if let Some(hint) = hint_on_air(core, device_id) {
+        let known = Recogniser::read(core)?;
+        if let Some(id) = known.whose(device_id, Some(&hint)) {
+            return Ok(Some(id));
         }
     }
+    contact_by_device_id(core, device_id)
+}
+
+/// A contact keyed on an identity the peer has actually proved.
+fn proved_contact(core: &Core, device_id: &str) -> Result<Option<i64>, StoreError> {
+    let Some(real) = pseudonym_of(core, device_id) else {
+        return Ok(None);
+    };
+    Ok(core.store.contact_by_pseudonym(&real)?.map(|c| c.id))
+}
+
+/// A contact remembered under this rotating id, and nothing stronger.
+///
+/// Tried last of all the routes. A device id is the weakest claim there is —
+/// it rotates every twelve minutes and anybody may present one — so a row
+/// found this way must not outrank a friend recognised by a key.
+fn contact_by_device_id(core: &Core, device_id: &str) -> Result<Option<i64>, StoreError> {
     Ok(core
         .store
         .contact_by_pseudonym(&fake::placeholder_pseudonym(device_id))?
         .map(|c| c.id))
+}
+
+/// The advert hint this device is currently carrying, if we can see it.
+fn hint_on_air(core: &Core, device_id: &str) -> Option<[u8; hint::HINT_LEN]> {
+    core.net
+        .as_ref()?
+        .discovery()
+        .sightings()
+        .into_iter()
+        .find(|s| s.peer == device_id)
+        .and_then(|s| s.hint)
 }
 
 /// The contact this device belongs to, created, adopted or merged as needed.

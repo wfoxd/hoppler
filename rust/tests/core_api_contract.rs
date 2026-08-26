@@ -2493,3 +2493,162 @@ fn a_stranger_advertising_noise_is_still_a_stranger() {
         "a stranger's advert opened somebody's conversation"
     );
 }
+
+/// Writing to a paired friend must not mint a stranger (T09a follow-up).
+///
+/// Found on two phones. The nearby list had recognised Ada from her advert and
+/// drawn her by name — and tapping Chat on that very row started a second
+/// conversation with "Unknown". The list resolved her by hint;
+/// `contact_id_for_device`, which every send and receive goes through, knew
+/// only the proved pseudonym and the rotating device id, so it fell through and
+/// created a stranger.
+///
+/// The lasting part is worse than the duplicate. The new row holds the
+/// placeholder key for that device id, so it wins the lookup from then on and
+/// the paired friend is displaced for as long as the id lives — one tap on a
+/// screen that had correctly recognised her.
+#[test]
+fn writing_to_a_friend_recognised_by_her_advert_uses_her_thread() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = fresh();
+    let peer = full_peer(&h.air, "peer", "Ada");
+    meet_and_pair(&peer);
+
+    // Walk out of range and come back under a fresh id, so the only thing that
+    // can identify her is the advert.
+    peer.transport.disconnect("core").unwrap();
+    peer.net.discovery().rotate(Instant::now()).unwrap();
+    let now_called = peer.net.discovery().local_id();
+    until("the engine to see her new advertisement", || {
+        pump(&peer);
+        nearby_devices()
+            .unwrap()
+            .iter()
+            .any(|d| d.device_id.as_deref() == Some(now_called.as_str()))
+    });
+
+    let threads_before = list_threads().unwrap().len();
+    send_chat(now_called.clone(), "hello again".into()).unwrap();
+
+    assert_eq!(
+        list_threads().unwrap().len(),
+        threads_before,
+        "writing to a recognised friend opened a second conversation: {:?}",
+        list_threads()
+            .unwrap()
+            .iter()
+            .map(|t| t.name.clone())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !list_threads().unwrap().iter().any(|t| t.name == "Unknown"),
+        "a paired friend was written to as a stranger"
+    );
+}
+
+/// A message written into a paired conversation goes when she is standing
+/// there, even if the only thing identifying her is her advert.
+///
+/// This is what the phone actually did: `holding a message on thread 1 until we
+/// meet again`, logged while Ada was on screen, named, with Discovery open.
+/// Nothing was wrong with the thread — the sighting had resolved to a stranger
+/// row minted earlier by the same gap, so no visible device belonged to the
+/// thread's owner and the send had nowhere to go.
+///
+/// `device_for_thread` now asks who owns the thread and looks for *them*. It
+/// used to compare against `thread_for_contact`, the contact's newest thread,
+/// which is a second one-to-one assumption of the kind T12 already broke once.
+#[test]
+fn a_paired_conversation_reaches_a_friend_known_only_by_her_advert() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = fresh();
+    let peer = full_peer(&h.air, "peer", "Ada");
+    let device_id = meet_and_pair(&peer);
+    let thread = thread_for_device(device_id).unwrap().unwrap();
+
+    // Out of range, back under a fresh id: no session, no known device id, and
+    // the advert hint is the only route left.
+    peer.transport.disconnect("core").unwrap();
+    peer.net.discovery().rotate(Instant::now()).unwrap();
+    let now_called = peer.net.discovery().local_id();
+    until("the engine to see her new advertisement", || {
+        pump(&peer);
+        nearby_devices()
+            .unwrap()
+            .iter()
+            .any(|d| d.device_id.as_deref() == Some(now_called.as_str()))
+    });
+
+    // The property the fix is about: her conversation is addressable at the id
+    // she is advertising under now. Delivery beyond this point is the reunion
+    // flush, which has its own tests and its own timing — what broke on the
+    // phone was earlier than that, and was that nothing on screen belonged to
+    // the thread's owner at all.
+    let row = nearby_devices()
+        .unwrap()
+        .into_iter()
+        .find(|d| d.device_id.as_deref() == Some(now_called.as_str()))
+        .expect("she is not on the list");
+    assert_eq!(row.name, "Ada", "her row lost her name after a rotation");
+    assert!(row.paired, "her row lost its paired badge after a rotation");
+    assert_eq!(
+        row.thread_id,
+        Some(thread),
+        "her row points at a different conversation than the one she is paired on"
+    );
+    assert_eq!(
+        with_device_for_thread(thread),
+        Some(now_called),
+        "the paired conversation could not find her, so a message would wait \
+         for a meeting already happening"
+    );
+}
+
+/// `device_for_thread` through the public surface: which device a thread would
+/// be sent to right now.
+fn with_device_for_thread(thread: i64) -> Option<String> {
+    nearby_devices()
+        .unwrap()
+        .into_iter()
+        .find(|d| d.thread_id == Some(thread))
+        .and_then(|d| d.device_id)
+}
+
+/// A stranger you have written to is still recognised by the id you wrote to.
+///
+/// The weakest of the four routes, and the last one tried — a device id rotates
+/// and anybody may present one — but it is what keeps an unpaired conversation
+/// attached to the person in front of you between rotations. Demoting it below
+/// the advert hint (so a paired friend outranks a stray row minted under her
+/// old id) must not delete it.
+#[test]
+fn a_stranger_written_to_is_still_recognised_by_that_id() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = fresh();
+    let (_peer, _rx) = advertising_peer(&h.air, "a-stranger");
+    set_discovery(true).unwrap();
+    until("the stranger to appear", || {
+        nearby_devices()
+            .unwrap()
+            .iter()
+            .any(|d| d.device_id.as_deref() == Some("a-stranger"))
+    });
+
+    // Writing to them creates the contact and the conversation.
+    send_chat("a-stranger".into(), "hello?".into()).unwrap();
+    let thread = thread_for_device("a-stranger".into()).unwrap().unwrap();
+
+    // And the row for that id now carries it, so the next line goes to the same
+    // conversation rather than opening another.
+    let row = nearby_devices()
+        .unwrap()
+        .into_iter()
+        .find(|d| d.device_id.as_deref() == Some("a-stranger"))
+        .expect("the stranger left the list after being written to");
+    assert_eq!(
+        row.thread_id,
+        Some(thread),
+        "a stranger's own conversation was not attached to their row"
+    );
+    assert!(!row.paired, "an unpaired stranger read as paired");
+}
