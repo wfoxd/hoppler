@@ -73,6 +73,34 @@ pub struct ChatMessageDto {
     pub text: String,
     pub outgoing: bool,
     pub created_at: i64,
+    /// How far this one has got, for outgoing messages.
+    ///
+    /// Carried because the difference is real and was invisible: until the
+    /// acknowledgement existed, `Sent` was terminal, so a message the other
+    /// person is reading looked exactly like one they refused — and one they
+    /// refused is a thing that happened, silently, on two phones.
+    ///
+    /// Meaningless on an incoming message, which is stored `Delivered` the
+    /// moment it is written, so the screen reads this on its own lines only.
+    pub state: MessageStateDto,
+}
+
+/// What a message's row is entitled to claim.
+///
+/// Deliberately three states rather than a `delivered: bool`. A flag collapses
+/// "we have not sent it yet" and "we sent it and heard nothing" into one
+/// negative, and those are the two the person on the other end of a queued
+/// backlog most needs told apart.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MessageStateDto {
+    /// Written, and still on this device. Nothing has left.
+    Queued,
+    /// The bytes left. Nobody has confirmed anything, and on an unpaired
+    /// thread nobody ever will — there is no ratchet to seal an
+    /// acknowledgement with, so this is as far as those rows go.
+    Sent,
+    /// The far side said it has it, sealed on a chain only they hold.
+    Delivered,
 }
 
 /// An event pushed from the core to Dart over the single event stream. Variants
