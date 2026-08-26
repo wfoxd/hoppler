@@ -502,13 +502,30 @@ impl Discovery {
                     // is the one part that legitimately moves under a settled
                     // id — it turns with the epoch, and it appears for the
                     // first time when a peer that was advertising nothing
-                    // starts carrying one. Both change who the row is, so both
-                    // are news; anything else is not.
-                    Some(existing) => {
-                        let news = existing.hint != seen;
-                        existing.hint = seen;
-                        news
-                    }
+                    // starts carrying one. Both change who the row is.
+                    //
+                    // An advertisement carrying *no* hint does not take away
+                    // one we already have. Our own rotation produces exactly
+                    // that event — [`Self::rotate`] goes quiet under the old id
+                    // before renaming itself — so a sighting that forgot on
+                    // sight of it would lose the peer the instant it rotated,
+                    // and keep losing it for as long as the rung remembered the
+                    // old service. On mDNS that is not prompt, so the peer
+                    // stays unresolvable and the duplicate row T09a exists to
+                    // prevent comes back, minutes after it was working.
+                    //
+                    // Keeping it is also the more honest reading: a hint
+                    // identifies its peer for its epoch window whether or not
+                    // the next advertisement repeats it, and nobody who cannot
+                    // compute one can put one there.
+                    Some(existing) => match seen {
+                        Some(fresh) => {
+                            let news = existing.hint != Some(fresh);
+                            existing.hint = Some(fresh);
+                            news
+                        }
+                        None => false,
+                    },
                     None => {
                         sightings.insert(
                             peer.clone(),

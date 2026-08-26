@@ -814,7 +814,79 @@ fn only_a_hint_that_actually_moved_counts_as_news() {
         "the same hint again does not"
     );
     assert!(
-        watcher.discovery.on_event(bare, now),
-        "and losing it changes it back"
+        !watcher.discovery.on_event(bare, now),
+        "an advertisement carrying no hint takes nothing away, so it is not news"
     );
+}
+
+/// A hint already learned survives an advertisement that carries none.
+///
+/// Our own rotation produces exactly that event. `rotate` goes quiet before it
+/// renames itself — an empty payload under the *old* id — so every peer
+/// watching sees that id lose its hint. If the sighting takes that literally,
+/// the peer becomes unresolvable the moment it rotates, and stays that way for
+/// as long as the rung keeps the old service around: on mDNS a withdrawal is
+/// not prompt, so "for as long as" can be minutes. What the user sees is the
+/// duplicate row T09a exists to prevent, back again, some time after it
+/// worked.
+///
+/// Keeping the last hint is also the more honest reading. A hint identifies its
+/// peer for its epoch window whether or not the next advertisement repeats it,
+/// and nobody who cannot compute it can put one there — so there is nothing to
+/// be gained by forgetting one we have already been given.
+#[test]
+fn a_hint_survives_an_advertisement_that_carries_none() {
+    let net = LoopbackNet::new();
+    let now = Instant::now();
+    let watcher = node(&net, "watcher", now);
+
+    let carrying = TransportEvent::PeerFound {
+        peer: "friend".into(),
+        payload: vec![7u8; 8],
+    };
+    let gone_quiet = TransportEvent::PeerFound {
+        peer: "friend".into(),
+        payload: Vec::new(),
+    };
+
+    watcher.discovery.on_event(carrying, now);
+    watcher.discovery.on_event(gone_quiet, now);
+
+    let seen = watcher
+        .discovery
+        .sightings()
+        .into_iter()
+        .find(|s| s.peer == "friend")
+        .expect("the friend should still be sighted");
+    assert_eq!(
+        seen.hint,
+        Some([7u8; 8]),
+        "going quiet before a rotation made a paired friend unrecognisable"
+    );
+}
+
+/// A *different* hint still replaces the old one — the epoch turns, and the
+/// sighting has to follow. Only the empty case is remembered.
+#[test]
+fn a_new_hint_still_replaces_the_one_before_it() {
+    let net = LoopbackNet::new();
+    let now = Instant::now();
+    let watcher = node(&net, "watcher", now);
+
+    for payload in [vec![1u8; 8], vec![2u8; 8]] {
+        watcher.discovery.on_event(
+            TransportEvent::PeerFound {
+                peer: "friend".into(),
+                payload,
+            },
+            now,
+        );
+    }
+    let seen = watcher
+        .discovery
+        .sightings()
+        .into_iter()
+        .find(|s| s.peer == "friend")
+        .unwrap();
+    assert_eq!(seen.hint, Some([2u8; 8]));
 }
