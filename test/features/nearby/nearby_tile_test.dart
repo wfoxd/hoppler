@@ -1,5 +1,7 @@
 import 'dart:async';
 
+import 'package:flutter/rendering.dart';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hoppler/features/nearby/nearby_tile.dart';
@@ -137,6 +139,48 @@ void main() {
       isEmpty,
       reason: 'a tap on an unavailable button opened a conversation',
     );
+  });
+
+  // Swallowing the tap must not turn a disabled control into one a screen
+  // reader offers to activate. The wrapper exists only to stop the row hearing
+  // the tap; announcing it as tappable would promise an action that does
+  // nothing, which is worse than what the button says by itself.
+  testWidgets('an unavailable button is not announced as tappable', (
+    tester,
+  ) async {
+    await pump(tester, _away(name: 'Wren'));
+
+    final handle = tester.ensureSemantics();
+
+    // Counted over the whole tree rather than asked of one widget. The
+    // swallowing wrapper sits *above* the button, so a check aimed at the
+    // button reads a node the wrapper is not on and passes either way — which
+    // is exactly what the first version of this test did.
+    var tappable = 0;
+    void walk(SemanticsNode node) {
+      if (node.getSemanticsData().hasAction(SemanticsAction.tap)) tappable++;
+      node.visitChildren((child) {
+        walk(child);
+        return true;
+      });
+    }
+
+    // The semantics owner hangs off a *child* of the root pipeline owner, and
+    // the direct getter for it is deprecated.
+    SemanticsNode? root;
+    void findOwner(PipelineOwner owner) {
+      root ??= owner.semanticsOwner?.rootSemanticsNode;
+      owner.visitChildren(findOwner);
+    }
+
+    findOwner(tester.binding.rootPipelineOwner);
+    walk(root!);
+    expect(
+      tappable,
+      1,
+      reason: 'an away row should offer exactly one tap — the row itself',
+    );
+    handle.dispose();
   });
 
   // R0-F2 rotates ids and R0-F4 makes pairing durable, so a paired friend is on

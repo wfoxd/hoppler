@@ -73,8 +73,15 @@ class NearbyTile extends StatelessWidget {
   /// A `GestureDetector` rather than an `AbsorbPointer`, so the long press that
   /// shows the tooltip still gets through. Taps compete in the gesture arena
   /// and the deepest recogniser wins, which is this one.
+  ///
+  /// `excludeFromSemantics` because the handler exists only to swallow. Without
+  /// it the wrapper advertises a tap action, so a screen reader offers to
+  /// activate a control the same tree describes as disabled — and activating it
+  /// does nothing, which is a worse answer than the button gives on its own.
+  /// What is silenced is this wrapper, not the button: the `IconButton` keeps
+  /// its own semantics, including that it is unavailable.
   static Widget _unavailable(Widget button) =>
-      GestureDetector(onTap: () {}, child: button);
+      GestureDetector(onTap: () {}, excludeFromSemantics: true, child: button);
 
   @override
   Widget build(BuildContext context) {
