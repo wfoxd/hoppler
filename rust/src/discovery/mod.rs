@@ -27,6 +27,7 @@
 //! "unavailable" frame, an error code, a different close — would break it
 //! silently, which is why `respond` funnels rather than matches.
 
+pub mod hint;
 pub mod protocol;
 
 use std::collections::HashMap;
@@ -36,6 +37,7 @@ use std::time::{Duration, Instant};
 
 use crate::identity::{self, Identity};
 use crate::transport::{PeerId, Transport, TransportError, TransportEvent};
+use hint::HINT_LEN;
 use protocol::{ProtocolError, Request, Response, PSEUDONYM_LEN};
 
 /// How often the advertised id rotates (tech spec §4: 10–15 min, aligned with
@@ -57,6 +59,12 @@ pub struct Sighting {
     pub peer: PeerId,
     /// Their persona, once fetched and signature-checked. `None` until then.
     pub persona: Option<identity::VerifiedPersona>,
+    /// The advert hint they are carrying, if the payload held one (T09a).
+    ///
+    /// Meaningless on its own — resolving it to a person needs the Layer-1 key
+    /// of somebody we have paired with, which lives in the store, not here.
+    /// Discovery carries the bytes and forms no opinion about them.
+    pub hint: Option<[u8; HINT_LEN]>,
 }
 
 /// Who a requester turned out to be, for the caller's rate limiting and
@@ -127,6 +135,21 @@ struct Inner {
     blocked: Mutex<Vec<[u8; PSEUDONYM_LEN]>>,
     buckets: Mutex<Buckets>,
     last_rotation: Mutex<Instant>,
+    /// The payload currently on the air, so [`Discovery::publish`] can tell a
+    /// re-advertisement that would change nothing from one that would. `None`
+    /// means nothing of ours is being advertised at all, which is not the same
+    /// as advertising an empty payload — the first has to reach the radio even
+    /// if the bytes match.
+    on_the_air: Mutex<Option<Vec<u8>>>,
+    /// Wall clock, in milliseconds since the Unix epoch.
+    ///
+    /// Injected rather than read from `SystemTime` at the point of use, and
+    /// separate from the `Instant`s already threaded through here, because the
+    /// two answer different questions. An `Instant` measures how long since we
+    /// last rotated, which only this device needs to agree with itself about.
+    /// The hint's epoch has to be a number *both* devices compute, so it can
+    /// only come from a clock they share.
+    clock: Box<dyn Fn() -> i64 + Send + Sync>,
 }
 
 /// The discovery engine.
@@ -144,6 +167,21 @@ impl Discovery {
         identity: Arc<Mutex<Identity>>,
         now: Instant,
     ) -> Self {
+        Self::with_clock(transport, identity, now, Box::new(system_millis))
+    }
+
+    /// As [`Self::new`], with the wall clock supplied.
+    ///
+    /// The hint's epoch is a division of real time, so testing what happens on
+    /// either side of a boundary means being able to stand on one. The system
+    /// clock cannot be asked to do that, and waiting twelve minutes for it is
+    /// not a test.
+    pub fn with_clock(
+        transport: Arc<dyn Transport>,
+        identity: Arc<Mutex<Identity>>,
+        now: Instant,
+        clock: Box<dyn Fn() -> i64 + Send + Sync>,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 transport,
@@ -158,6 +196,8 @@ impl Discovery {
                     hits: HashMap::new(),
                 }),
                 last_rotation: Mutex::new(now),
+                on_the_air: Mutex::new(None),
+                clock,
             }),
         }
     }
@@ -217,6 +257,13 @@ impl Discovery {
             // radio call returns, not after it.
             self.inner.on.store(false, Ordering::SeqCst);
             self.inner.transport.stop_advertising()?;
+            // Nothing of ours is on the air, so the next `publish` must reach
+            // the radio however little the hint has changed meanwhile.
+            *self
+                .inner
+                .on_the_air
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = None;
         }
         Ok(())
     }
@@ -291,9 +338,15 @@ impl Discovery {
             now.saturating_duration_since(*last) >= ROTATION_PERIOD
         };
         if due {
-            self.rotate(now)?;
+            return self.rotate(now);
         }
-        Ok(())
+        // The epoch grid is shared and our rotation timer is not, so the two
+        // drift apart and a hint can fall due long before an id does. Left to
+        // the rotation alone, a device holding an open pipe — which refuses to
+        // rotate — would keep advertising a hint from epochs ago, and its
+        // friends would stop recognising it. `publish` is a no-op unless the
+        // bytes have actually moved.
+        self.publish()
     }
 
     /// Rotate now. A rotation while a pipe is open is refused by the rung
@@ -301,6 +354,8 @@ impl Discovery {
     /// device is mid-conversation, and the next tick will try again.
     pub fn rotate(&self, now: Instant) -> Result<(), TransportError> {
         let fresh = ephemeral_id();
+        // Before the id moves, not after: see `go_quiet`.
+        self.go_quiet()?;
         match self.inner.transport.set_local_id(&fresh) {
             Ok(()) => {
                 *self
@@ -315,17 +370,88 @@ impl Discovery {
                     .unwrap_or_else(|e| e.into_inner()) = now;
                 self.publish()
             }
-            Err(TransportError::Unavailable(_)) => Ok(()),
+            // Refused because a pipe is open. We have already gone quiet, so
+            // put the old hint back rather than leaving the advert bare until
+            // some later rotation succeeds — it is the same hint under the same
+            // id it was already advertising, and links nothing new.
+            Err(TransportError::Unavailable(_)) => self.publish(),
             Err(e) => Err(e),
         }
     }
 
-    /// Advertise. The payload is empty: the persona is disclosed through the
-    /// endpoint, to a requester that has identified itself first. Putting it in
-    /// the advertisement would hand it to every scanner in range and make the
-    /// requester-first ordering decorative.
+    /// Advertise the hint for right now, if it is not already on the air.
+    ///
+    /// The payload is the hint and nothing else. The persona stays behind the
+    /// endpoint, disclosed to a requester that has identified itself first;
+    /// putting it here would hand it to every scanner in range and make that
+    /// ordering decorative. The hint is the opposite kind of thing — it names
+    /// nobody, and only somebody who has already paired with us can tell it
+    /// from noise.
+    ///
+    /// Returns early when the bytes have not moved. The radio call is not free
+    /// and this runs on every tick; the hint only changes when the epoch turns
+    /// or our id does.
     fn publish(&self) -> Result<(), TransportError> {
-        self.inner.transport.start_advertising(Vec::new())
+        let want = self.payload_now();
+        let mut air = self
+            .inner
+            .on_the_air
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if air.as_deref() == Some(want.as_slice()) {
+            return Ok(());
+        }
+        self.inner.transport.start_advertising(want.clone())?;
+        *air = Some(want);
+        Ok(())
+    }
+
+    /// The payload we should be advertising at this moment.
+    ///
+    /// Empty when we do not know what id we are advertising under. The hint is
+    /// bound to that id, so one computed over the wrong string is not a weaker
+    /// hint — it is eight bytes no friend can match and no stranger can read,
+    /// with nothing on any screen to say so. Advertising nothing is the honest
+    /// version of the same state, and is what this did before T09a.
+    ///
+    /// Reachable only by constructing a `Discovery` and advertising without
+    /// telling it its id; `Net::new` seeds it for exactly this reason. Hence
+    /// the assertion — a caller that gets this wrong should find out during
+    /// its own tests, not from a friend who stopped being recognised.
+    fn payload_now(&self) -> Vec<u8> {
+        let id = self.local_id();
+        debug_assert!(
+            !id.is_empty(),
+            "advertising before the local id was seeded: the hint has nothing to bind to"
+        );
+        if id.is_empty() {
+            log::warn!("advertising without a local id, so no hint goes out");
+            return Vec::new();
+        }
+        let l1 = self
+            .inner
+            .identity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .layer1_public();
+        hint::hint_for(&l1.0, &id, hint::epoch_at((self.inner.clock)())).to_vec()
+    }
+
+    /// Advertise nothing, without saying we have stopped being discoverable.
+    ///
+    /// Used for the moment in [`Self::rotate`] between one id and the next. The
+    /// rung re-advertises the payload it was last given when the id changes, so
+    /// without this the new id would go out carrying the *old* hint — the same
+    /// eight bytes under two ids, which is the link a rotation exists to break,
+    /// readable by any scanner without a key or a pairing.
+    fn go_quiet(&self) -> Result<(), TransportError> {
+        self.inner.transport.start_advertising(Vec::new())?;
+        *self
+            .inner
+            .on_the_air
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Vec::new());
+        Ok(())
     }
 
     /// Feed a transport event in. Returns whether the nearby list actually
@@ -340,7 +466,7 @@ impl Discovery {
     /// screen, for a list that was identical each time.
     pub fn on_event(&self, event: TransportEvent, now: Instant) -> bool {
         match event {
-            TransportEvent::PeerFound { peer, .. } => {
+            TransportEvent::PeerFound { peer, payload } => {
                 // Recorded on *every* sighting, including the re-resolves that
                 // change nothing: the question this answers is "when did the
                 // rung last confirm it", which a repeat does confirm.
@@ -369,16 +495,32 @@ impl Discovery {
                     .sightings
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                let fresh = !sightings.contains_key(&peer);
-                sightings.entry(peer.clone()).or_insert(Sighting {
-                    peer,
-                    persona: known,
-                });
-                // A re-resolve of a peer already listed changes nothing. The
-                // payload is deliberately not compared: `PeerFound` carries the
-                // advertisement, and this branch has never stored it — the
-                // persona comes through the endpoint instead.
-                fresh
+                let seen = hint::read(&payload);
+                match sightings.get_mut(&peer) {
+                    // A re-resolve of a peer already listed usually changes
+                    // nothing, and the mDNS ones arrive by the dozen. The hint
+                    // is the one part that legitimately moves under a settled
+                    // id — it turns with the epoch, and it appears for the
+                    // first time when a peer that was advertising nothing
+                    // starts carrying one. Both change who the row is, so both
+                    // are news; anything else is not.
+                    Some(existing) => {
+                        let news = existing.hint != seen;
+                        existing.hint = seen;
+                        news
+                    }
+                    None => {
+                        sightings.insert(
+                            peer.clone(),
+                            Sighting {
+                                peer,
+                                persona: known,
+                                hint: seen,
+                            },
+                        );
+                        true
+                    }
+                }
             }
             TransportEvent::PeerLost { peer } => {
                 self.inner
@@ -555,4 +697,18 @@ fn ephemeral_id() -> String {
         out.push(char::from_digit((b & 0x0f) as u32, 16).unwrap());
     }
     out
+}
+
+/// The wall clock, in milliseconds since the Unix epoch.
+///
+/// A clock that cannot be read reports zero rather than refusing. The only
+/// consumer is the hint's epoch, and a device whose clock is that broken will
+/// simply not be recognised by its friends until the clock is set — which is
+/// the same outcome as any other disagreement about the time, and better than
+/// discovery failing outright over it.
+fn system_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }

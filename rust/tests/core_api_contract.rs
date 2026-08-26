@@ -84,6 +84,9 @@ fn advertising_peer(air: &LoopbackNet, id: &str) -> (Discovery, Receiver<Transpo
     let transport: Arc<dyn Transport> = Arc::new(air.join(id, sink));
     let identity = Arc::new(Mutex::new(Identity::generate(id, 0x00_ff_00)));
     let d = Discovery::new(transport, identity, Instant::now());
+    // What `Net::new` does for the real one. Without it the advert goes out
+    // under an id the hint was not computed against, and nothing says so.
+    d.set_local_id_for_tiebreak(id);
     d.set_enabled(true, Instant::now()).unwrap();
     (d, rx)
 }
@@ -2386,4 +2389,107 @@ fn every_code_shown_is_a_different_code() {
         "the two codes named different identities"
     );
     stop_showing_invite().unwrap();
+}
+
+/// The two-row bug, as it appeared on a phone (T09a).
+///
+/// With Discovery on, the nearby list showed the same Samsung twice: an unknown
+/// device, and separately the paired contact as away. Both rows were one phone
+/// on one desk, and nothing resolved it — the list is drawn from sightings and
+/// from disk, and a friend who is merely advertising matched neither route.
+/// R0-F2 rotates their id every twelve minutes precisely so that an advert
+/// cannot be attributed to a person, so the app genuinely held nothing that
+/// said this unknown device was Ada.
+///
+/// The rotation is what makes this the real thing rather than a re-run of
+/// `a_paired_friend_still_reads_as_paired_with_no_session`. Losing the session
+/// alone leaves the device id we paired under, and that still matches. Rotating
+/// takes the last route away, which is exactly the state the phones were in:
+/// nothing had dialled, so no session had ever been established, and the
+/// duplicate stood indefinitely.
+#[test]
+fn a_paired_friend_who_only_advertises_is_listed_once() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = fresh();
+    let peer = full_peer(&h.air, "peer", "Ada");
+    let paired_under = meet_and_pair(&peer);
+
+    // Walk out of range: the session goes, and the id we knew them by rotates
+    // out from under us.
+    peer.transport.disconnect("core").unwrap();
+    until("the session to go", || {
+        pump(&peer);
+        !has_session(&paired_under)
+    });
+    peer.net.discovery().rotate(Instant::now()).unwrap();
+    let now_called = peer.net.discovery().local_id();
+    assert_ne!(now_called, paired_under, "the peer should have rotated");
+
+    until("the engine to see the new advertisement", || {
+        pump(&peer);
+        nearby_devices()
+            .unwrap()
+            .iter()
+            .any(|d| d.device_id.as_deref() == Some(now_called.as_str()))
+    });
+
+    let listed = nearby_devices().unwrap();
+    let hers: Vec<_> = listed
+        .iter()
+        .filter(|d| d.name == "Ada" || d.device_id.as_deref() == Some(now_called.as_str()))
+        .collect();
+    assert_eq!(
+        hers.len(),
+        1,
+        "one phone, listed {} times: {:?}",
+        hers.len(),
+        listed
+            .iter()
+            .map(|d| (d.device_id.clone(), d.name.clone(), d.paired))
+            .collect::<Vec<_>>()
+    );
+    let row = hers[0];
+    assert_eq!(row.name, "Ada", "the row should have carried her name");
+    assert!(row.paired, "the row should have carried the paired badge");
+    assert_eq!(
+        row.device_id.as_deref(),
+        Some(now_called.as_str()),
+        "the row should be addressable at the id she is advertising under now"
+    );
+    assert!(row.thread_id.is_some(), "the row should open her thread");
+}
+
+/// The other half of it: recognising a friend must not turn a stranger into
+/// one. Eight bytes that nobody's Layer-1 key generated resolve to nobody, and
+/// the row stays the unknown device it is.
+#[test]
+fn a_stranger_advertising_noise_is_still_a_stranger() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = fresh();
+    let peer = full_peer(&h.air, "peer", "Ada");
+    meet_and_pair(&peer);
+
+    // Not derived from any key we hold — the overwhelmingly likely case for any
+    // eight bytes at all.
+    let (_noise, _rx) = advertising_peer(&h.air, "passer-by");
+
+    until("the engine to see the passer-by", || {
+        pump(&peer);
+        nearby_devices()
+            .unwrap()
+            .iter()
+            .any(|d| d.device_id.as_deref() == Some("passer-by"))
+    });
+
+    let listed = nearby_devices().unwrap();
+    let row = listed
+        .iter()
+        .find(|d| d.device_id.as_deref() == Some("passer-by"))
+        .unwrap();
+    assert!(!row.paired, "a stranger's advert read as a pairing");
+    assert!(row.name.is_empty(), "a stranger's advert borrowed a name");
+    assert!(
+        row.thread_id.is_none(),
+        "a stranger's advert opened somebody's conversation"
+    );
 }

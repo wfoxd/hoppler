@@ -7,12 +7,13 @@
 //! value and across every refusal path at once — a future branch that decided
 //! to be helpful on one of them fails here rather than in a privacy report.
 
+use std::collections::HashMap;
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rust_lib_hoppler::discovery::protocol::{Request, Response, PSEUDONYM_LEN, REQUEST_LEN};
-use rust_lib_hoppler::discovery::{Discovery, ROTATION_PERIOD};
+use rust_lib_hoppler::discovery::{hint, Discovery, ROTATION_PERIOD};
 use rust_lib_hoppler::identity::Identity;
 use rust_lib_hoppler::transport::loopback::LoopbackNet;
 use rust_lib_hoppler::transport::{Transport, TransportEvent};
@@ -60,6 +61,26 @@ struct Node {
     transport: Arc<dyn Transport>,
     rx: Events,
     id: String,
+    /// Kept so the hint tests can ask what a friend who had paired with this
+    /// node would know — the Layer-1 public key is the whole of it.
+    identity: Arc<Mutex<Identity>>,
+    /// The wall clock this node's hints are computed against, in ms. Shared
+    /// with the `Discovery`, so a test moves time by writing to it.
+    clock: Arc<Mutex<i64>>,
+}
+
+impl Node {
+    fn l1(&self) -> [u8; 32] {
+        self.identity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .layer1_public()
+            .0
+    }
+
+    fn set_clock(&self, ms: i64) {
+        *self.clock.lock().unwrap_or_else(|e| e.into_inner()) = ms;
+    }
 }
 
 fn node(net: &LoopbackNet, id: &str, now: Instant) -> Node {
@@ -69,13 +90,31 @@ fn node(net: &LoopbackNet, id: &str, now: Instant) -> Node {
         format!("{id}-persona"),
         0x00ff00,
     )));
+    let clock = Arc::new(Mutex::new(EPOCH_ZERO));
+    let reads = clock.clone();
+    let discovery = Discovery::with_clock(
+        transport.clone(),
+        identity.clone(),
+        now,
+        Box::new(move || *reads.lock().unwrap_or_else(|e| e.into_inner())),
+    );
+    // What `Net::new` does in production: discovery is built after the
+    // transport, so it has to be told the id the transport already has.
+    discovery.set_local_id_for_tiebreak(id);
     Node {
-        discovery: Discovery::new(transport.clone(), identity, now),
+        discovery,
         transport,
         rx,
         id: id.to_string(),
+        identity,
+        clock,
     }
 }
+
+/// A wall-clock instant far enough from zero that a test can step either side
+/// of an epoch boundary without the arithmetic going negative by accident.
+const EPOCH_ZERO: i64 = 1_000 * PERIOD_MS;
+const PERIOD_MS: i64 = 12 * 60 * 1000;
 
 /// Everything a requester gets back after asking, as raw bytes.
 ///
@@ -511,4 +550,268 @@ fn an_oversized_record_is_refused_rather_than_truncated_on_the_wire() {
     assert!(over.encode().is_empty());
     let ok = Response::Persona(vec![0u8; 4096]);
     assert!(!ok.encode().is_empty(), "a legal record was refused");
+}
+
+// ── the advert hint (T09a) ──────────────────────────────────────────────────
+
+/// Every advertisement a scanner saw, in order, as (id, payload).
+fn adverts(rx: &Events) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    while let Ok(event) = rx.recv_timeout(Duration::from_millis(50)) {
+        if let TransportEvent::PeerFound { peer, payload } = event {
+            out.push((peer, payload));
+        }
+    }
+    out
+}
+
+/// The point of the whole feature: somebody who has paired with us can pick our
+/// advertisement out of the air, with nothing dialled and no session open.
+#[test]
+fn a_friend_can_recognise_the_advertisement() {
+    let net = LoopbackNet::new();
+    let now = Instant::now();
+    let subject = node(&net, "subject", now);
+    let watcher = node(&net, "watcher", now);
+    watcher.transport.start_scanning().unwrap();
+
+    subject.discovery.set_enabled(true, now).unwrap();
+
+    let seen = adverts(&watcher.rx);
+    let (id, payload) = seen
+        .iter()
+        .find(|(id, _)| id == "subject")
+        .expect("the subject should have advertised");
+    let carried = hint::read(payload).expect("the advert should have carried a hint");
+    assert!(
+        hint::written_by(&subject.l1(), id, &carried, EPOCH_ZERO),
+        "a paired friend should have recognised it"
+    );
+}
+
+/// And nobody else can. A scanner holding some other Layer-1 key — which is
+/// every scanner that has not stood next to us and pressed confirm — gets
+/// eight bytes it cannot tell from noise.
+#[test]
+fn a_stranger_cannot() {
+    let net = LoopbackNet::new();
+    let now = Instant::now();
+    let subject = node(&net, "subject", now);
+    let stranger = node(&net, "stranger", now);
+    stranger.transport.start_scanning().unwrap();
+
+    subject.discovery.set_enabled(true, now).unwrap();
+
+    let seen = adverts(&stranger.rx);
+    let (id, payload) = seen.iter().find(|(id, _)| id == "subject").unwrap();
+    let carried = hint::read(payload).unwrap();
+    assert!(!hint::written_by(&stranger.l1(), id, &carried, EPOCH_ZERO));
+}
+
+/// The one that guards R0-F2, and the reason `rotate` goes quiet before it
+/// renames itself.
+///
+/// The rung re-advertises whatever payload it was last given when the id
+/// changes, so the naive order publishes the *old* hint under the *new* id —
+/// eight identical bytes under two ids, which any scanner in range can link
+/// with no key and no pairing at all. That is exactly the linkage the rotation
+/// was performed to break, so it would have made the advert worse than empty.
+///
+/// Asserted over everything the scanner saw rather than the end state: the leak
+/// is a moment, not a resting position, and a test that only looked at the
+/// final advertisement would sail straight past it.
+#[test]
+fn no_hint_is_ever_seen_under_two_ids() {
+    let net = LoopbackNet::new();
+    let now = Instant::now();
+    let subject = node(&net, "subject", now);
+    let watcher = node(&net, "watcher", now);
+    watcher.transport.start_scanning().unwrap();
+
+    subject.discovery.set_enabled(true, now).unwrap();
+    subject.discovery.rotate(now).unwrap();
+
+    let mut ids_per_payload: std::collections::HashMap<Vec<u8>, Vec<String>> = HashMap::new();
+    for (id, payload) in adverts(&watcher.rx) {
+        if payload.is_empty() {
+            continue; // carries nothing, so it links nothing
+        }
+        let ids = ids_per_payload.entry(payload).or_default();
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    assert!(
+        !ids_per_payload.is_empty(),
+        "the subject should have advertised a hint at all"
+    );
+    for (payload, ids) in &ids_per_payload {
+        assert_eq!(
+            ids.len(),
+            1,
+            "{} was advertised under {:?} — two ids linked by one hint",
+            hex::encode(payload),
+            ids
+        );
+    }
+}
+
+/// A rotation that the rung refuses — which is what happens whenever a pipe is
+/// open — must leave us advertising, not silent. `rotate` goes quiet before it
+/// asks, so the refusal path has to put the hint back.
+#[test]
+fn a_refused_rotation_leaves_the_hint_on_the_air() {
+    let net = LoopbackNet::new();
+    let now = Instant::now();
+    let subject = node(&net, "subject", now);
+    let peer = node(&net, "peer", now);
+    peer.transport.start_scanning().unwrap();
+
+    subject.discovery.set_enabled(true, now).unwrap();
+    connected(&net, &subject, &peer);
+    let _ = adverts(&peer.rx);
+
+    // A pipe is open, so the rung refuses to rename (T08 rule 4).
+    subject.discovery.rotate(now).unwrap();
+
+    let last = adverts(&peer.rx)
+        .into_iter()
+        .rfind(|(id, _)| id == "subject")
+        .expect("the subject should have re-advertised");
+    let carried = hint::read(&last.1).expect("the hint should have gone back up");
+    assert!(hint::written_by(
+        &subject.l1(),
+        &last.0,
+        &carried,
+        EPOCH_ZERO
+    ));
+}
+
+/// The epoch grid is shared between devices; our rotation timer is our own. So
+/// a hint falls due on a schedule the id knows nothing about, and a device
+/// holding an open pipe — which cannot rotate at all — would otherwise go on
+/// advertising a hint from epochs ago until its friends stopped recognising it.
+#[test]
+fn the_hint_turns_with_the_epoch_without_waiting_for_a_rotation() {
+    let net = LoopbackNet::new();
+    let now = Instant::now();
+    let subject = node(&net, "subject", now);
+    let watcher = node(&net, "watcher", now);
+    watcher.transport.start_scanning().unwrap();
+
+    subject.discovery.set_enabled(true, now).unwrap();
+    let first = adverts(&watcher.rx).pop().expect("an advert").1;
+
+    // Time enough for the epoch to turn, and nowhere near enough for a
+    // rotation to fall due.
+    subject.set_clock(EPOCH_ZERO + PERIOD_MS);
+    subject
+        .discovery
+        .tick(now + Duration::from_secs(1))
+        .unwrap();
+
+    let second = adverts(&watcher.rx).pop().expect("a second advert");
+    assert_eq!(second.0, "subject", "the id should not have moved");
+    assert_ne!(first, second.1, "the hint should have");
+    let carried = hint::read(&second.1).unwrap();
+    assert!(hint::written_by(
+        &subject.l1(),
+        &second.0,
+        &carried,
+        EPOCH_ZERO + PERIOD_MS
+    ));
+}
+
+/// A tick that changes nothing must not touch the radio. This runs on every
+/// turn of the engine loop, and re-advertising is not free — on BLE it stops
+/// and restarts an advertising set.
+#[test]
+fn a_tick_that_changes_nothing_does_not_re_advertise() {
+    let net = LoopbackNet::new();
+    let now = Instant::now();
+    let subject = node(&net, "subject", now);
+    let watcher = node(&net, "watcher", now);
+    watcher.transport.start_scanning().unwrap();
+
+    subject.discovery.set_enabled(true, now).unwrap();
+    let _ = adverts(&watcher.rx);
+
+    for second in 1..5 {
+        subject
+            .discovery
+            .tick(now + Duration::from_secs(second))
+            .unwrap();
+    }
+
+    assert!(
+        adverts(&watcher.rx).is_empty(),
+        "nothing had changed, so nothing should have been published"
+    );
+}
+
+/// The sighting has to keep the hint, because the only thing that can resolve
+/// it is the store — discovery holds no Layer-1 keys but its own.
+#[test]
+fn a_sighting_keeps_the_hint_it_arrived_with() {
+    let net = LoopbackNet::new();
+    let now = Instant::now();
+    let subject = node(&net, "subject", now);
+    let watcher = node(&net, "watcher", now);
+    watcher.transport.start_scanning().unwrap();
+
+    subject.discovery.set_enabled(true, now).unwrap();
+    pump(&watcher.discovery, &watcher.rx, now);
+
+    let seen = watcher
+        .discovery
+        .sightings()
+        .into_iter()
+        .find(|s| s.peer == "subject")
+        .expect("the subject should have been sighted");
+    let carried = seen.hint.expect("the sighting should have kept the hint");
+    assert!(hint::written_by(
+        &subject.l1(),
+        &seen.peer,
+        &carried,
+        EPOCH_ZERO
+    ));
+}
+
+/// mDNS resolves a peer once per interface and address — sixteen `PeerFound`
+/// events inside a second, measured — so "the list changed" has to stay false
+/// for a repeat, or the screen rebuilds sixteen times for one arrival. The hint
+/// is the one part that legitimately moves under a settled id, and it moving is
+/// news: a peer that was advertising nothing and now carries a hint stops being
+/// an unknown device and becomes somebody with a name.
+#[test]
+fn only_a_hint_that_actually_moved_counts_as_news() {
+    let net = LoopbackNet::new();
+    let now = Instant::now();
+    let watcher = node(&net, "watcher", now);
+    let bare = TransportEvent::PeerFound {
+        peer: "stranger".into(),
+        payload: Vec::new(),
+    };
+    let with_hint = TransportEvent::PeerFound {
+        peer: "stranger".into(),
+        payload: vec![7u8; 8],
+    };
+
+    assert!(watcher.discovery.on_event(bare.clone(), now), "first sight");
+    assert!(
+        !watcher.discovery.on_event(bare.clone(), now),
+        "a re-resolve"
+    );
+    assert!(
+        watcher.discovery.on_event(with_hint.clone(), now),
+        "a hint where there was none changes who the row is"
+    );
+    assert!(
+        !watcher.discovery.on_event(with_hint, now),
+        "the same hint again does not"
+    );
+    assert!(
+        watcher.discovery.on_event(bare, now),
+        "and losing it changes it back"
+    );
 }

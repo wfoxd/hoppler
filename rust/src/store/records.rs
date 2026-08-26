@@ -608,6 +608,32 @@ impl Store {
             .transpose()
     }
 
+    /// Every pairing on file.
+    ///
+    /// The whole table, because the caller's question is one no index can
+    /// answer: which of these Layer-1 keys generated the hint in an
+    /// advertisement (T09a). That is a hash per pairing per epoch tried, and
+    /// there is no way to look it up — the hint is only recognisable to
+    /// somebody who already holds the key, which is exactly the property that
+    /// makes it safe to broadcast.
+    ///
+    /// Ordered oldest first so the answer to a hint collision is stable across
+    /// calls rather than whatever the page order happened to be. A collision
+    /// needs two of our friends' keys to agree in eight bytes, which is not
+    /// something to plan around, but "always the same wrong answer" is much
+    /// easier to recognise from a screenshot than a row that flickers.
+    pub fn pairings(&self) -> Result<Vec<Pairing>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT contact_id, l1_pub, paired_at FROM pairings ORDER BY paired_at, contact_id",
+        )?;
+        let rows = stmt.query_map([], map_pairing)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row??);
+        }
+        Ok(out)
+    }
+
     /// The contact paired to this Layer-1 identity, if any.
     ///
     /// The lookup that makes a pairing durable across everything else: a
@@ -1653,6 +1679,51 @@ mod tests {
             stranger
         );
         assert_eq!(s.contact_by_l1(&[1u8; 32]).unwrap().unwrap().id, other);
+    }
+
+    /// Every pairing, because matching an advert hint has to try them all —
+    /// there is no index for "which key generated these eight bytes".
+    #[test]
+    fn listing_pairings_returns_all_of_them_oldest_first() {
+        let (s, _d) = store();
+        let middle = s.add_contact(&a_contact()).unwrap();
+        let first = s
+            .add_contact(&NewContact {
+                pseudonym: [2u8; 32],
+                ..a_contact()
+            })
+            .unwrap();
+        let last = s
+            .add_contact(&NewContact {
+                pseudonym: [3u8; 32],
+                ..a_contact()
+            })
+            .unwrap();
+        // Three, and paired in an order that matches neither the row ids
+        // ascending nor descending — with two, every plausible ordering agrees
+        // by accident and the assertion pins nothing.
+        s.pair_contact_for_test(middle, &[8u8; 32], 2000).unwrap();
+        s.pair_contact_for_test(first, &[9u8; 32], 1000).unwrap();
+        s.pair_contact_for_test(last, &[7u8; 32], 3000).unwrap();
+
+        let all = s.pairings().unwrap();
+        assert_eq!(
+            all.iter().map(|p| p.contact_id).collect::<Vec<_>>(),
+            vec![first, middle, last],
+            "a hint that matched two keys must pick the same one every time"
+        );
+        assert_eq!(all[0].l1_pub, [9u8; 32]);
+        assert_eq!(all[2].l1_pub, [7u8; 32]);
+    }
+
+    /// An unpaired contact is not a pairing. It carries no Layer-1 key — only a
+    /// ceremony discloses one — so it can generate no hint and must not appear
+    /// among the keys a hint is tried against.
+    #[test]
+    fn listing_pairings_leaves_out_contacts_that_never_paired() {
+        let (s, _d) = store();
+        s.add_contact(&a_contact()).unwrap();
+        assert!(s.pairings().unwrap().is_empty());
     }
 
     /// The happy path writes all four things.
