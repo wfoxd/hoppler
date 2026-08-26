@@ -1184,6 +1184,7 @@ impl Net {
     /// it: both `Net`s in one process compile the same `PROTOCOL_VERSION`, so a
     /// disagreement can only come from a hand-rolled peer, and that peer has no
     /// persona endpoint to fetch from.
+    #[cfg(test)]
     pub fn learn_persona_for_test(&self, peer: &str, persona: VerifiedPersona) {
         self.known
             .lock()

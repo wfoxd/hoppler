@@ -129,15 +129,28 @@ pub(crate) fn encode_intro(
     our_static: &dh::DhPublic,
 ) -> Result<Vec<u8>, HandshakeError> {
     let record = us.persona_record();
-    if record.len() > MAX_HANDSHAKE_PAYLOAD {
-        return Err(HandshakeError::PayloadTooLarge);
-    }
     let signature = us.bind_session_static(our_static);
     let mut out = Vec::with_capacity(1 + 2 + record.len() + sign::SIGNATURE_LEN);
     out.push(PROTOCOL_VERSION);
     out.extend_from_slice(&(record.len() as u16).to_be_bytes());
     out.extend_from_slice(&record);
     out.extend_from_slice(&signature.0);
+    // The assembled payload, not the record inside it. `decode_intro` bounds
+    // what it *reads*, so bounding something smaller here leaves a band of
+    // records this side would send and the other must refuse — a message that
+    // fails for a reason neither end can see. The version byte widened that
+    // band by one; it was already there.
+    //
+    // Unreachable today, and kept anyway. A persona record is a Layer-2 key, a
+    // name capped at `MAX_PERSONA_NAME_LEN`, a colour, a version, a session
+    // static and a signature — around 280 bytes assembled, against a cap of
+    // 4096. Nothing can currently produce a payload this rejects, which is why
+    // no test drives it and why the mutation back to `record.len()` survives:
+    // the two spellings cannot be told apart by any input the type system
+    // allows. It is the asymmetry that is the bug, not a size anybody has hit.
+    if out.len() > MAX_HANDSHAKE_PAYLOAD {
+        return Err(HandshakeError::PayloadTooLarge);
+    }
     Ok(out)
 }
 
@@ -393,6 +406,40 @@ mod tests {
         let bob = Identity::generate("Bob", 2);
         let bob_persona = identity::verify_persona_record(&bob.persona_record()).unwrap();
         (alice, bob, bob_persona)
+    }
+
+    /// What this side will send stays inside what the other will read.
+    ///
+    /// Review found `encode_intro` bounding the persona record while
+    /// `decode_intro` bounds the whole payload, which leaves a band of records
+    /// one end would send and the other must refuse. The encoder now measures
+    /// the assembled bytes.
+    ///
+    /// **This cannot currently be violated**, which is why the assertion is on
+    /// a real identity rather than a crafted one: a persona record is around
+    /// 280 bytes assembled against a 4096 cap, and `MAX_PERSONA_NAME_LEN` is
+    /// what holds it there. The mutation back to `record.len()` therefore
+    /// survives, and would go on surviving however this test were written —
+    /// no input the type system allows can tell the two spellings apart. What
+    /// is pinned here is the margin: if a record ever grows toward the cap,
+    /// this fails long before the asymmetry becomes reachable on a wire.
+    #[test]
+    fn an_intro_stays_well_inside_the_cap_it_is_read_against() {
+        let (alice, _bob, bob_persona) = pair();
+        let alice_static = alice.pseudonym_toward(&bob_persona.l2_pub);
+        let intro = encode_intro(&alice, &alice_static).unwrap();
+        assert!(
+            intro.len() < MAX_HANDSHAKE_PAYLOAD / 4,
+            "an intro is {} bytes against a {MAX_HANDSHAKE_PAYLOAD}-byte cap — \
+             the headroom the encoder relies on has gone",
+            intro.len()
+        );
+        // And the reader's bound is on the same quantity the writer just checked.
+        let too_big = vec![0u8; MAX_HANDSHAKE_PAYLOAD + 1];
+        assert!(matches!(
+            decode_intro(&too_big, &dh::DhPublic([0; 32])),
+            Err(HandshakeError::PayloadTooLarge)
+        ));
     }
 
     /// An intro built the way every build before the version gate built one.
