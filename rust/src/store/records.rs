@@ -403,6 +403,46 @@ impl Store {
         Ok(())
     }
 
+    /// Throw away what a thread was going to send, because the pairing just
+    /// changed what its bytes have to be.
+    ///
+    /// A message written before this moment was sealed with whatever the thread
+    /// had, which on an unpaired thread is nothing — the wire is a bare
+    /// envelope and that is what `commit_sent` stored. The thread now has a
+    /// ratchet, so the far side will open sealed bodies and only those, and
+    /// sending the stored bytes at the next reunion delivers something it
+    /// throws away. R0-F5 promises the opposite, and neither person is told.
+    ///
+    /// **Dropped rather than re-sealed here.** Sealing needs a ratchet turn,
+    /// which belongs to the engine and not to a store transaction; and
+    /// `resend_queued` already seals from the envelope when it finds no stored
+    /// seal, keeping what it drew so the attempt after it is identical. So the
+    /// smallest correct act is to forget the wrong answer and let the existing
+    /// path compute the right one.
+    ///
+    /// That ordering also survives a crash. The delete lands in the same
+    /// transaction as the pairing, so a thread is never left paired while still
+    /// holding bytes from before it — and an interruption before the commit
+    /// leaves both undone, which is where it started.
+    ///
+    /// Only `Queued` rows, because those are the only ones a reunion will send.
+    /// A seal for a message already `Sent` is deleted when it is acked, and
+    /// re-sending one is not something a pairing should provoke.
+    fn drop_seals_overtaken_by_pairing(&self, thread_id: i64) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM outbound_seals WHERE msg_id IN (
+                 SELECT msg_id FROM messages
+                 WHERE thread_id = ?1 AND direction = ?2 AND state = ?3
+             )",
+            params![
+                thread_id,
+                Direction::Outgoing.to_i64(),
+                MessageState::Queued.to_i64()
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Update a contact's persona fields (their name/colour/version changed via
     /// a persona record). Returns whether a row matched.
     pub fn update_contact_persona(
@@ -532,6 +572,7 @@ impl Store {
         )?;
         let thread = self.write_pairing(contact_id, l1_pub, paired_at)?;
         self.write_ratchet(thread, ratchet, paired_at)?;
+        self.drop_seals_overtaken_by_pairing(thread)?;
         tx.commit()?;
         Ok(thread)
     }
@@ -1724,6 +1765,72 @@ mod tests {
         let (s, _d) = store();
         s.add_contact(&a_contact()).unwrap();
         assert!(s.pairings().unwrap().is_empty());
+    }
+
+    /// A pairing forgets what the thread was about to send.
+    ///
+    /// A message written before the pairing was sealed with whatever the thread
+    /// had, which on an unpaired thread is nothing — the stored wire is a bare
+    /// envelope. The thread now has a ratchet and the far side will open sealed
+    /// bodies and only those, so those bytes have become undeliverable. Dropped
+    /// here; `resend_queued` seals afresh from the envelope when it finds no
+    /// stored seal, which is a path it already had and already tests.
+    ///
+    /// **A guard against a state nothing has been shown to produce.** The
+    /// ordinary path empties the queue before a ceremony can finish: the peer
+    /// appearing is what triggers the flush *and* what makes pairing possible,
+    /// so the plaintext normally goes out while both ends are still strangers
+    /// and both read it correctly. Reaching this needs the flush to fail or be
+    /// skipped while the ceremony succeeds, and an attempt to drive that
+    /// through two devices showed the queue empty before the ceremony
+    /// completed. Asserted against the store, which is where the rule lives,
+    /// rather than through a sequence nobody has produced.
+    #[test]
+    fn pairing_drops_a_seal_it_has_made_undeliverable() {
+        let (s, _d) = store();
+        let id = s.add_contact(&a_contact()).unwrap();
+
+        // A conversation with a stranger, and a message waiting on it with the
+        // bare-envelope bytes it would have gone out as.
+        let thread = s.create_thread(id, 1000).unwrap();
+        let msg_id = vec![1u8; 16];
+        s.commit_sent(
+            None,
+            &NewMessage {
+                thread_id: thread,
+                seq: 1,
+                msg_id: msg_id.clone(),
+                body: b"before".to_vec(),
+                direction: Direction::Outgoing,
+                state: MessageState::Queued,
+                created_at: 1000,
+            },
+            Some(b"a bare envelope"),
+            1000,
+        )
+        .unwrap();
+        assert!(
+            s.seal_for(&msg_id).unwrap().is_some(),
+            "the message was not stored with the bytes it would send"
+        );
+
+        // Pairing adopts that conversation, and the bytes stop being sendable.
+        let paired = s
+            .record_pairing(id, &[7u8; 32], "Ada", 1, 1, &[9u8; 32], b"ratchet", 2000)
+            .unwrap();
+        assert_eq!(paired, thread, "the pairing did not adopt the conversation");
+        assert_eq!(
+            s.seal_for(&msg_id).unwrap(),
+            None,
+            "a pairing left bytes the other end can no longer open"
+        );
+        // The message itself stays, so the reunion still has something to seal.
+        assert_eq!(
+            s.count_in_state(thread, Direction::Outgoing, MessageState::Queued)
+                .unwrap(),
+            1,
+            "dropping the seal took the message with it"
+        );
     }
 
     /// The happy path writes all four things.
