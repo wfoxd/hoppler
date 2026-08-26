@@ -68,6 +68,7 @@
 //! outside this value has been written. Persistence happens after
 //! [`Paired`] comes out, which is slice 3's job.
 
+use crate::protocol::PROTOCOL_VERSION;
 use snow::params::NoiseParams;
 use snow::{Builder, HandshakeState, TransportState};
 
@@ -157,6 +158,12 @@ pub enum CeremonyError {
     OutOfOrder,
     /// A frame that did not parse, or was larger than [`MAX_CEREMONY_FRAME`].
     Malformed,
+    /// The peer speaks a different protocol version.
+    ///
+    /// Normally arrives as [`CeremonyError::Noise`] instead — the version is in
+    /// the prologue, so a disagreement means nothing decrypts and there is no
+    /// intro left to read a number out of. See [`crate::protocol`].
+    VersionMismatch { theirs: u8, ours: u8 },
 }
 
 impl std::fmt::Display for CeremonyError {
@@ -170,6 +177,10 @@ impl std::fmt::Display for CeremonyError {
             CeremonyError::L1ProofInvalid => write!(f, "layer-1 proof did not verify"),
             CeremonyError::OutOfOrder => write!(f, "ceremony message arrived out of order"),
             CeremonyError::Malformed => write!(f, "malformed ceremony message"),
+            CeremonyError::VersionMismatch { theirs, ours } => write!(
+                f,
+                "peer speaks protocol version {theirs}, this build speaks {ours}"
+            ),
         }
     }
 }
@@ -188,6 +199,15 @@ impl From<HandshakeError> for CeremonyError {
                 identity::IdentityError::RecordSignatureInvalid,
             ),
             HandshakeError::PayloadTooLarge => CeremonyError::Malformed,
+            // Unreachable while the version is also in the prologue: two builds
+            // that disagree derive different `h`, so message 1 fails to decrypt
+            // and this side never sees an intro to read a version out of. Kept
+            // as the belt to that prologue's braces — if the binding is ever
+            // loosened, the ceremony still refuses with a reason instead of
+            // pairing two builds that cannot read each other.
+            HandshakeError::VersionMismatch { theirs, ours } => {
+                CeremonyError::VersionMismatch { theirs, ours }
+            }
         }
     }
 }
@@ -751,10 +771,17 @@ fn open_handshake(
         .expect("CEREMONY_PARAMS is a compile-time constant and must parse");
     let secret = us.session_secret();
     let exposed = secret.expose_secret();
+    // The nonce binds the ceremony to the code that was scanned; the version
+    // binds it to a build that means the same thing by it. A pairing writes a
+    // contact, a Layer-1 key and a ratchet seed, so two builds that disagree
+    // about the wire would be writing each other durable state neither can
+    // read — worse than not pairing at all. Both go into `h` before a single
+    // message goes out, so a mismatch in either means nothing decrypts.
+    let mut prologue = Vec::with_capacity(nonce.len() + 1);
+    prologue.extend_from_slice(nonce);
+    prologue.push(PROTOCOL_VERSION);
     let builder = Builder::new(params)
-        // The binding. Mixed into `h` before a single message goes out, so both
-        // sides must have read the same code or nothing decrypts.
-        .prologue(nonce)
+        .prologue(&prologue)
         .map_err(noise)?
         .local_private_key(&*exposed)
         .map_err(noise)?;
@@ -842,6 +869,99 @@ mod tests {
 
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// A pairing across two protocol versions must not complete.
+    ///
+    /// This is the half of the version gate that protects *durable* state. A
+    /// ceremony writes a contact row, a Layer-1 key and a ratchet seed; two
+    /// builds that disagree about the wire would be writing each other records
+    /// neither can read, which is worse than not pairing at all.
+    ///
+    /// The failure lands on message 2, not message 1 — XX's first message is
+    /// `-> e` with nothing authenticated yet, so a prologue disagreement is
+    /// invisible until the first tag has to verify. That is the same place a
+    /// wrong ceremony *nonce* fails, and for the same reason: the prologue is
+    /// not a field anyone checks, it is the difference between a tag verifying
+    /// and not.
+    #[test]
+    fn a_ceremony_between_two_protocol_versions_cannot_complete() {
+        let shower_id = Identity::generate("Ada", 0x11_2233);
+        let scanner_id = Identity::generate("Bo", 0x44_5566);
+        let invite = Invite::fresh(shower_id.layer2_public(), "a1b2c3d4");
+
+        // A scanner from some other build: same code, same everything, one
+        // different number folded into the prologue.
+        let params: NoiseParams = CEREMONY_PARAMS.parse().unwrap();
+        let secret = scanner_id.session_secret();
+        let mut foreign_prologue = invite.nonce.to_vec();
+        foreign_prologue.push(PROTOCOL_VERSION.wrapping_add(1));
+        let mut foreign = Builder::new(params)
+            .prologue(&foreign_prologue)
+            .unwrap()
+            .local_private_key(&*secret.expose_secret())
+            .unwrap()
+            .build_initiator()
+            .unwrap();
+
+        let mut buf = vec![0u8; MAX_CEREMONY_FRAME];
+        let n = foreign.write_message(&[], &mut buf).unwrap();
+        buf.truncate(n);
+
+        let mut shower = Ceremony::show(&shower_id, &invite).unwrap();
+        // Message 1 carries no tag, so this side has nothing to object to yet.
+        let m2 = one_send(&shower.read(&shower_id, &buf).unwrap());
+
+        // Message 2 is where the disagreement becomes arithmetic.
+        let mut back = vec![0u8; MAX_CEREMONY_FRAME];
+        assert!(
+            foreign.read_message(&m2, &mut back).is_err(),
+            "a ceremony completed across two protocol versions"
+        );
+
+        // The other half, and the one that actually pins the prologue: the same
+        // hand-built peer using `nonce || PROTOCOL_VERSION` gets through.
+        // Without this the test above passes for a build that never put the
+        // version in at all — two prologues that differ are two prologues that
+        // differ, whichever of them is the odd one out.
+        let params: NoiseParams = CEREMONY_PARAMS.parse().unwrap();
+        let mut agreed_prologue = invite.nonce.to_vec();
+        agreed_prologue.push(PROTOCOL_VERSION);
+        let mut agreed = Builder::new(params)
+            .prologue(&agreed_prologue)
+            .unwrap()
+            .local_private_key(&*secret.expose_secret())
+            .unwrap()
+            .build_initiator()
+            .unwrap();
+        let mut buf = vec![0u8; MAX_CEREMONY_FRAME];
+        let n = agreed.write_message(&[], &mut buf).unwrap();
+        buf.truncate(n);
+        let mut shower = Ceremony::show(&shower_id, &invite).unwrap();
+        let m2 = one_send(&shower.read(&shower_id, &buf).unwrap());
+        let mut back = vec![0u8; MAX_CEREMONY_FRAME];
+        assert!(
+            agreed.read_message(&m2, &mut back).is_ok(),
+            "the prologue is not `nonce || PROTOCOL_VERSION`"
+        );
+    }
+
+    /// The nonce is still in the prologue beside the version. Folding a second
+    /// thing in must not displace the binding that was already there.
+    #[test]
+    fn a_wrong_code_still_fails_with_the_version_in_the_prologue() {
+        let shower_id = Identity::generate("Ada", 0x11_2233);
+        let scanner_id = Identity::generate("Bo", 0x44_5566);
+        let shown = Invite::fresh(shower_id.layer2_public(), "a1b2c3d4");
+        let other = Invite::fresh(shower_id.layer2_public(), "a1b2c3d4");
+
+        let mut shower = Ceremony::show(&shower_id, &shown).unwrap();
+        let (mut scanner, m1) = Ceremony::scan(&scanner_id, &other).unwrap();
+        let m2 = one_send(&shower.read(&shower_id, &m1).unwrap());
+        assert!(
+            scanner.read(&scanner_id, &m2).is_err(),
+            "a ceremony ran against a code that was never shown"
+        );
     }
 
     #[test]
