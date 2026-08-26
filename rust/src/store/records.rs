@@ -443,6 +443,19 @@ impl Store {
         Ok(())
     }
 
+    /// What state a message is in, if it is on file.
+    pub fn message_state(&self, msg_id: &[u8]) -> Result<Option<MessageState>, StoreError> {
+        let raw: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT state FROM messages WHERE msg_id = ?1",
+                params![msg_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        raw.map(MessageState::from_i64).transpose()
+    }
+
     /// Update a contact's persona fields (their name/colour/version changed via
     /// a persona record). Returns whether a row matched.
     pub fn update_contact_persona(

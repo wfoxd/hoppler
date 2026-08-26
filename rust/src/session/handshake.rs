@@ -470,7 +470,7 @@ mod tests {
         assert!(
             matches!(
                 Responder::read_first(&bob, &message),
-                Err(HandshakeError::VersionMismatch { theirs: 0, ours: 1 })
+                Err(HandshakeError::VersionMismatch { theirs: 0, ours: 2 })
             ),
             "an older build was not refused by version"
         );
@@ -490,7 +490,7 @@ mod tests {
             Responder::read_first(&bob, &message),
             Err(HandshakeError::VersionMismatch {
                 theirs: 200,
-                ours: 1
+                ours: 2
             })
         ));
     }
@@ -506,7 +506,7 @@ mod tests {
         let (_alice, bob, _bob_persona) = pair();
         assert!(matches!(
             decode_intro(&[9], &dh::DhPublic([0; 32])),
-            Err(HandshakeError::VersionMismatch { theirs: 9, ours: 1 })
+            Err(HandshakeError::VersionMismatch { theirs: 9, ours: 2 })
         ));
         let _ = bob;
     }

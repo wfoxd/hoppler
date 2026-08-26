@@ -348,13 +348,14 @@ mod framing {
     /// A new variant that is not added here is a kind nothing round-trips —
     /// which is how `Pong` arrived, straight past a test that looked like it
     /// covered the enum.
-    const EVERY_KIND: [FrameKind; 6] = [
+    const EVERY_KIND: [FrameKind; 7] = [
         FrameKind::Ping,
         FrameKind::Chat,
         FrameKind::DropControl,
         FrameKind::Pong,
         FrameKind::Ceremony,
         FrameKind::Opening,
+        FrameKind::Ack,
     ];
 
     #[test]
@@ -384,6 +385,7 @@ mod framing {
             FrameKind::Pong => 4,
             FrameKind::Ceremony => 5,
             FrameKind::Opening => 6,
+            FrameKind::Ack => 7,
         }
     }
 

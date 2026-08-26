@@ -1086,6 +1086,12 @@ pub fn queued_for_resend_for_test(device_id: &str) -> Result<Vec<(u64, String)>,
 /// message held and a message sent is invisible from the public API — the DTO
 /// carries no state — and it is the whole of what F3 promises about a closed
 /// Discovery.
+pub fn message_state_for_test(msg_id: &[u8]) -> Result<Option<String>, String> {
+    with_core(|core| Ok(core.store.message_state(msg_id)?.map(|s| format!("{s:?}"))))
+}
+
+/// How many of a thread's outgoing messages are still waiting, for the contract
+/// tests.
 pub fn queued_on_thread_for_test(thread_id: i64) -> Result<usize, String> {
     with_core(|core| {
         core.store
@@ -1632,9 +1638,25 @@ fn on_net_event(net: &Arc<net::Net>, event: net::NetEvent) {
             });
         }
         net::NetEvent::ChatReceived { peer, body } => {
+            if let Ok(landed) = store_incoming_chat(&peer, &body) {
+                // The ack goes out before the screen is told, because the
+                // ratchet turn behind it is already on disk and the sender's
+                // row is waiting on it. Failing to send leaves that row saying
+                // `Sent`, which is the honest direction to fail in.
+                if let Some(ack) = landed.ack {
+                    if let Err(why) = net.send_ack(&peer, ack, std::time::Instant::now()) {
+                        log::warn!("could not acknowledge a message: {why}");
+                    }
+                }
+                if let Some(event) = landed.event {
+                    emit(event);
+                }
+            }
+        }
+        net::NetEvent::ChatAcked { peer, body } => {
             let _ = net;
-            if let Ok(Some(event)) = store_incoming_chat(&peer, &body) {
-                emit(event);
+            if let Err(why) = mark_delivered(&peer, &body) {
+                log::warn!("could not mark a message delivered: {why}");
             }
         }
     }
@@ -1666,7 +1688,20 @@ pub fn thread_rows_for_test(thread_id: i64) -> Result<Vec<(i64, String)>, String
 /// same envelope arriving twice is one message — cannot be reached through the
 /// public API, which has no way to make a message arrive.
 pub fn receive_chat_for_test(device_id: &str, body: &[u8]) -> Result<Option<CoreEvent>, String> {
-    store_incoming_chat(device_id, body)
+    store_incoming_chat(device_id, body).map(|landed| landed.event)
+}
+
+/// Whether receiving this body would send an acknowledgement back, for the
+/// contract tests.
+///
+/// The decision, not the bytes. Whether an ack goes out is the whole of what
+/// [`crate::session::frame::FrameKind::Ack`] promises and refuses — an
+/// unpaired thread must not produce one, because an unsealed ack is a
+/// forgeable claim that a message arrived — and none of it is visible through
+/// the public API, which reports what was received and never what was said
+/// back.
+pub fn acked_on_receipt_for_test(device_id: &str, body: &[u8]) -> Result<bool, String> {
+    store_incoming_chat(device_id, body).map(|landed| landed.ack.is_some())
 }
 
 /// Write an inbound chat line and return the event announcing it, or `None` if
@@ -1680,7 +1715,16 @@ pub fn receive_chat_for_test(device_id: &str, body: &[u8]) -> Result<Option<Core
 /// second copy on the screen. That is the case `seq` and `msg_id` exist for,
 /// and the case the ratchet cannot catch, because a resend is genuinely fresh
 /// ciphertext it has never seen.
-fn store_incoming_chat(device_id: &str, body: &[u8]) -> Result<Option<CoreEvent>, String> {
+/// What arrived, and what to say back about it.
+struct Landed {
+    event: Option<CoreEvent>,
+    /// A sealed `msg_id`, when this thread can seal one. `None` on an unpaired
+    /// thread — see [`crate::session::frame::FrameKind::Ack`] for why that is a
+    /// stated limit rather than a gap.
+    ack: Option<Vec<u8>>,
+}
+
+fn store_incoming_chat(device_id: &str, body: &[u8]) -> Result<Landed, String> {
     with_core_mut(|core| {
         let now = now_millis();
         let thread = ensure_thread(core, device_id, now)?;
@@ -1715,7 +1759,10 @@ fn store_incoming_chat(device_id: &str, body: &[u8]) -> Result<Option<CoreEvent>
                 // written it would be worse than dropping it. Nothing moved, so
                 // there is nothing to keep.
                 log::warn!("dropping a chat message that would not open: {why}");
-                return Ok(None);
+                return Ok(Landed {
+                    event: None,
+                    ack: None,
+                });
             }
         };
         let advanced = advanced.as_ref().map(|s| s.as_slice());
@@ -1733,7 +1780,10 @@ fn store_incoming_chat(device_id: &str, body: &[u8]) -> Result<Option<CoreEvent>
                 if let Some(advanced) = advanced {
                     core.store.start_ratchet(thread, advanced, now)?;
                 }
-                return Ok(None);
+                return Ok(Landed {
+                    event: None,
+                    ack: None,
+                });
             }
         };
 
@@ -1770,7 +1820,12 @@ fn store_incoming_chat(device_id: &str, body: &[u8]) -> Result<Option<CoreEvent>
                 if let Some(advanced) = advanced {
                     core.store.start_ratchet(thread, advanced, now)?;
                 }
-                return Ok(None);
+                // Not acknowledged. The chain moved, but nothing was stored,
+                // and an ack asserts that this end *has* the message.
+                return Ok(Landed {
+                    event: None,
+                    ack: None,
+                });
             }
         };
 
@@ -1799,19 +1854,126 @@ fn store_incoming_chat(device_id: &str, body: &[u8]) -> Result<Option<CoreEvent>
         // first, and one that resent after we lost our position would pass the
         // second — neither covers the other's case.
         if outcome == InsertOutcome::Duplicate {
-            log::debug!("dropping a chat message the store already had");
-            return Ok(None);
+            // Acked all the same. A duplicate means the sender never heard the
+            // first one, so staying quiet leaves its row claiming less than the
+            // truth for ever — and this end already has the message, which is
+            // the whole of what an ack asserts.
+            //
+            // No test reaches this and the mutation to `ack: None` survives. On
+            // a paired thread a byte-identical resend is refused by the ratchet
+            // before the store is consulted at all — that is what makes a
+            // resend cost no message key — so arriving here needs a repeat this
+            // end can still open, which means a position lost and recovered.
+            // The harness can produce neither. Recorded as a guard on a state
+            // nothing here can build rather than left to read as dead code.
+            return Ok(Landed {
+                event: None,
+                ack: seal_ack(core, thread, &envelope.msg_id, now)?,
+            });
         }
-        Ok(Some(CoreEvent::MessageReceived {
-            thread_id: thread,
-            msg_id: hex::encode(envelope.msg_id),
-            // From the opened envelope, which on a paired thread is not what
-            // arrived on the wire. The event is what the screen draws the
-            // moment a message lands — built from the raw frame, a thread
-            // already open showed a ratchet header and a block of ciphertext,
-            // and only reading it again put the real line there.
-            text: String::from_utf8_lossy(&envelope.body).into_owned(),
-        }))
+        let ack = seal_ack(core, thread, &envelope.msg_id, now)?;
+        Ok(Landed {
+            ack,
+            event: Some(CoreEvent::MessageReceived {
+                thread_id: thread,
+                msg_id: hex::encode(envelope.msg_id),
+                // From the opened envelope, which on a paired thread is not what
+                // arrived on the wire. The event is what the screen draws the
+                // moment a message lands — built from the raw frame, a thread
+                // already open showed a ratchet header and a block of ciphertext,
+                // and only reading it again put the real line there.
+                text: String::from_utf8_lossy(&envelope.body).into_owned(),
+            }),
+        })
+    })
+}
+
+/// The thread a peer's traffic belongs to, without creating one.
+///
+/// The read-only counterpart of `ensure_thread`. An acknowledgement is about a
+/// conversation that already exists by definition, so a lookup that opened one
+/// would be inventing a conversation out of somebody else's bytes.
+fn thread_for_peer(core: &Core, device_id: &str) -> Result<Option<i64>, StoreError> {
+    let Some(contact) = contact_id_for_device(core, device_id)? else {
+        return Ok(None);
+    };
+    core.store.thread_for_contact(contact)
+}
+
+/// Seal an acknowledgement for a message just stored, and make the turn durable
+/// before the caller sends it.
+///
+/// Sealing spends a message key on this end's *sending* chain, so an ack costs
+/// the same as a short chat line — a conversation where one person only listens
+/// still turns its own chain once per message received. That is the price of
+/// the ack being unforgeable, and it is paid in the one currency the ratchet
+/// cannot refill, so it is worth saying out loud.
+///
+/// The advanced state is written here, before anything goes out, for the reason
+/// `commit_sent` gives: a counter that rewinds reuses a nonce. Seal, commit,
+/// send — in that order or not at all.
+///
+/// `None` on an unpaired thread. There is nothing to seal with, and an unsealed
+/// ack would be a forgeable claim that a message arrived.
+fn seal_ack(
+    core: &mut Core,
+    thread: i64,
+    msg_id: &[u8; MSG_ID_LEN],
+    now: i64,
+) -> Result<Option<Vec<u8>>, StoreError> {
+    match seal_for_thread(core, thread, msg_id)? {
+        Outgoing::Ready {
+            body,
+            ratchet: Some(advanced),
+        } => {
+            core.store.start_ratchet(thread, &advanced, now)?;
+            Ok(Some(body))
+        }
+        // Unpaired: nothing to seal with, and nothing to say.
+        Outgoing::Ready { ratchet: None, .. } => Ok(None),
+        // Paired, but this end cannot write yet — the chain opens when the
+        // other side speaks first, which it just did, so this is a moment that
+        // does not outlast the opening.
+        Outgoing::NoChainYet => Ok(None),
+    }
+}
+
+/// Mark the message an acknowledgement names as delivered.
+///
+/// Opening it advances this end's receiving chain, exactly as a chat line
+/// would, and the advanced state has to land whether or not the row updates —
+/// the chain moved either way.
+fn mark_delivered(device_id: &str, body: &[u8]) -> Result<(), String> {
+    with_core_mut(|core| {
+        let now = now_millis();
+        let Some(thread) = thread_for_peer(core, device_id)? else {
+            return Ok(());
+        };
+        let Incoming {
+            plaintext,
+            ratchet: advanced,
+        } = match open_for_thread(core, thread, body) {
+            Ok(opened) => opened,
+            Err(why) => {
+                log::warn!("dropping an acknowledgement that would not open: {why}");
+                return Ok(());
+            }
+        };
+        if let Some(advanced) = advanced.as_ref() {
+            core.store.start_ratchet(thread, advanced, now)?;
+        }
+        let Ok(msg_id) = <[u8; MSG_ID_LEN]>::try_from(plaintext.as_slice()) else {
+            log::warn!("an acknowledgement did not name a message");
+            return Ok(());
+        };
+        // Only ever forwards. A row already `Delivered` stays there, and one
+        // still `Queued` is not promoted by an ack for bytes that have not
+        // left — which cannot happen, but the store is where that stays true.
+        if core.store.message_state(&msg_id)? == Some(MessageState::Sent) {
+            core.store
+                .set_message_state(&msg_id, MessageState::Delivered)?;
+        }
+        Ok(())
     })
 }
 

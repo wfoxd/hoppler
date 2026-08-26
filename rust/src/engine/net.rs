@@ -131,6 +131,12 @@ pub enum NetEvent {
     /// over-long body) threw away a message that would have opened, and with it
     /// the chain step the sender had already taken.
     ChatReceived { peer: PeerId, body: Vec<u8> },
+    /// A peer says it has stored a chat message ([`FrameKind::Ack`]).
+    ///
+    /// Carries the sealed bytes and nothing else, for the same reason
+    /// [`NetEvent::ChatReceived`] does: only the engine holds the ratchet, and
+    /// only the engine knows which thread this belongs to.
+    ChatAcked { peer: PeerId, body: Vec<u8> },
     /// A peer opened its end of a paired thread's ratchet chain
     /// ([`FrameKind::Opening`]).
     ///
@@ -918,6 +924,17 @@ impl Net {
         self.send_frame(peer, FrameKind::Opening, body, now)
     }
 
+    /// Say that a chat message has been stored, so the sender's row can stop
+    /// claiming only that the bytes left.
+    ///
+    /// `body` is a sealed `msg_id`, and it is sealed for the reason
+    /// [`FrameKind::Ack`] gives: an unsealed one is a forgeable delivery claim.
+    /// This layer holds no ratchet, so it seals nothing and reads nothing — it
+    /// carries what the engine hands it, exactly as it does for a chat line.
+    pub fn send_ack(&self, peer: &str, body: Vec<u8>, now: Instant) -> Result<(), SendError> {
+        self.send_frame(peer, FrameKind::Ack, body, now)
+    }
+
     /// One turn of the engine's clock: drop sessions that have gone quiet, then
     /// rotate the advertised id if it is due.
     ///
@@ -1477,6 +1494,12 @@ impl Net {
                     peer: peer.to_string(),
                     body: frame.payload.clone(),
                 }),
+                // Sealed, like a chat line, and passed on unread for the same
+                // reason: the ratchet that opens it lives in the store.
+                FrameKind::Ack => out.push(NetEvent::ChatAcked {
+                    peer: peer.to_string(),
+                    body: frame.payload.clone(),
+                }),
                 FrameKind::Ceremony => {
                     out.extend(self.on_ceremony_frame(peer, &frame.payload, now))
                 }
@@ -1598,7 +1621,7 @@ mod tests {
                 initiator.finish(&reply),
                 Err(HandshakeError::VersionMismatch {
                     theirs: 200,
-                    ours: 1
+                    ours: 2
                 })
             ),
             "the dialling side did not refuse a foreign version"
@@ -1644,7 +1667,7 @@ mod tests {
                 out.as_slice(),
                 [NetEvent::SessionRefused {
                     their_version: 200,
-                    our_version: 1,
+                    our_version: 2,
                     ..
                 }]
             ),
