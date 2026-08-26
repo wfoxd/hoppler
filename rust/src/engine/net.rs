@@ -48,7 +48,7 @@ use crate::pairing::ceremony::{Ceremony, CeremonyError, Paired, Step};
 use crate::pairing::invite::Invite;
 use crate::pairing::sas::Sas;
 use crate::session::frame::{Frame, FrameKind};
-use crate::session::handshake::{Established, Initiator, Responder};
+use crate::session::handshake::{Established, HandshakeError, Initiator, Responder};
 use crate::session::ratchet::Ratchet;
 use crate::session::table::SessionTable;
 use crate::transport::{PeerId, Transport, TransportError, TransportEvent};
@@ -173,6 +173,22 @@ pub enum NetEvent {
     /// A ceremony ended without pairing. Every abort path arrives here, and
     /// none of them has written anything.
     PairingFailed { peer: PeerId, why: String },
+    /// We dialled someone whose build speaks a different protocol version, so
+    /// the session was refused (see [`crate::protocol`]).
+    ///
+    /// The *only* handshake failure that produces an event. Every other one
+    /// stays silent on purpose: they are indistinguishable from an attacker
+    /// probing, and R0-F10 needs a blocked peer to look exactly like a peer who
+    /// is not there. A version mismatch is different in kind — it is not a
+    /// judgement about who is calling, it is a fact about two builds, and it is
+    /// the one failure where the honest thing to tell the user is also
+    /// actionable. Raised on the dialling side only, where somebody actually
+    /// asked for something and is owed an answer.
+    SessionRefused {
+        peer: PeerId,
+        their_version: u8,
+        our_version: u8,
+    },
 }
 
 /// How long a ceremony may sit before it is abandoned.
@@ -1161,6 +1177,21 @@ impl Net {
         }
     }
 
+    /// Seed a peer's persona, skipping the discovery fetch.
+    ///
+    /// For tests that need this side holding a pending handshake without a
+    /// second `Net` on the other end. The version gate is the case that needs
+    /// it: both `Net`s in one process compile the same `PROTOCOL_VERSION`, so a
+    /// disagreement can only come from a hand-rolled peer, and that peer has no
+    /// persona endpoint to fetch from.
+    #[cfg(test)]
+    pub fn learn_persona_for_test(&self, peer: &str, persona: VerifiedPersona) {
+        self.known
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(peer.to_string(), persona);
+    }
+
     /// Open a handshake — **at most one at a time per peer**.
     ///
     /// The guard lives here rather than only at the call sites because there
@@ -1285,6 +1316,14 @@ impl Net {
         if let Some(initiator) = waiting {
             return match initiator.finish(bytes) {
                 Ok(established) => self.adopt(peer, established, now),
+                Err(HandshakeError::VersionMismatch { theirs, ours }) => {
+                    log::warn!("{peer} speaks protocol version {theirs}, we speak {ours}");
+                    vec![NetEvent::SessionRefused {
+                        peer: peer.to_string(),
+                        their_version: theirs,
+                        our_version: ours,
+                    }]
+                }
                 Err(e) => {
                     log::warn!("handshake reply from {peer} rejected: {e:?}");
                     Vec::new()
@@ -1510,8 +1549,108 @@ fn radio_log(available: bool, reason: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{radio_log, speaks_first};
+    use super::*;
     use crate::crypto::{dh, sign};
+
+    /// A peer on another protocol version is refused, and the dialling side is
+    /// told why.
+    ///
+    /// The reason the version went in the intro payload rather than the Noise
+    /// prologue is that a mismatch can *name itself*. A prologue refuses just
+    /// as safely and leaves the user staring at somebody who never connects —
+    /// so the event is the feature, and this is the test of it.
+    ///
+    /// The far side is a hand-rolled Noise responder, because both `Net`s in
+    /// this process compile the same `PROTOCOL_VERSION` and a disagreement can
+    /// only be built by hand. Its intro is a single version byte and nothing
+    /// else: `decode_intro` reads the version before it believes any length, so
+    /// there is deliberately nothing behind it to believe.
+    #[test]
+    fn a_peer_on_another_protocol_version_is_refused_with_a_reason() {
+        use crate::identity::Identity;
+        use crate::session::handshake::{Initiator, MAX_NOISE_MESSAGE, NOISE_PARAMS};
+        use snow::Builder;
+
+        let alice = Identity::generate("Alice", 1);
+        let bob = Identity::generate("Bob", 2);
+        let bob_persona = crate::identity::verify_persona_record(&bob.persona_record()).unwrap();
+
+        // Alice dials, and holds the initiator half.
+        let (initiator, first) = Initiator::start(&alice, &bob_persona).unwrap();
+
+        // Bob's build, from another version. Same keys, same pattern — only the
+        // number in the intro differs.
+        let secret = bob.session_secret();
+        let mut state = Builder::new(NOISE_PARAMS.parse().unwrap())
+            .local_private_key(&*secret.expose_secret())
+            .unwrap()
+            .build_responder()
+            .unwrap();
+        let mut scratch = vec![0u8; MAX_NOISE_MESSAGE];
+        state.read_message(&first, &mut scratch).unwrap();
+        let mut reply = vec![0u8; MAX_NOISE_MESSAGE];
+        let n = state.write_message(&[200u8], &mut reply).unwrap();
+        reply.truncate(n);
+
+        // The detection.
+        assert!(
+            matches!(
+                initiator.finish(&reply),
+                Err(HandshakeError::VersionMismatch {
+                    theirs: 200,
+                    ours: 1
+                })
+            ),
+            "the dialling side did not refuse a foreign version"
+        );
+
+        // And the report, through the real path: a `Net` holding this pending
+        // handshake, handed these bytes. Asserting on a helper that rebuilt the
+        // event would only prove the helper works — the arm in `on_session` is
+        // what has to fire, and nothing else in the handshake path raises an
+        // event on failure, so dropping it is otherwise invisible.
+        let air = crate::transport::loopback::LoopbackNet::new();
+        let transport: Arc<dyn Transport> = Arc::new(air.join("alice", Box::new(|_| {})));
+        let net = Net::new(
+            transport,
+            Arc::new(Mutex::new(alice)),
+            "alice",
+            Instant::now(),
+        );
+        // This Net's own dial, so the reply below is the one it is waiting for.
+        let (pending, first) = {
+            let id = net.identity.lock().unwrap_or_else(|e| e.into_inner());
+            Initiator::start(&id, &bob_persona).unwrap()
+        };
+        let secret = bob.session_secret();
+        let mut state = Builder::new(NOISE_PARAMS.parse().unwrap())
+            .local_private_key(&*secret.expose_secret())
+            .unwrap()
+            .build_responder()
+            .unwrap();
+        let mut scratch = vec![0u8; MAX_NOISE_MESSAGE];
+        state.read_message(&first, &mut scratch).unwrap();
+        let mut reply = vec![0u8; MAX_NOISE_MESSAGE];
+        let n = state.write_message(&[200u8], &mut reply).unwrap();
+        reply.truncate(n);
+
+        net.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("bob".to_string(), pending);
+        let out = net.on_session("bob", &reply, Instant::now());
+        assert!(
+            matches!(
+                out.as_slice(),
+                [NetEvent::SessionRefused {
+                    their_version: 200,
+                    our_version: 1,
+                    ..
+                }]
+            ),
+            "the dialling side was not told why; got {out:?}"
+        );
+    }
 
     /// Exactly one side speaks first, whichever way round you ask.
     ///

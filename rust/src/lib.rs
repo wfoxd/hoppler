@@ -7,6 +7,7 @@ pub mod identity;
 pub mod pairing;
 pub mod platform;
 pub mod proto;
+pub mod protocol;
 pub mod session;
 pub mod store;
 pub mod transport;

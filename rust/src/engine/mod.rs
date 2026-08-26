@@ -1613,6 +1613,24 @@ fn on_net_event(net: &Arc<net::Net>, event: net::NetEvent) {
                 reason: why,
             });
         }
+        net::NetEvent::SessionRefused {
+            peer,
+            their_version,
+            our_version,
+        } => {
+            // Reported as a Ping failure because reaching someone is what the
+            // user did, and this is the answer to it. A dedicated event would
+            // be a second way to say "that did not work" for the UI to route,
+            // and the reason string is where the difference actually lives.
+            emit(CoreEvent::PingFailed {
+                device_id: peer,
+                reason: if their_version < our_version {
+                    "their app is an older version — they need to update".to_string()
+                } else {
+                    "their app is a newer version — you need to update".to_string()
+                },
+            });
+        }
         net::NetEvent::ChatReceived { peer, body } => {
             let _ = net;
             if let Ok(Some(event)) = store_incoming_chat(&peer, &body) {

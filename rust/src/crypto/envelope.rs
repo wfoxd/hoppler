@@ -2,6 +2,23 @@
 //!
 //! Wire format: `[1 version byte][protobuf Envelope]`. The version byte lives
 //! outside the protobuf so an unknown version is rejected before any parsing.
+//!
+//! # Nothing sends these
+//!
+//! **This module has no caller outside its own tests.** The live paths frame
+//! differently — `engine::pipe` for the channel split, `session::frame` inside
+//! Noise — and none of them carries [`WIRE_VERSION_V0`]. It is kept because the
+//! shape is right and the tech spec asks for it, not because it guards
+//! anything.
+//!
+//! That mattered once. T12 recorded a release blocker — the meaning of a `Chat`
+//! body changed with no way to refuse an older build — and deferred it on the
+//! grounds that "`WIRE_VERSION_V0` is checked before any parsing, so the tool
+//! for refusing an incompatible peer outright already exists". It does not: a
+//! constant nothing transmits cannot turn anybody away. The gate that does the
+//! job lives in [`crate::protocol`], and it is a different number in a
+//! different place. If this module ever gains a caller, that is the version to
+//! reach for.
 
 use prost::Message;
 

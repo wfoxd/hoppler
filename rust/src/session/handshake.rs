@@ -49,6 +49,7 @@ use snow::{Builder, HandshakeState, TransportState};
 
 use crate::crypto::{dh, sign};
 use crate::identity::{self, Identity, VerifiedPersona};
+use crate::protocol::PROTOCOL_VERSION;
 
 /// The suite, pinned. Recorded for T22 rather than left to a default:
 /// X25519 + ChaCha20-Poly1305 + BLAKE2s, matching the primitives T04 already
@@ -76,6 +77,12 @@ pub enum HandshakeError {
     PseudonymMismatch,
     /// A payload larger than [`MAX_HANDSHAKE_PAYLOAD`].
     PayloadTooLarge,
+    /// The peer speaks a different protocol version, so the two builds disagree
+    /// about what the bytes after this handshake would mean.
+    ///
+    /// Raised before the persona is even looked at, and it ends the session:
+    /// see [`crate::protocol`] for why refusing beats connecting.
+    VersionMismatch { theirs: u8, ours: u8 },
 }
 
 impl std::fmt::Display for HandshakeError {
@@ -87,13 +94,22 @@ impl std::fmt::Display for HandshakeError {
                 write!(f, "static key does not match the persona presented with it")
             }
             HandshakeError::PayloadTooLarge => write!(f, "handshake payload too large"),
+            HandshakeError::VersionMismatch { theirs, ours } => write!(
+                f,
+                "peer speaks protocol version {theirs}, this build speaks {ours}"
+            ),
         }
     }
 }
 
 impl std::error::Error for HandshakeError {}
 
-/// The handshake payload: `[record_len:2][persona record][signature:64]`.
+/// The handshake payload:
+/// `[version:1][record_len:2][persona record][signature:64]`.
+///
+/// The version leads, so it is read before any length is trusted — a peer
+/// cannot make us act on a field belonging to a layout we do not speak. See
+/// [`crate::protocol`] for why the number is 1 and what a 0 means.
 ///
 /// The signature binds the persona to the static this side is presenting. It
 /// has to travel with the record because the verifier cannot derive it: an
@@ -113,14 +129,28 @@ pub(crate) fn encode_intro(
     our_static: &dh::DhPublic,
 ) -> Result<Vec<u8>, HandshakeError> {
     let record = us.persona_record();
-    if record.len() > MAX_HANDSHAKE_PAYLOAD {
-        return Err(HandshakeError::PayloadTooLarge);
-    }
     let signature = us.bind_session_static(our_static);
-    let mut out = Vec::with_capacity(2 + record.len() + sign::SIGNATURE_LEN);
+    let mut out = Vec::with_capacity(1 + 2 + record.len() + sign::SIGNATURE_LEN);
+    out.push(PROTOCOL_VERSION);
     out.extend_from_slice(&(record.len() as u16).to_be_bytes());
     out.extend_from_slice(&record);
     out.extend_from_slice(&signature.0);
+    // The assembled payload, not the record inside it. `decode_intro` bounds
+    // what it *reads*, so bounding something smaller here leaves a band of
+    // records this side would send and the other must refuse — a message that
+    // fails for a reason neither end can see. The version byte widened that
+    // band by one; it was already there.
+    //
+    // Unreachable today, and kept anyway. A persona record is a Layer-2 key, a
+    // name capped at `MAX_PERSONA_NAME_LEN`, a colour, a version, a session
+    // static and a signature — around 280 bytes assembled, against a cap of
+    // 4096. Nothing can currently produce a payload this rejects, which is why
+    // no test drives it and why the mutation back to `record.len()` survives:
+    // the two spellings cannot be told apart by any input the type system
+    // allows. It is the asymmetry that is the bug, not a size anybody has hit.
+    if out.len() > MAX_HANDSHAKE_PAYLOAD {
+        return Err(HandshakeError::PayloadTooLarge);
+    }
     Ok(out)
 }
 
@@ -132,19 +162,31 @@ pub(crate) fn decode_intro(
     if payload.len() > MAX_HANDSHAKE_PAYLOAD {
         return Err(HandshakeError::PayloadTooLarge);
     }
-    if payload.len() < 2 + sign::SIGNATURE_LEN {
+    // The version first, and before any length is believed. Everything below
+    // this line is a layout claim, and a peer that does not speak our version
+    // has made no promise about any of it.
+    let (&theirs, rest) = payload.split_first().ok_or(HandshakeError::Persona(
+        identity::IdentityError::MalformedRecord,
+    ))?;
+    if theirs != PROTOCOL_VERSION {
+        return Err(HandshakeError::VersionMismatch {
+            theirs,
+            ours: PROTOCOL_VERSION,
+        });
+    }
+    if rest.len() < 2 + sign::SIGNATURE_LEN {
         return Err(HandshakeError::Persona(
             identity::IdentityError::MalformedRecord,
         ));
     }
-    let record_len = u16::from_be_bytes([payload[0], payload[1]]) as usize;
-    if payload.len() != 2 + record_len + sign::SIGNATURE_LEN {
+    let record_len = u16::from_be_bytes([rest[0], rest[1]]) as usize;
+    if rest.len() != 2 + record_len + sign::SIGNATURE_LEN {
         return Err(HandshakeError::Persona(
             identity::IdentityError::MalformedRecord,
         ));
     }
-    let record = &payload[2..2 + record_len];
-    let sig_bytes: [u8; sign::SIGNATURE_LEN] = payload[2 + record_len..]
+    let record = &rest[2..2 + record_len];
+    let sig_bytes: [u8; sign::SIGNATURE_LEN] = rest[2 + record_len..]
         .try_into()
         .map_err(|_| HandshakeError::Persona(identity::IdentityError::MalformedRecord))?;
 
@@ -366,6 +408,132 @@ mod tests {
         (alice, bob, bob_persona)
     }
 
+    /// What this side will send stays inside what the other will read.
+    ///
+    /// Review found `encode_intro` bounding the persona record while
+    /// `decode_intro` bounds the whole payload, which leaves a band of records
+    /// one end would send and the other must refuse. The encoder now measures
+    /// the assembled bytes.
+    ///
+    /// **This cannot currently be violated**, which is why the assertion is on
+    /// a real identity rather than a crafted one: a persona record is around
+    /// 280 bytes assembled against a 4096 cap, and `MAX_PERSONA_NAME_LEN` is
+    /// what holds it there. The mutation back to `record.len()` therefore
+    /// survives, and would go on surviving however this test were written —
+    /// no input the type system allows can tell the two spellings apart. What
+    /// is pinned here is the margin: if a record ever grows toward the cap,
+    /// this fails long before the asymmetry becomes reachable on a wire.
+    #[test]
+    fn an_intro_stays_well_inside_the_cap_it_is_read_against() {
+        let (alice, _bob, bob_persona) = pair();
+        let alice_static = alice.pseudonym_toward(&bob_persona.l2_pub);
+        let intro = encode_intro(&alice, &alice_static).unwrap();
+        assert!(
+            intro.len() < MAX_HANDSHAKE_PAYLOAD / 4,
+            "an intro is {} bytes against a {MAX_HANDSHAKE_PAYLOAD}-byte cap — \
+             the headroom the encoder relies on has gone",
+            intro.len()
+        );
+        // And the reader's bound is on the same quantity the writer just checked.
+        let too_big = vec![0u8; MAX_HANDSHAKE_PAYLOAD + 1];
+        assert!(matches!(
+            decode_intro(&too_big, &dh::DhPublic([0; 32])),
+            Err(HandshakeError::PayloadTooLarge)
+        ));
+    }
+
+    /// An intro built the way every build before the version gate built one.
+    fn intro_before_the_gate(us: &Identity, our_static: &dh::DhPublic) -> Vec<u8> {
+        let record = us.persona_record();
+        let signature = us.bind_session_static(our_static);
+        let mut out = Vec::new();
+        out.extend_from_slice(&(record.len() as u16).to_be_bytes());
+        out.extend_from_slice(&record);
+        out.extend_from_slice(&signature.0);
+        out
+    }
+
+    /// The release blocker, as a test.
+    ///
+    /// A build from before the gate sends `[record_len:2][record][sig]`, and a
+    /// persona record is a couple of hundred bytes, so its first byte is zero.
+    /// That is why [`PROTOCOL_VERSION`] starts at 1: the older peer is turned
+    /// away *and named*, rather than producing some length that happens not to
+    /// parse.
+    #[test]
+    fn a_build_from_before_the_gate_is_refused_and_identified() {
+        let (alice, bob, bob_persona) = pair();
+        let alice_static = alice.pseudonym_toward(&bob_persona.l2_pub);
+        let old = intro_before_the_gate(&alice, &alice_static);
+        let message = forged_first_message(&alice, &bob_persona, &old);
+
+        assert!(
+            matches!(
+                Responder::read_first(&bob, &message),
+                Err(HandshakeError::VersionMismatch { theirs: 0, ours: 1 })
+            ),
+            "an older build was not refused by version"
+        );
+    }
+
+    /// And a version from the future is refused the same way, rather than being
+    /// read as far as it happens to parse.
+    #[test]
+    fn a_version_we_do_not_speak_is_refused() {
+        let (alice, bob, bob_persona) = pair();
+        let alice_static = alice.pseudonym_toward(&bob_persona.l2_pub);
+        let mut future = encode_intro(&alice, &alice_static).unwrap();
+        future[0] = 200;
+        let message = forged_first_message(&alice, &bob_persona, &future);
+
+        assert!(matches!(
+            Responder::read_first(&bob, &message),
+            Err(HandshakeError::VersionMismatch {
+                theirs: 200,
+                ours: 1
+            })
+        ));
+    }
+
+    /// The version is read before any length is believed.
+    ///
+    /// A peer that does not speak our version has made no promise about the
+    /// bytes behind it, so acting on one of its length fields — even to reject
+    /// it — is trusting a layout we have just established we do not share. This
+    /// payload is *only* a wrong version; there is nothing behind it at all.
+    #[test]
+    fn the_version_is_checked_before_the_length() {
+        let (_alice, bob, _bob_persona) = pair();
+        assert!(matches!(
+            decode_intro(&[9], &dh::DhPublic([0; 32])),
+            Err(HandshakeError::VersionMismatch { theirs: 9, ours: 1 })
+        ));
+        let _ = bob;
+    }
+
+    /// An empty payload is malformed, not a version mismatch — there is no
+    /// version in it to disagree with.
+    #[test]
+    fn an_empty_intro_is_malformed() {
+        assert!(matches!(
+            decode_intro(&[], &dh::DhPublic([0; 32])),
+            Err(HandshakeError::Persona(
+                identity::IdentityError::MalformedRecord
+            ))
+        ));
+    }
+
+    /// Two builds that agree still talk. The gate must refuse the wrong version
+    /// without refusing the right one.
+    #[test]
+    fn matching_versions_still_complete() {
+        let (alice, bob, bob_persona) = pair();
+        let (initiator, first) = Initiator::start(&alice, &bob_persona).unwrap();
+        let pending = Responder::read_first(&bob, &first).unwrap();
+        let (_established, reply) = pending.accept(&bob).unwrap();
+        assert!(initiator.finish(&reply).is_ok());
+    }
+
     /// The impersonation the binding exists to stop.
     ///
     /// A persona record is public — anyone who has discovered Alice holds hers.
@@ -383,6 +551,9 @@ mod tests {
         let alice_record = alice.persona_record();
 
         let mut payload = Vec::new();
+        // A current version, so the forgery is refused for the reason under
+        // test rather than turned away at the version gate.
+        payload.push(PROTOCOL_VERSION);
         payload.extend_from_slice(&(alice_record.len() as u16).to_be_bytes());
         payload.extend_from_slice(&alice_record);
         payload.extend_from_slice(&[0u8; sign::SIGNATURE_LEN]);
@@ -409,6 +580,9 @@ mod tests {
         let sig = mallory.bind_session_static(&mallory_static);
 
         let mut payload = Vec::new();
+        // A current version, so the forgery is refused for the reason under
+        // test rather than turned away at the version gate.
+        payload.push(PROTOCOL_VERSION);
         payload.extend_from_slice(&(alice_record.len() as u16).to_be_bytes());
         payload.extend_from_slice(&alice_record);
         payload.extend_from_slice(&sig.0);
