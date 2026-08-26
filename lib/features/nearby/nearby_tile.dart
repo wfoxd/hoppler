@@ -61,12 +61,28 @@ class NearbyTile extends StatelessWidget {
   /// nothing.
   static const awayHint = 'Ping and Drop need them nearby.';
 
+  /// A disabled control that still swallows the tap that lands on it.
+  ///
+  /// An `IconButton` with no callback registers no gesture, so the tap carries
+  /// straight through to whatever is behind — here the row, which would open a
+  /// conversation. That is the one reading a person would least expect from a
+  /// control shown greyed out beside the words "Ping and Drop need them
+  /// nearby": they tapped the thing that says it is unavailable, and something
+  /// else happened.
+  ///
+  /// A `GestureDetector` rather than an `AbsorbPointer`, so the long press that
+  /// shows the tooltip still gets through. Taps compete in the gesture arena
+  /// and the deepest recogniser wins, which is this one.
+  static Widget _unavailable(Widget button) =>
+      GestureDetector(onTap: () {}, child: button);
+
   @override
   Widget build(BuildContext context) {
     return ListTile(
-      // The whole row bar the buttons: avatar, name and subtitle. Flutter gives
-      // the trailing controls their own hit targets, so Ping and Drop still do
-      // their own thing rather than opening a conversation by accident.
+      // The whole row bar the buttons: avatar, name and subtitle. An enabled
+      // control keeps its own hit target and wins the gesture arena by being
+      // deeper in the tree — a *disabled* one does not, which is why the two
+      // below are wrapped. See [`_unavailable`].
       onTap: onOpen,
       leading: CircleAvatar(
         // Colour arrives with the persona. Until then it is 0, which renders as
@@ -93,19 +109,30 @@ class NearbyTile extends StatelessWidget {
               deviceId: device.deviceId!,
             )
           else
-            const IconButton(
-              icon: Icon(Icons.notifications_none),
-              tooltip: awayHint,
-              // Deliberately shown and disabled rather than removed. A row that
-              // loses its buttons when somebody walks away looks broken; one
-              // whose buttons are visibly unavailable says what changed.
-              onPressed: null,
+            // Deliberately shown and disabled rather than removed. A row that
+            // loses its buttons when somebody walks away looks broken; one
+            // whose buttons are visibly unavailable says what changed.
+            _unavailable(
+              const IconButton(
+                icon: Icon(Icons.notifications_none),
+                tooltip: awayHint,
+                onPressed: null,
+              ),
             ),
-          IconButton(
-            icon: const Icon(Icons.upload_file_outlined),
-            tooltip: isHere ? 'Drop' : awayHint,
-            onPressed: isHere ? onDrop : null,
-          ),
+          if (isHere)
+            IconButton(
+              icon: const Icon(Icons.upload_file_outlined),
+              tooltip: 'Drop',
+              onPressed: onDrop,
+            )
+          else
+            _unavailable(
+              const IconButton(
+                icon: Icon(Icons.upload_file_outlined),
+                tooltip: awayHint,
+                onPressed: null,
+              ),
+            ),
         ],
       ),
     );

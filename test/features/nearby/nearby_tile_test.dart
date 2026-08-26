@@ -115,6 +115,30 @@ void main() {
     expect(opened, isEmpty, reason: 'Drop opened a conversation instead');
   });
 
+  // And the *disabled* ones are not the row either, which is the case that does
+  // not come for free: a button with no callback registers no gesture, so
+  // without help the tap carries straight through to whatever is behind it —
+  // here, the row. The tile says these two are unavailable while somebody is
+  // away, and opening a conversation is the one reading a person would least
+  // expect from a control shown greyed out.
+  testWidgets('the disabled buttons on an away row are not the row either', (
+    tester,
+  ) async {
+    final opened = await pump(tester, _away(name: 'Wren'));
+
+    final blocked = find.byTooltip(NearbyTile.awayHint);
+    expect(blocked, findsWidgets, reason: 'nothing was shown as unavailable');
+    for (var i = 0; i < blocked.evaluate().length; i++) {
+      await tester.tap(blocked.at(i));
+      await tester.pump();
+    }
+    expect(
+      opened,
+      isEmpty,
+      reason: 'a tap on an unavailable button opened a conversation',
+    );
+  });
+
   // R0-F2 rotates ids and R0-F4 makes pairing durable, so a paired friend is on
   // the list for most of the day without being reachable. The row has to say
   // which of those two things is true right now.
