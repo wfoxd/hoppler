@@ -31,8 +31,15 @@
 //!
 //! **Bound to an epoch**, which is what keeps a recording from working forever.
 //! Without it the hint is a fixed function of an id, and anyone who copies down
-//! the pair can replay it at any future date and be greeted as a friend. With
-//! it, that window closes after [`super::ROTATION_PERIOD`].
+//! the pair can replay it at any future date and be greeted as a friend.
+//!
+//! The window that closes is wider than one [`super::ROTATION_PERIOD`], because
+//! [`written_by`] accepts the neighbouring epochs too. A hint written in epoch
+//! W verifies for as long as the reader's own clock reads W-1, W or W+1 — so
+//! from the moment it was written, somewhere between two and three periods, or
+//! **24 to 36 minutes** at the current cadence. That is the price of tolerating
+//! two devices that disagree about the time, and it is the number to quote
+//! rather than the period itself.
 //!
 //! # What it costs, stated
 //!
@@ -57,10 +64,18 @@ const CONTEXT: &[u8] = b"hoppler/advert-hint/v1";
 
 /// Which epoch a wall-clock instant falls in.
 ///
-/// `div_euclid` rather than `/`, so a clock that reports a moment before 1970
-/// — which `now_millis` will do for a device whose clock has not been set —
-/// still lands on a consistent grid instead of folding two epochs into one
-/// around zero.
+/// `div_euclid` rather than `/`, so the grid stays even on both sides of zero.
+/// Truncating division rounds toward zero, which folds the epoch before 1970
+/// and the one after it into a single number — one epoch twice as long as every
+/// other, and a hint that keeps verifying across it.
+///
+/// Neither clock in the tree reaches that today: `system_millis` and
+/// `engine::now_millis` both report 0 rather than a negative on a clock they
+/// cannot read. This is about the function being total rather than about a
+/// failure anybody has seen — it takes an `i64` from a caller-supplied clock,
+/// and a discontinuity that only appears for inputs the current callers happen
+/// not to produce is the kind that surfaces years later as a bug in something
+/// else.
 pub fn epoch_at(now_ms: i64) -> i64 {
     now_ms.div_euclid(super::ROTATION_PERIOD.as_millis() as i64)
 }
@@ -134,7 +149,10 @@ fn same_bytes(a: &[u8; HINT_LEN], b: &[u8; HINT_LEN]) -> bool {
 mod tests {
     use super::*;
 
-    const PERIOD_MS: i64 = 12 * 60 * 1000;
+    /// Derived, never restated: a test that hardcoded twelve minutes would go
+    /// on passing against a changed [`super::super::ROTATION_PERIOD`] while
+    /// saying nothing about it.
+    const PERIOD_MS: i64 = super::super::ROTATION_PERIOD.as_millis() as i64;
     const KEY: [u8; HASH_LEN] = [3u8; HASH_LEN];
     const OTHER_KEY: [u8; HASH_LEN] = [4u8; HASH_LEN];
 

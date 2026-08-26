@@ -114,7 +114,10 @@ fn node(net: &LoopbackNet, id: &str, now: Instant) -> Node {
 /// A wall-clock instant far enough from zero that a test can step either side
 /// of an epoch boundary without the arithmetic going negative by accident.
 const EPOCH_ZERO: i64 = 1_000 * PERIOD_MS;
-const PERIOD_MS: i64 = 12 * 60 * 1000;
+/// Derived from the real constant rather than restated. A hardcoded twelve
+/// minutes would keep passing against a changed `ROTATION_PERIOD` while quietly
+/// no longer testing an epoch boundary at all.
+const PERIOD_MS: i64 = ROTATION_PERIOD.as_millis() as i64;
 
 /// Everything a requester gets back after asking, as raw bytes.
 ///
