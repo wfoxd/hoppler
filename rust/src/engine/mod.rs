@@ -41,7 +41,7 @@ use crate::discovery::{hint, Sighting};
 use crate::frb_generated::StreamSink;
 use crate::identity::filekeystore::FileKeystore;
 use crate::identity::keystore::Keystore;
-use crate::identity::{Identity, Persona};
+use crate::identity::{Identity, Persona, VerifiedPersona};
 use crate::identity::{COLOUR_MASK, MAX_PERSONA_NAME_LEN};
 use crate::pairing::invite::Invite;
 use zeroize::Zeroizing;
@@ -2110,41 +2110,118 @@ fn open_for_thread(core: &Core, thread: i64, body: &[u8]) -> Result<Incoming, St
     })
 }
 
-/// Which contact a sighting belongs to, if we have one on file.
+/// Which contact a device belongs to, if we have one on file.
 ///
-/// Three routes, in this order, weakest claim last. A session pseudonym is
-/// proved, so it wins. The persona a sighting carries is only claimed, and is
-/// consulted when no session has answered. The advert hint is last because it
-/// is the only one that arrives without anybody having connected at all — and
-/// last is not the same as weak: forging one means guessing eight bytes keyed
-/// on a Layer-1 key you would have had to attend a ceremony to learn.
+/// **Four routes, strongest claim first**, and every caller uses all four.
+/// Splitting them was the bug this order exists to prevent: the nearby list
+/// recognised a friend by her advert hint while every *send* went through a
+/// lookup that did not know about hints, fell through to the device id, and
+/// minted a stranger for somebody the screen had just named.
 ///
-/// The hint route is what stops a paired friend appearing twice. Before it,
-/// somebody merely advertising offered no route at all — R0-F2 rotates their
-/// id every twelve minutes precisely so an advert cannot be attributed — so the
-/// list drew them once as an unknown device and again, from disk, as a contact
-/// who is away. Both rows were the same phone on the same desk.
+/// 1. **A pseudonym the peer has proved** in a session. Nothing outranks it.
+/// 2. **The advert hint** (T09a). Cryptographic, and the only route that works
+///    with nobody connected — forging one means guessing eight bytes keyed on a
+///    Layer-1 key you would have had to attend a ceremony to learn.
+/// 3. **A claimed persona.** Only claimed, so it sits below the two above, but
+///    it is a Layer-2 key and matches paired contacts only.
+///
+///    **No test reaches this route, and deleting it passes the suite.** It
+///    fires only for a device whose persona we have fetched while holding no
+///    session and matching no hint — a pipe that opened far enough to answer
+///    the persona endpoint and then went away, against a peer advertising
+///    nothing we can read. The harness can build the parts and not the
+///    sequence. Recorded so the surviving mutant reads as what it is rather
+///    than as a hole to close by deleting the route: it predates this
+///    ordering, and dropping it would silently narrow who can be recognised.
+/// 4. **The rotating device id.** Last, and it matters that it is last. It
+///    rotates every twelve minutes and anybody may present one, so a row
+///    remembered under it must not outrank a friend recognised by a key. Before
+///    this it came *second*, which is how a stray row minted under a friend's
+///    old id went on displacing her for as long as that id lived.
 ///
 /// Creates nothing: a stranger stays a stranger, and drawing the nearby list is
 /// not the moment to start writing rows.
+fn contact_for(
+    core: &Core,
+    device_id: &str,
+    hint: Option<&[u8; hint::HINT_LEN]>,
+    persona: Option<&VerifiedPersona>,
+    known: &Recogniser,
+) -> Result<Option<i64>, StoreError> {
+    if let Some(id) = proved_contact(core, device_id)? {
+        return Ok(Some(id));
+    }
+    if let Some(id) = known.whose(device_id, hint) {
+        return Ok(Some(id));
+    }
+    if let Some(persona) = persona {
+        if let Some(c) = core.store.paired_contact_by_l2(&persona.l2_pub.0)? {
+            return Ok(Some(c.id));
+        }
+    }
+    contact_by_device_id(core, device_id)
+}
+
+/// [`contact_for`] with what a sighting already carries.
+///
 /// `known` is read once for a whole list and handed down — see [`Recogniser`].
 fn contact_for_sighting(
     core: &Core,
     sighting: &Sighting,
     known: &Recogniser,
 ) -> Result<Option<i64>, StoreError> {
-    if let Some(id) = proved_contact(core, &sighting.peer)? {
-        return Ok(Some(id));
-    }
-    if let Some(id) = known.whose(&sighting.peer, sighting.hint.as_ref()) {
-        return Ok(Some(id));
-    }
-    if let Some(persona) = sighting.persona.as_ref() {
-        if let Some(c) = core.store.paired_contact_by_l2(&persona.l2_pub.0)? {
-            return Ok(Some(c.id));
-        }
-    }
-    contact_by_device_id(core, &sighting.peer)
+    contact_for(
+        core,
+        &sighting.peer,
+        sighting.hint.as_ref(),
+        sighting.persona.as_ref(),
+        known,
+    )
+}
+
+/// [`contact_for`] with what the current sighting of this device carries.
+///
+/// The read-only twin of [`ensure_contact`], for callers holding only a device
+/// id — every send and every receive. It reaches for the sighting rather than
+/// taking a narrower set of routes, because the two answering differently is
+/// exactly what put a friend's name on one screen and a stranger's row behind
+/// every message to her.
+fn contact_id_for_device(core: &Core, device_id: &str) -> Result<Option<i64>, StoreError> {
+    let seen = sighting_of(core, device_id);
+    let known = Recogniser::read(core)?;
+    contact_for(
+        core,
+        device_id,
+        seen.as_ref().and_then(|s| s.hint.as_ref()),
+        seen.as_ref().and_then(|s| s.persona.as_ref()),
+        &known,
+    )
+}
+
+/// A contact keyed on an identity the peer has actually proved.
+fn proved_contact(core: &Core, device_id: &str) -> Result<Option<i64>, StoreError> {
+    let Some(real) = pseudonym_of(core, device_id) else {
+        return Ok(None);
+    };
+    Ok(core.store.contact_by_pseudonym(&real)?.map(|c| c.id))
+}
+
+/// A contact remembered under this rotating id, and nothing stronger.
+fn contact_by_device_id(core: &Core, device_id: &str) -> Result<Option<i64>, StoreError> {
+    Ok(core
+        .store
+        .contact_by_pseudonym(&fake::placeholder_pseudonym(device_id))?
+        .map(|c| c.id))
+}
+
+/// What we can currently see of this device, if anything.
+fn sighting_of(core: &Core, device_id: &str) -> Option<Sighting> {
+    core.net
+        .as_ref()?
+        .discovery()
+        .sightings()
+        .into_iter()
+        .find(|s| s.peer == device_id)
 }
 
 /// The Layer-1 keys an advert hint can be tried against, and the moment the
@@ -2189,64 +2266,6 @@ fn pseudonym_of(core: &Core, device_id: &str) -> Option<[u8; 32]> {
         .as_ref()
         .and_then(|net| net.pseudonym(device_id))
         .map(|p| p.0)
-}
-
-/// The contact for this device, if there already is one.
-///
-/// The read-only twin of [`ensure_contact`]: same two keys, tried in the same
-/// order, but it creates nothing and adopts nothing. Sharing the *order* is the
-/// point — a lookup that consulted only the device id would miss every contact
-/// that had already moved onto its session key, and report no conversation for
-/// someone the user has been talking to all afternoon.
-fn contact_id_for_device(core: &Core, device_id: &str) -> Result<Option<i64>, StoreError> {
-    if let Some(id) = proved_contact(core, device_id)? {
-        return Ok(Some(id));
-    }
-    // The same advert hint the nearby list resolves by. Without it this
-    // function and `contact_for_sighting` disagreed about who a device is: the
-    // list called them Ada while every *send* to that id fell through to the
-    // placeholder below, minted a stranger named "Unknown", and started a
-    // second conversation. Worse, the stranger then held the placeholder key,
-    // so it won this lookup ever after and displaced the paired friend for
-    // good — one tap on a screen that had correctly recognised her.
-    if let Some(hint) = hint_on_air(core, device_id) {
-        let known = Recogniser::read(core)?;
-        if let Some(id) = known.whose(device_id, Some(&hint)) {
-            return Ok(Some(id));
-        }
-    }
-    contact_by_device_id(core, device_id)
-}
-
-/// A contact keyed on an identity the peer has actually proved.
-fn proved_contact(core: &Core, device_id: &str) -> Result<Option<i64>, StoreError> {
-    let Some(real) = pseudonym_of(core, device_id) else {
-        return Ok(None);
-    };
-    Ok(core.store.contact_by_pseudonym(&real)?.map(|c| c.id))
-}
-
-/// A contact remembered under this rotating id, and nothing stronger.
-///
-/// Tried last of all the routes. A device id is the weakest claim there is —
-/// it rotates every twelve minutes and anybody may present one — so a row
-/// found this way must not outrank a friend recognised by a key.
-fn contact_by_device_id(core: &Core, device_id: &str) -> Result<Option<i64>, StoreError> {
-    Ok(core
-        .store
-        .contact_by_pseudonym(&fake::placeholder_pseudonym(device_id))?
-        .map(|c| c.id))
-}
-
-/// The advert hint this device is currently carrying, if we can see it.
-fn hint_on_air(core: &Core, device_id: &str) -> Option<[u8; hint::HINT_LEN]> {
-    core.net
-        .as_ref()?
-        .discovery()
-        .sightings()
-        .into_iter()
-        .find(|s| s.peer == device_id)
-        .and_then(|s| s.hint)
 }
 
 /// The contact this device belongs to, created, adopted or merged as needed.
