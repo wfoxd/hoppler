@@ -8,6 +8,8 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 import 'package:freezed_annotation/freezed_annotation.dart' hide protected;
 part 'types.freezed.dart';
 
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_fields_are_eq`, `clone`, `eq`, `fmt`
+
 /// A stored chat message, as the UI sees it.
 class ChatMessageDto {
   final String msgId;
@@ -16,12 +18,24 @@ class ChatMessageDto {
   final bool outgoing;
   final PlatformInt64 createdAt;
 
+  /// How far this one has got, for outgoing messages.
+  ///
+  /// Carried because the difference is real and was invisible: until the
+  /// acknowledgement existed, `Sent` was terminal, so a message the other
+  /// person is reading looked exactly like one they refused — and one they
+  /// refused is a thing that happened, silently, on two phones.
+  ///
+  /// Meaningless on an incoming message, which is stored `Delivered` the
+  /// moment it is written, so the screen reads this on its own lines only.
+  final MessageStateDto state;
+
   const ChatMessageDto({
     required this.msgId,
     required this.threadId,
     required this.text,
     required this.outgoing,
     required this.createdAt,
+    required this.state,
   });
 
   @override
@@ -30,7 +44,8 @@ class ChatMessageDto {
       threadId.hashCode ^
       text.hashCode ^
       outgoing.hashCode ^
-      createdAt.hashCode;
+      createdAt.hashCode ^
+      state.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -41,7 +56,8 @@ class ChatMessageDto {
           threadId == other.threadId &&
           text == other.text &&
           outgoing == other.outgoing &&
-          createdAt == other.createdAt;
+          createdAt == other.createdAt &&
+          state == other.state;
 }
 
 @freezed
@@ -176,6 +192,25 @@ sealed class CoreEvent with _$CoreEvent {
     required bool available,
     String? reason,
   }) = CoreEvent_RadioChanged;
+}
+
+/// What a message's row is entitled to claim.
+///
+/// Deliberately three states rather than a `delivered: bool`. A flag collapses
+/// "we have not sent it yet" and "we sent it and heard nothing" into one
+/// negative, and those are the two the person on the other end of a queued
+/// backlog most needs told apart.
+enum MessageStateDto {
+  /// Written, and still on this device. Nothing has left.
+  queued,
+
+  /// The bytes left. Nobody has confirmed anything, and on an unpaired
+  /// thread nobody ever will — there is no ratchet to seal an
+  /// acknowledgement with, so this is as far as those rows go.
+  sent,
+
+  /// The far side said it has it, sealed on a chain only they hold.
+  delivered,
 }
 
 /// Someone the app can show: a device in range, or a person we have paired

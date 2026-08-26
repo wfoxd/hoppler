@@ -1,14 +1,59 @@
 import 'package:flutter/material.dart';
+import 'package:hoppler/src/rust/api/types.dart';
 
 /// One line of a conversation, as this screen needs it.
 ///
 /// A plain record rather than the bridge's `ChatMessageDto` so the widget below
-/// can be built in a test. The two fields are the whole of what a message looks
-/// like on screen: what it says, and which side it came from.
+/// can be built in a test: what it says, which side it came from, and how far
+/// it has got.
 class ThreadLine {
-  const ThreadLine({required this.text, required this.outgoing});
+  const ThreadLine({
+    required this.text,
+    required this.outgoing,
+    this.state = MessageStateDto.delivered,
+  });
   final String text;
   final bool outgoing;
+
+  /// How far this one has got. Only meaningful on a line this device wrote —
+  /// something that arrived is here by definition.
+  final MessageStateDto state;
+
+  /// What the row is entitled to claim, in words rather than a tick.
+  ///
+  /// A tick is the convention and it is the wrong one here. Ticks are read as
+  /// "sent" and "read", and this app knows neither of those: it knows the bytes
+  /// left, and it knows whether the other device said it stored them. Nobody
+  /// has been told anyone read anything.
+  ///
+  /// `null` on an incoming line, and on a delivered one — a conversation that
+  /// annotated every settled line would be noise around the only two that
+  /// matter.
+  String? get note {
+    if (!outgoing) return null;
+    switch (state) {
+      case MessageStateDto.queued:
+        return 'waiting to send';
+      case MessageStateDto.sent:
+        return 'not confirmed';
+      case MessageStateDto.delivered:
+        return null;
+    }
+  }
+
+  /// Whether this line is *marked* rather than merely annotated.
+  ///
+  /// A message that left and was never acknowledged is not resent by itself —
+  /// that is decided, so the mark is the whole of what happens next, and it has
+  /// to be visible enough to act on. "Waiting to send" is a state the app is
+  /// still working through and needs no mark; "not confirmed" is one it has
+  /// stopped working on.
+  ///
+  /// Deliberately not an error colour. Nothing has gone wrong the moment a
+  /// message leaves, and most are confirmed within a second — an alarm that
+  /// fires on every message and clears itself teaches people to stop reading
+  /// it, and the one time it stays is the time that mattered.
+  bool get marked => outgoing && state == MessageStateDto.sent;
 }
 
 /// One conversation: what has been said, and a box to say more.
@@ -89,7 +134,41 @@ class _ThreadViewState extends State<ThreadView> {
                         child: Card(
                           child: Padding(
                             padding: const EdgeInsets.all(10),
-                            child: Text(line.text),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.end,
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Text(line.text),
+                                if (line.note != null)
+                                  Padding(
+                                    padding: const EdgeInsets.only(top: 4),
+                                    child: Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        if (line.marked) ...[
+                                          Icon(
+                                            Icons.remove_circle_outline,
+                                            size: 12,
+                                            color: Theme.of(context).hintColor,
+                                          ),
+                                          const SizedBox(width: 4),
+                                        ],
+                                        Text(
+                                          line.note!,
+                                          style: Theme.of(context)
+                                              .textTheme
+                                              .labelSmall
+                                              ?.copyWith(
+                                                color: Theme.of(
+                                                  context,
+                                                ).hintColor,
+                                              ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                              ],
+                            ),
                           ),
                         ),
                       );

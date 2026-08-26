@@ -34,7 +34,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::api::types::{
-    ChatMessageDto, CoreEvent, NearbyDevice, PersonaDto, SasColourDto, ThreadSummary,
+    ChatMessageDto, CoreEvent, MessageStateDto, NearbyDevice, PersonaDto, SasColourDto,
+    ThreadSummary,
 };
 use crate::crypto::rng;
 use crate::discovery::{hint, Sighting};
@@ -760,6 +761,9 @@ fn write_then_send(
             text: text.clone(),
             outgoing: true,
             created_at: now,
+            // Queued until the send below says otherwise, which is what the row
+            // says too — this is not a guess about what is about to happen.
+            state: MessageStateDto::Queued,
         };
 
         Ok((dto, envelope, wire, held))
@@ -835,6 +839,7 @@ pub fn thread_messages(thread_id: i64) -> Result<Vec<ChatMessageDto>, String> {
                 text: String::from_utf8_lossy(&m.body).into_owned(),
                 outgoing: m.direction == Direction::Outgoing,
                 created_at: m.created_at,
+                state: state_dto(m.state),
             })
             .collect())
     })
@@ -2552,6 +2557,14 @@ fn needs_name(store: &Store) -> bool {
     // form survives — it is a difference in what happens when the database is
     // unreadable, and asking is the safer of the two answers.
     !matches!(stored_persona(store), Ok(Some(_)))
+}
+
+fn state_dto(state: MessageState) -> MessageStateDto {
+    match state {
+        MessageState::Queued => MessageStateDto::Queued,
+        MessageState::Sent => MessageStateDto::Sent,
+        MessageState::Delivered => MessageStateDto::Delivered,
+    }
 }
 
 fn now_millis() -> i64 {

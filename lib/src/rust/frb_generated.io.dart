@@ -86,6 +86,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<ThreadSummary> dco_decode_list_thread_summary(dynamic raw);
 
   @protected
+  MessageStateDto dco_decode_message_state_dto(dynamic raw);
+
+  @protected
   NearbyDevice dco_decode_nearby_device(dynamic raw);
 
   @protected
@@ -191,6 +194,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<ThreadSummary> sse_decode_list_thread_summary(
     SseDeserializer deserializer,
   );
+
+  @protected
+  MessageStateDto sse_decode_message_state_dto(SseDeserializer deserializer);
 
   @protected
   NearbyDevice sse_decode_nearby_device(SseDeserializer deserializer);
@@ -318,6 +324,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_list_thread_summary(
     List<ThreadSummary> self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_message_state_dto(
+    MessageStateDto self,
     SseSerializer serializer,
   );
 

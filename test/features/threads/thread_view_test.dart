@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hoppler/features/threads/thread_view.dart';
+import 'package:hoppler/src/rust/api/types.dart';
 
 void main() {
   Future<List<String>> pump(
@@ -105,5 +106,99 @@ void main() {
       'on my way',
       reason: 'an arriving message threw away the draft',
     );
+  });
+
+  // T14a on screen. Until an acknowledgement existed, `Sent` was terminal, so a
+  // message the other person is reading looked exactly like one they refused —
+  // and one they refused is a thing that happened, silently, on two phones.
+  testWidgets('an outgoing line says how far it has got, until it arrives', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ThreadView(
+          title: 'Ada',
+          lines: const [
+            ThreadLine(
+              text: 'still on this device',
+              outgoing: true,
+              state: MessageStateDto.queued,
+            ),
+            ThreadLine(
+              text: 'left, and nobody has said anything',
+              outgoing: true,
+              state: MessageStateDto.sent,
+            ),
+            ThreadLine(
+              text: 'she has it',
+              outgoing: true,
+              state: MessageStateDto.delivered,
+            ),
+          ],
+          onSend: (_) {},
+        ),
+      ),
+    );
+
+    expect(find.text('waiting to send'), findsOneWidget);
+    expect(find.text('not confirmed'), findsOneWidget);
+    // Nothing on the settled one: a conversation that annotated every line
+    // would be noise around the only two that matter.
+    expect(find.textContaining('delivered'), findsNothing);
+
+    // And the unconfirmed one is *marked*, not merely annotated. It will not be
+    // resent by itself, so the mark is the whole of what happens next — a
+    // person has to see it to act on it.
+    //
+    // Asserted against the line it belongs to, not counted. Counting passes for
+    // a mark on the *wrong* line, because there is exactly one of each state on
+    // screen — which is what the first version of this did.
+    expect(
+      find.descendant(
+        of: find.ancestor(
+          of: find.text('not confirmed'),
+          matching: find.byType(Row),
+        ),
+        matching: find.byIcon(Icons.remove_circle_outline),
+      ),
+      findsOneWidget,
+      reason: 'an unacknowledged message was not marked',
+    );
+    // And the one still being worked through carries none: nothing is being
+    // asked of anybody yet.
+    expect(
+      find.descendant(
+        of: find.ancestor(
+          of: find.text('waiting to send'),
+          matching: find.byType(Row),
+        ),
+        matching: find.byIcon(Icons.remove_circle_outline),
+      ),
+      findsNothing,
+      reason: 'a message still on its way out was marked as unconfirmed',
+    );
+  });
+
+  // Something that arrived is here by definition, so a note on it would be
+  // describing this device's own bookkeeping back at the person.
+  testWidgets('an incoming line carries no delivery note', (tester) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ThreadView(
+          title: 'Ada',
+          lines: const [
+            ThreadLine(
+              text: 'from her',
+              outgoing: false,
+              state: MessageStateDto.sent,
+            ),
+          ],
+          onSend: (_) {},
+        ),
+      ),
+    );
+
+    expect(find.text('from her'), findsOneWidget);
+    expect(find.text('sent'), findsNothing);
   });
 }
