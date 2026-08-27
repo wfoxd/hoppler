@@ -996,6 +996,13 @@ struct FullPeer {
     /// never opens anything it is sent, which is not a second end of a
     /// conversation — it is an echo the engine cannot get wrong.
     ratchet: Mutex<Option<Ratchet>>,
+    /// Whether this end answers what it opens.
+    ///
+    /// A real device always acknowledges. This exists so a test can hold the
+    /// one state the engine cannot reach on its own — a message that genuinely
+    /// went out, genuinely arrived, and was never answered — which is what a
+    /// refused message looks like from the sender's side.
+    silent: Mutex<bool>,
     /// Every body this end has opened, in order.
     ///
     /// What makes "the engine sent it" and "the other device could read it"
@@ -1153,21 +1160,28 @@ impl FullPeer {
             else {
                 continue;
             };
-            let heard = if is_chat {
+            // Decoded once. It was decoded twice — for the text and again for
+            // the `msg_id` to acknowledge — which is two readings of one thing,
+            // free to drift apart.
+            let decoded = if is_chat {
                 match ChatEnvelope::decode(&plaintext) {
-                    Ok(envelope) => envelope.body,
+                    Ok(envelope) => Some(envelope),
                     Err(_) => continue,
                 }
             } else {
-                plaintext.to_vec()
+                None
+            };
+            let heard = match &decoded {
+                Some(envelope) => envelope.body.clone(),
+                None => plaintext.to_vec(),
             };
             // Acknowledge it, the way the engine does when it is the one
             // receiving: seal the `msg_id` and send it back. Without this the
             // harness is a device that reads everything and confirms nothing,
             // so the sender's row could never leave `Sent` and the whole of
             // T14a would be untestable from this end.
-            if is_chat {
-                if let Ok(envelope) = ChatEnvelope::decode(&plaintext) {
+            if let Some(envelope) = decoded {
+                if !*self.silent.lock().unwrap_or_else(|p| p.into_inner()) {
                     if let Ok((header, sealed)) = ratchet.encrypt(&envelope.msg_id) {
                         let mut body = header.to_bytes().to_vec();
                         body.extend_from_slice(&sealed);
@@ -1180,6 +1194,12 @@ impl FullPeer {
                 .unwrap_or_else(|p| p.into_inner())
                 .push(heard);
         }
+    }
+
+    /// Stop answering. What a device that refuses a message looks like from
+    /// the other end: it received something and said nothing back.
+    fn go_silent(&self) {
+        *self.silent.lock().unwrap_or_else(|p| p.into_inner()) = true;
     }
 
     /// Everything this end has managed to open, as text.
@@ -1238,6 +1258,7 @@ fn full_peer_with(air: &LoopbackNet, id: &str, identity: Identity) -> FullPeer {
         identity,
         id: id.to_string(),
         ratchet: Mutex::new(None),
+        silent: Mutex::new(false),
         heard: Mutex::new(Vec::new()),
     }
 }
@@ -2714,19 +2735,30 @@ fn a_message_nobody_acknowledges_stays_sent() {
     let device_id = meet_and_pair(&peer);
     let thread = thread_for_device(device_id).unwrap().unwrap();
 
-    // Nothing on the far side will answer: her transport is gone, so the bytes
-    // go nowhere and no acknowledgement can come back.
-    peer.transport.disconnect("core").unwrap();
+    // She receives it and says nothing — what a refused message looks like from
+    // this side. The bytes really do leave, which is the part that makes the
+    // assertion below mean anything: a message that never went out would sit at
+    // `Queued`, which is a different failure and the one this test used to be
+    // quietly passing for.
+    peer.go_silent();
     let sent = send_chat_to_thread(thread, "into the dark".into()).unwrap();
     let msg_id = hex::decode(&sent.msg_id).unwrap();
 
+    until("her to have read it", || {
+        pump(&peer);
+        peer.heard().iter().any(|t| t == "into the dark")
+    });
     for _ in 0..10 {
         pump(&peer);
     }
-    assert_ne!(
+    // `Sent`, not merely "not Delivered". Review caught the weaker assertion:
+    // a message that never left at all would satisfy it, so the test would
+    // have passed for a regression where the bytes stopped going out — the
+    // opposite failure from the one it is about.
+    assert_eq!(
         message_state_for_test(&msg_id).unwrap().as_deref(),
-        Some("Delivered"),
-        "a row claimed delivery with nobody having confirmed anything"
+        Some("Sent"),
+        "a row that got no acknowledgement should say the bytes left, and only that"
     );
 }
 
