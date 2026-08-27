@@ -1700,6 +1700,12 @@ pub fn receive_chat_for_test(device_id: &str, body: &[u8]) -> Result<Option<Core
 /// forgeable claim that a message arrived — and none of it is visible through
 /// the public API, which reports what was received and never what was said
 /// back.
+pub fn mark_delivered_for_test(device_id: &str, body: &[u8]) -> Result<(), String> {
+    mark_delivered(device_id, body)
+}
+
+/// Whether receiving this body would send an acknowledgement back, for the
+/// contract tests.
 pub fn acked_on_receipt_for_test(device_id: &str, body: &[u8]) -> Result<bool, String> {
     store_incoming_chat(device_id, body).map(|landed| landed.ack.is_some())
 }
@@ -1949,10 +1955,20 @@ fn mark_delivered(device_id: &str, body: &[u8]) -> Result<(), String> {
         let Some(thread) = thread_for_peer(core, device_id)? else {
             return Ok(());
         };
+        // Only a sealed one counts, and this is where that is enforced.
+        //
+        // `open_for_thread` hands back the raw bytes when a thread has no
+        // ratchet, because an unpaired chat body legitimately arrives in the
+        // clear. An acknowledgement never does: its whole value is that
+        // producing one requires a chain only a completed ceremony discloses.
+        // Without this guard, sixteen bytes from anybody in range promoted a
+        // message to `Delivered` on an unpaired thread — the exact lie this
+        // design refuses to permit, which was stated for the sending half and
+        // never checked on the receiving one.
         let Incoming {
             plaintext,
             ratchet: advanced,
-        } = match open_for_thread(core, thread, body) {
+        } = match open_sealed_for_thread(core, thread, body) {
             Ok(opened) => opened,
             Err(why) => {
                 log::warn!("dropping an acknowledgement that would not open: {why}");
@@ -2270,6 +2286,25 @@ fn open_for_thread(core: &Core, thread: i64, body: &[u8]) -> Result<Incoming, St
         plaintext: plaintext.to_vec(),
         ratchet: Some(ratchet.to_state()),
     })
+}
+
+/// Open something that is only ever sealed.
+///
+/// [`open_for_thread`] falls back to treating a body as plaintext when the
+/// thread has no ratchet, which is right for a chat line — R0-F5 lets strangers
+/// talk, and a stranger's thread has nothing to seal with. It is wrong for
+/// anything whose meaning depends on having been sealed, because the fallback
+/// turns "nobody could have forged this" into "anybody could".
+///
+/// Refusing here rather than at each caller: a guard that has to be remembered
+/// is one that will be forgotten, and the thing forgotten is a forgery check.
+fn open_sealed_for_thread(core: &Core, thread: i64, body: &[u8]) -> Result<Incoming, StoreError> {
+    if core.store.ratchet_state(thread)?.is_none() {
+        return Err(StoreError::Db(
+            "a thread with no ratchet cannot have sealed anything".into(),
+        ));
+    }
+    open_for_thread(core, thread, body)
 }
 
 /// Which contact a device belongs to, if we have one on file.

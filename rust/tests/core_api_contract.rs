@@ -29,9 +29,10 @@ use rust_lib_hoppler::api::types::CoreEvent;
 use rust_lib_hoppler::discovery::Discovery;
 use rust_lib_hoppler::engine::{
     acked_on_receipt_for_test, has_session, init_with_transport, layer1_public_for_test,
-    mark_sent_for_test, message_state_for_test, queued_for_resend_for_test,
-    queued_on_thread_for_test, ratchet_can_send_for_test, ratchet_fingerprint_for_test,
-    ratchet_size_for_test, receive_chat_for_test, resend_queued_for_test, thread_rows_for_test,
+    mark_delivered_for_test, mark_sent_for_test, message_state_for_test,
+    queued_for_resend_for_test, queued_on_thread_for_test, ratchet_can_send_for_test,
+    ratchet_fingerprint_for_test, ratchet_size_for_test, receive_chat_for_test,
+    resend_queued_for_test, thread_rows_for_test,
 };
 use rust_lib_hoppler::identity::Identity;
 use rust_lib_hoppler::pairing::invite::Invite;
@@ -2837,5 +2838,43 @@ fn an_unacknowledged_message_is_not_resent_by_itself() {
         message_state_for_test(&msg_id).unwrap().as_deref(),
         Some("Sent"),
         "the mark was cleared by a reunion that did nothing"
+    );
+}
+
+/// An unsealed acknowledgement is not an acknowledgement (T14a).
+///
+/// The whole shape rests on an ack being unforgeable: it rides the ratchet, so
+/// producing one means holding a chain only a completed ceremony discloses. The
+/// *sending* half was stated and tested. The receiving half was neither, and
+/// `open_for_thread` hands back the raw bytes when a thread has no ratchet — so
+/// sixteen bytes of anything, from anybody in range, promoted a message to
+/// `Delivered` on an unpaired thread.
+///
+/// That is the exact lie the design refuses to permit: a forged ack makes a
+/// person believe a message arrived that did not.
+#[test]
+fn a_forged_acknowledgement_on_an_unpaired_thread_is_refused() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _h = fresh();
+
+    // A stranger's conversation: no ceremony, so no ratchet, so nothing that
+    // could seal anything.
+    let sent = send_chat("a-stranger".into(), "did this land?".into()).unwrap();
+    let msg_id = hex::decode(&sent.msg_id).unwrap();
+    let thread = thread_for_device("a-stranger".into()).unwrap().unwrap();
+    mark_sent_for_test(thread).unwrap();
+    assert_eq!(
+        message_state_for_test(&msg_id).unwrap().as_deref(),
+        Some("Sent")
+    );
+
+    // Sixteen bytes anybody could write, naming the message they want to look
+    // delivered.
+    mark_delivered_for_test("a-stranger", &msg_id).unwrap();
+
+    assert_eq!(
+        message_state_for_test(&msg_id).unwrap().as_deref(),
+        Some("Sent"),
+        "an unsealed acknowledgement was believed"
     );
 }
