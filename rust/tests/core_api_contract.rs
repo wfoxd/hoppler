@@ -2938,7 +2938,7 @@ fn a_refused_message_says_which_kind_of_refusal_it_was() {
         refusal_for_test(&peer.id, &bare.encode())
             .unwrap()
             .as_deref(),
-        Some("it was written before you paired"),
+        Some("it looked like a message from before you paired"),
     );
 
     // Too short to have been a sealed anything.

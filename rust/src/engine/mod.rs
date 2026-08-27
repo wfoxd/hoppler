@@ -1960,7 +1960,13 @@ fn why_refused(body: &[u8]) -> &'static str {
         // sealed ones. Almost always a message written before the two of you
         // paired: it was sealed with what the thread had at the time, which was
         // nothing.
-        return "it was written before you paired";
+        //
+        // Hedged, because it is a guess read off bytes nobody vouched for and
+        // the sentence may reach a person. "It was written before you paired"
+        // states as fact what this can only recognise the shape of — and the
+        // one reader who could be misled by the difference is the one holding
+        // a message that never arrived.
+        return "it looked like a message from before you paired";
     }
     if body.len() < ratchet::HEADER_LEN {
         // Too short to be a ratchet header, so there was never a sealed message
