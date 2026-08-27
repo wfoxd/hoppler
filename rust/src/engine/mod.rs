@@ -793,6 +793,7 @@ fn write_then_send(
     // is promoted to Sent only once the bytes are actually away — a caller
     // that sees Sent can trust it.
     let net = require_net()?;
+    let mut dto = dto;
     match net.send_chat(&device_id, wire, std::time::Instant::now()) {
         Ok(()) => {
             with_core(|core| {
@@ -800,6 +801,13 @@ fn write_then_send(
                     .set_message_state(&envelope.msg_id, MessageState::Sent)?;
                 Ok(())
             })?;
+            // And on the value handed back, which is the same fact and was two.
+            // The row said `Sent` while the returned DTO still said `Queued`, so
+            // a caller that drew what it was given — rather than re-reading the
+            // thread — showed a message as waiting when the bytes had gone.
+            // Every caller re-reads today, which is exactly why nothing caught
+            // it and why it would have bitten the first one that did not.
+            dto.state = MessageStateDto::Sent;
         }
         // Out of range is not a failure to write a message, and saying so was
         // false: the row is already `Queued` and `resend_queued` delivers it at
