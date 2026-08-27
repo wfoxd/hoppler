@@ -1704,17 +1704,21 @@ pub fn receive_chat_for_test(device_id: &str, body: &[u8]) -> Result<Option<Core
     store_incoming_chat(device_id, body).map(|landed| landed.event)
 }
 
+/// Why an inbound chat body was turned away, for the contract tests.
+///
+/// `Some` only where a body failed to open — the one refusal that has a shape
+/// worth naming. Everything else this function can return `None` for was
+/// refused for a reason the store already records.
+pub fn refusal_for_test(device_id: &str, body: &[u8]) -> Result<Option<String>, String> {
+    store_incoming_chat(device_id, body).map(|l| l.refused.map(str::to_owned))
+}
+
 /// Take an acknowledgement as if it had arrived, for the contract tests.
 ///
 /// The *receiving* half, which is where the forgery check lives and where it
 /// was missing: an unsealed body must not promote anything. Nothing on the
 /// public API can drive this — an ack arrives as a transport event and reports
 /// itself only by changing a row.
-pub fn refusal_for_test(device_id: &str, body: &[u8]) -> Result<Option<String>, String> {
-    store_incoming_chat(device_id, body).map(|l| l.refused.map(str::to_owned))
-}
-
-/// Take an acknowledgement as if it had arrived, for the contract tests.
 pub fn mark_delivered_for_test(device_id: &str, body: &[u8]) -> Result<(), String> {
     mark_delivered(device_id, body)
 }
@@ -1748,6 +1752,13 @@ struct Landed {
     event: Option<CoreEvent>,
     /// Why a body was turned away, when one was. Never a reason to *keep* it —
     /// see [`why_refused`].
+    ///
+    /// **Logged, and not yet shown to anybody.** Review was right that the
+    /// design's "the log and the screen can say so" is only half true here: the
+    /// receive path uses `event` and `ack`, and this reaches a log line and the
+    /// contract tests. Putting it on a screen needs a `CoreEvent` and a
+    /// decision about where a dropped message should appear, which is a
+    /// separate slice rather than something to bolt on quietly.
     refused: Option<&'static str>,
     /// A sealed `msg_id`, when this thread can seal one. `None` on an unpaired
     /// thread — see [`crate::session::frame::FrameKind::Ack`] for why that is a
