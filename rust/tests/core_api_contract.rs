@@ -28,7 +28,8 @@ use rust_lib_hoppler::api::transfers::offer_drop;
 use rust_lib_hoppler::api::types::CoreEvent;
 use rust_lib_hoppler::discovery::Discovery;
 use rust_lib_hoppler::engine::{
-    has_session, init_with_transport, layer1_public_for_test, mark_sent_for_test,
+    acked_on_receipt_for_test, has_session, init_with_transport, layer1_public_for_test,
+    mark_delivered_for_test, mark_sent_for_test, message_state_for_test,
     queued_for_resend_for_test, queued_on_thread_for_test, ratchet_can_send_for_test,
     ratchet_fingerprint_for_test, ratchet_size_for_test, receive_chat_for_test,
     resend_queued_for_test, thread_rows_for_test,
@@ -996,6 +997,13 @@ struct FullPeer {
     /// never opens anything it is sent, which is not a second end of a
     /// conversation — it is an echo the engine cannot get wrong.
     ratchet: Mutex<Option<Ratchet>>,
+    /// Whether this end answers what it opens.
+    ///
+    /// A real device always acknowledges. This exists so a test can hold the
+    /// one state the engine cannot reach on its own — a message that genuinely
+    /// went out, genuinely arrived, and was never answered — which is what a
+    /// refused message looks like from the sender's side.
+    silent: Mutex<bool>,
     /// Every body this end has opened, in order.
     ///
     /// What makes "the engine sent it" and "the other device could read it"
@@ -1153,19 +1161,46 @@ impl FullPeer {
             else {
                 continue;
             };
-            let heard = if is_chat {
+            // Decoded once. It was decoded twice — for the text and again for
+            // the `msg_id` to acknowledge — which is two readings of one thing,
+            // free to drift apart.
+            let decoded = if is_chat {
                 match ChatEnvelope::decode(&plaintext) {
-                    Ok(envelope) => envelope.body,
+                    Ok(envelope) => Some(envelope),
                     Err(_) => continue,
                 }
             } else {
-                plaintext.to_vec()
+                None
             };
+            let heard = match &decoded {
+                Some(envelope) => envelope.body.clone(),
+                None => plaintext.to_vec(),
+            };
+            // Acknowledge it, the way the engine does when it is the one
+            // receiving: seal the `msg_id` and send it back. Without this the
+            // harness is a device that reads everything and confirms nothing,
+            // so the sender's row could never leave `Sent` and the whole of
+            // T14a would be untestable from this end.
+            if let Some(envelope) = decoded {
+                if !*self.silent.lock().unwrap_or_else(|p| p.into_inner()) {
+                    if let Ok((header, sealed)) = ratchet.encrypt(&envelope.msg_id) {
+                        let mut body = header.to_bytes().to_vec();
+                        body.extend_from_slice(&sealed);
+                        let _ = self.net.send_ack("core", body, Instant::now());
+                    }
+                }
+            }
             self.heard
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .push(heard);
         }
+    }
+
+    /// Stop answering. What a device that refuses a message looks like from
+    /// the other end: it received something and said nothing back.
+    fn go_silent(&self) {
+        *self.silent.lock().unwrap_or_else(|p| p.into_inner()) = true;
     }
 
     /// Everything this end has managed to open, as text.
@@ -1224,6 +1259,7 @@ fn full_peer_with(air: &LoopbackNet, id: &str, identity: Identity) -> FullPeer {
         identity,
         id: id.to_string(),
         ratchet: Mutex::new(None),
+        silent: Mutex::new(false),
         heard: Mutex::new(Vec::new()),
     }
 }
@@ -2651,4 +2687,194 @@ fn a_stranger_written_to_is_still_recognised_by_that_id() {
         "a stranger's own conversation was not attached to their row"
     );
     assert!(!row.paired, "an unpaired stranger read as paired");
+}
+
+/// A row stops claiming what it cannot know (T14a).
+///
+/// `Sent` used to be terminal, so a message that left this device looked the
+/// same as one the other person is reading — including one they refused, which
+/// is what T12a found. Nothing on the wire came back, so nothing could tell
+/// them apart.
+///
+/// Now the receiver seals the `msg_id` it stored and sends it back, and only
+/// that moves a row to `Delivered`. A message that was refused, lost, or never
+/// arrived is not acknowledged, so its row stays `Sent` — the row says the
+/// bytes left, which is all this end ever knew.
+#[test]
+fn a_message_reaches_delivered_only_when_the_far_side_says_so() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = fresh();
+    let peer = full_peer(&h.air, "peer", "Ada");
+    let device_id = meet_and_pair(&peer);
+    let thread = thread_for_device(device_id).unwrap().unwrap();
+
+    let sent = send_chat_to_thread(thread, "did you get this?".into()).unwrap();
+    let msg_id = hex::decode(&sent.msg_id).unwrap();
+
+    // It left, and that is all this end knows until she answers.
+    until("her to read it", || {
+        pump(&peer);
+        peer.heard().iter().any(|t| t == "did you get this?")
+    });
+
+    until("her acknowledgement to come back", || {
+        pump(&peer);
+        message_state_for_test(&msg_id).unwrap().as_deref() == Some("Delivered")
+    });
+}
+
+/// And a message nobody answered stays `Sent`.
+///
+/// The half that makes the other half mean anything: if a row reached
+/// `Delivered` on its own, the state would be a restatement of "we tried" and
+/// T12a's silent loss would look exactly the same as success.
+#[test]
+fn a_message_nobody_acknowledges_stays_sent() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = fresh();
+    let peer = full_peer(&h.air, "peer", "Ada");
+    let device_id = meet_and_pair(&peer);
+    let thread = thread_for_device(device_id).unwrap().unwrap();
+
+    // She receives it and says nothing — what a refused message looks like from
+    // this side. The bytes really do leave, which is the part that makes the
+    // assertion below mean anything: a message that never went out would sit at
+    // `Queued`, which is a different failure and the one this test used to be
+    // quietly passing for.
+    peer.go_silent();
+    let sent = send_chat_to_thread(thread, "into the dark".into()).unwrap();
+    let msg_id = hex::decode(&sent.msg_id).unwrap();
+
+    until("her to have read it", || {
+        pump(&peer);
+        peer.heard().iter().any(|t| t == "into the dark")
+    });
+    for _ in 0..10 {
+        pump(&peer);
+    }
+    // `Sent`, not merely "not Delivered". Review caught the weaker assertion:
+    // a message that never left at all would satisfy it, so the test would
+    // have passed for a regression where the bytes stopped going out — the
+    // opposite failure from the one it is about.
+    assert_eq!(
+        message_state_for_test(&msg_id).unwrap().as_deref(),
+        Some("Sent"),
+        "a row that got no acknowledgement should say the bytes left, and only that"
+    );
+}
+
+/// An unpaired thread says nothing back, and that is a rule rather than an
+/// omission.
+///
+/// A stranger's thread has no ratchet, so any acknowledgement it sent would be
+/// unsealed — bytes anybody in range could write. A forged ack is worse than a
+/// forged failure: it makes a person believe a message arrived that did not.
+/// So those rows stay `Sent`, saying exactly what this end knows.
+#[test]
+fn an_unpaired_thread_does_not_acknowledge() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _h = fresh();
+
+    let envelope = ChatEnvelope::new(1, b"hello from a stranger".to_vec()).unwrap();
+    assert!(
+        !acked_on_receipt_for_test("a-stranger", &envelope.encode()).unwrap(),
+        "an unpaired thread sent an unsealed delivery claim"
+    );
+}
+
+/// A message nobody acknowledged is marked, and left alone (T14a).
+///
+/// The decision, and it is a decision rather than a consequence: an unacked
+/// message stays visible as unacked and is **not** resent by itself. Today that
+/// falls out of `queued_for_resend` selecting `Queued` rows, which is an
+/// accident of which state the query names — so it is pinned here before
+/// somebody widens that query and turns every lost acknowledgement into a
+/// duplicate delivery arriving days later.
+///
+/// The alternative was rejected on what it would cost the person rather than
+/// the protocol. A receiver dedupes on `msg_id`, so an automatic resend is safe
+/// — it is just never *finished*: a message that cannot be delivered is retried
+/// at every reunion for ever, and the one thing nobody can do about it is know
+/// that is what is happening. Marked and still costs a decision; resent for
+/// ever costs attention and never asks.
+#[test]
+fn an_unacknowledged_message_is_not_resent_by_itself() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = fresh();
+    let peer = full_peer(&h.air, "peer", "Ada");
+    let device_id = meet_and_pair(&peer);
+    let thread = thread_for_device(device_id.clone()).unwrap().unwrap();
+
+    // Written and away, with nothing coming back — the state this decision is
+    // about.
+    set_discovery(false).unwrap();
+    let sent = send_chat_to_thread(thread, "did that land?".into()).unwrap();
+    let msg_id = hex::decode(&sent.msg_id).unwrap();
+    mark_sent_for_test(thread).unwrap();
+    assert_eq!(
+        message_state_for_test(&msg_id).unwrap().as_deref(),
+        Some("Sent"),
+        "the row is not in the state this test is about"
+    );
+
+    // A reunion. It has plenty to do and nothing to do with this message.
+    set_discovery(true).unwrap();
+    until("the peer to be reachable again", || {
+        pump(&peer);
+        nearby_devices()
+            .unwrap()
+            .iter()
+            .any(|d| d.device_id.as_deref() == Some(peer.id.as_str()))
+    });
+
+    let owed = queued_for_resend_for_test(&device_id).unwrap();
+    assert!(
+        !owed.iter().any(|(_, id)| *id == sent.msg_id),
+        "a reunion resent a message that had already gone, with no request from anyone"
+    );
+    // And it is still marked, so the person can see it never arrived and decide
+    // for themselves.
+    assert_eq!(
+        message_state_for_test(&msg_id).unwrap().as_deref(),
+        Some("Sent"),
+        "the mark was cleared by a reunion that did nothing"
+    );
+}
+
+/// An unsealed acknowledgement is not an acknowledgement (T14a).
+///
+/// The whole shape rests on an ack being unforgeable: it rides the ratchet, so
+/// producing one means holding a chain only a completed ceremony discloses. The
+/// *sending* half was stated and tested. The receiving half was neither, and
+/// `open_for_thread` hands back the raw bytes when a thread has no ratchet — so
+/// sixteen bytes of anything, from anybody in range, promoted a message to
+/// `Delivered` on an unpaired thread.
+///
+/// That is the exact lie the design refuses to permit: a forged ack makes a
+/// person believe a message arrived that did not.
+#[test]
+fn a_forged_acknowledgement_on_an_unpaired_thread_is_refused() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _h = fresh();
+
+    // A stranger's conversation: no ceremony, so no ratchet, so nothing that
+    // could seal anything.
+    let sent = send_chat("a-stranger".into(), "did this land?".into()).unwrap();
+    let msg_id = hex::decode(&sent.msg_id).unwrap();
+    let thread = thread_for_device("a-stranger".into()).unwrap().unwrap();
+    mark_sent_for_test(thread).unwrap();
+    assert_eq!(
+        message_state_for_test(&msg_id).unwrap().as_deref(),
+        Some("Sent")
+    );
+
+    // Sixteen bytes anybody could write, naming the message they want to look
+    // delivered.
+    mark_delivered_for_test("a-stranger", &msg_id).unwrap();
+
+    assert_eq!(
+        message_state_for_test(&msg_id).unwrap().as_deref(),
+        Some("Sent"),
+        "an unsealed acknowledgement was believed"
+    );
 }

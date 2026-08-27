@@ -57,7 +57,7 @@
 /// before there was a version" means those peers are diagnosed rather than
 /// merely malformed — this build reads a 0 and can say *older version*
 /// instead of *something is wrong with that message*.
-pub const PROTOCOL_VERSION: u8 = 1;
+pub const PROTOCOL_VERSION: u8 = 2;
 
 /// The version a build that predates this gate appears to send.
 pub const VERSION_BEFORE_THE_GATE: u8 = 0;

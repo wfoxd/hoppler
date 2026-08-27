@@ -69,6 +69,27 @@ pub enum FrameKind {
     /// ratchet header and a sealed empty body, with no `seq` and no `msg_id` to
     /// write a row with.
     Opening = 6,
+    /// R0-F5. The far side has stored a chat message, identified by its
+    /// `msg_id` — the only thing that makes one *delivered* rather than merely
+    /// sent.
+    ///
+    /// **Sealed like a chat body, and that is not optional.** An unsealed ack
+    /// is forgeable, and a forged ack is worse than a forged failure: it makes
+    /// a person believe a message arrived that did not. Riding the ratchet
+    /// means producing one requires a chain that only a completed ceremony
+    /// discloses.
+    ///
+    /// So there are no acks on an unpaired thread, which has no ratchet. Those
+    /// messages stay `Sent`, and the row says exactly what it knows — the bytes
+    /// left this device. That is a stated limit rather than a gap to close
+    /// later: an unsealed ack on an unpaired thread would be precisely the
+    /// forgeable delivery claim this shape exists to prevent.
+    ///
+    /// Positive only. A frame that said *I could not open this* would be a
+    /// forgeable failure signal, would cost a message key per forgery if the
+    /// sender resent on it, and would answer where R0-F10 requires silence.
+    /// Nothing acknowledged covers refusal, loss and never-arrived alike.
+    Ack = 7,
 }
 
 impl FrameKind {
@@ -80,6 +101,7 @@ impl FrameKind {
             4 => Some(FrameKind::Pong),
             5 => Some(FrameKind::Ceremony),
             6 => Some(FrameKind::Opening),
+            7 => Some(FrameKind::Ack),
             _ => None,
         }
     }
