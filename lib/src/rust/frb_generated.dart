@@ -916,14 +916,15 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   ChatMessageDto dco_decode_chat_message_dto(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 5)
-      throw Exception('unexpected arr length: expect 5 but see ${arr.length}');
+    if (arr.length != 6)
+      throw Exception('unexpected arr length: expect 6 but see ${arr.length}');
     return ChatMessageDto(
       msgId: dco_decode_String(arr[0]),
       threadId: dco_decode_i_64(arr[1]),
       text: dco_decode_String(arr[2]),
       outgoing: dco_decode_bool(arr[3]),
       createdAt: dco_decode_i_64(arr[4]),
+      state: dco_decode_message_state_dto(arr[5]),
     );
   }
 
@@ -1117,6 +1118,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  MessageStateDto dco_decode_message_state_dto(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return MessageStateDto.values[raw as int];
+  }
+
+  @protected
   NearbyDevice dco_decode_nearby_device(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
@@ -1280,12 +1287,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_text = sse_decode_String(deserializer);
     var var_outgoing = sse_decode_bool(deserializer);
     var var_createdAt = sse_decode_i_64(deserializer);
+    var var_state = sse_decode_message_state_dto(deserializer);
     return ChatMessageDto(
       msgId: var_msgId,
       threadId: var_threadId,
       text: var_text,
       outgoing: var_outgoing,
       createdAt: var_createdAt,
+      state: var_state,
     );
   }
 
@@ -1544,6 +1553,13 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  MessageStateDto sse_decode_message_state_dto(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var inner = sse_decode_i_32(deserializer);
+    return MessageStateDto.values[inner];
+  }
+
+  @protected
   NearbyDevice sse_decode_nearby_device(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var var_deviceId = sse_decode_opt_String(deserializer);
@@ -1740,6 +1756,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_String(self.text, serializer);
     sse_encode_bool(self.outgoing, serializer);
     sse_encode_i_64(self.createdAt, serializer);
+    sse_encode_message_state_dto(self.state, serializer);
   }
 
   @protected
@@ -1975,6 +1992,15 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     for (final item in self) {
       sse_encode_thread_summary(item, serializer);
     }
+  }
+
+  @protected
+  void sse_encode_message_state_dto(
+    MessageStateDto self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.index, serializer);
   }
 
   @protected

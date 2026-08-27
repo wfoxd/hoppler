@@ -34,7 +34,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::api::types::{
-    ChatMessageDto, CoreEvent, NearbyDevice, PersonaDto, SasColourDto, ThreadSummary,
+    ChatMessageDto, CoreEvent, MessageStateDto, NearbyDevice, PersonaDto, SasColourDto,
+    ThreadSummary,
 };
 use crate::crypto::rng;
 use crate::discovery::{hint, Sighting};
@@ -760,6 +761,9 @@ fn write_then_send(
             text: text.clone(),
             outgoing: true,
             created_at: now,
+            // Queued until the send below says otherwise, which is what the row
+            // says too — this is not a guess about what is about to happen.
+            state: MessageStateDto::Queued,
         };
 
         Ok((dto, envelope, wire, held))
@@ -789,6 +793,7 @@ fn write_then_send(
     // is promoted to Sent only once the bytes are actually away — a caller
     // that sees Sent can trust it.
     let net = require_net()?;
+    let mut dto = dto;
     match net.send_chat(&device_id, wire, std::time::Instant::now()) {
         Ok(()) => {
             with_core(|core| {
@@ -796,6 +801,13 @@ fn write_then_send(
                     .set_message_state(&envelope.msg_id, MessageState::Sent)?;
                 Ok(())
             })?;
+            // And on the value handed back, which is the same fact and was two.
+            // The row said `Sent` while the returned DTO still said `Queued`, so
+            // a caller that drew what it was given — rather than re-reading the
+            // thread — showed a message as waiting when the bytes had gone.
+            // Every caller re-reads today, which is exactly why nothing caught
+            // it and why it would have bitten the first one that did not.
+            dto.state = MessageStateDto::Sent;
         }
         // Out of range is not a failure to write a message, and saying so was
         // false: the row is already `Queued` and `resend_queued` delivers it at
@@ -835,6 +847,7 @@ pub fn thread_messages(thread_id: i64) -> Result<Vec<ChatMessageDto>, String> {
                 text: String::from_utf8_lossy(&m.body).into_owned(),
                 outgoing: m.direction == Direction::Outgoing,
                 created_at: m.created_at,
+                state: state_dto(m.state),
             })
             .collect())
     })
@@ -2591,6 +2604,14 @@ fn needs_name(store: &Store) -> bool {
     // form survives — it is a difference in what happens when the database is
     // unreadable, and asking is the safer of the two answers.
     !matches!(stored_persona(store), Ok(Some(_)))
+}
+
+fn state_dto(state: MessageState) -> MessageStateDto {
+    match state {
+        MessageState::Queued => MessageStateDto::Queued,
+        MessageState::Sent => MessageStateDto::Sent,
+        MessageState::Delivered => MessageStateDto::Delivered,
+    }
 }
 
 fn now_millis() -> i64 {

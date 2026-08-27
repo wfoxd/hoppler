@@ -652,7 +652,11 @@ class _HomePageState extends State<HomePage> {
       if (id == null) return <ThreadLine>[];
       return (await threadMessages(
         threadId: id,
-      )).map((m) => ThreadLine(text: m.text, outgoing: m.outgoing)).toList();
+      )).map((m) => ThreadLine(
+            text: m.text,
+            outgoing: m.outgoing,
+            state: m.state,
+          )).toList();
     }
 
     List<ThreadLine> lines;

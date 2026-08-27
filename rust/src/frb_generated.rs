@@ -899,12 +899,14 @@ impl SseDecode for crate::api::types::ChatMessageDto {
         let mut var_text = <String>::sse_decode(deserializer);
         let mut var_outgoing = <bool>::sse_decode(deserializer);
         let mut var_createdAt = <i64>::sse_decode(deserializer);
+        let mut var_state = <crate::api::types::MessageStateDto>::sse_decode(deserializer);
         return crate::api::types::ChatMessageDto {
             msg_id: var_msgId,
             thread_id: var_threadId,
             text: var_text,
             outgoing: var_outgoing,
             created_at: var_createdAt,
+            state: var_state,
         };
     }
 }
@@ -1229,6 +1231,19 @@ impl SseDecode for Vec<crate::api::types::ThreadSummary> {
     }
 }
 
+impl SseDecode for crate::api::types::MessageStateDto {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut inner = <i32>::sse_decode(deserializer);
+        return match inner {
+            0 => crate::api::types::MessageStateDto::Queued,
+            1 => crate::api::types::MessageStateDto::Sent,
+            2 => crate::api::types::MessageStateDto::Delivered,
+            _ => unreachable!("Invalid variant for MessageStateDto: {}", inner),
+        };
+    }
+}
+
 impl SseDecode for crate::api::types::NearbyDevice {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -1432,6 +1447,7 @@ impl flutter_rust_bridge::IntoDart for crate::api::types::ChatMessageDto {
             self.text.into_into_dart().into_dart(),
             self.outgoing.into_into_dart().into_dart(),
             self.created_at.into_into_dart().into_dart(),
+            self.state.into_into_dart().into_dart(),
         ]
         .into_dart()
     }
@@ -1657,6 +1673,28 @@ impl flutter_rust_bridge::IntoIntoDart<crate::api::platform::HostFact>
     }
 }
 // Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::types::MessageStateDto {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        match self {
+            Self::Queued => 0.into_dart(),
+            Self::Sent => 1.into_dart(),
+            Self::Delivered => 2.into_dart(),
+            _ => unreachable!(),
+        }
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
+    for crate::api::types::MessageStateDto
+{
+}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::types::MessageStateDto>
+    for crate::api::types::MessageStateDto
+{
+    fn into_into_dart(self) -> crate::api::types::MessageStateDto {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
 impl flutter_rust_bridge::IntoDart for crate::api::types::NearbyDevice {
     fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
         [
@@ -1830,6 +1868,7 @@ impl SseEncode for crate::api::types::ChatMessageDto {
         <String>::sse_encode(self.text, serializer);
         <bool>::sse_encode(self.outgoing, serializer);
         <i64>::sse_encode(self.created_at, serializer);
+        <crate::api::types::MessageStateDto>::sse_encode(self.state, serializer);
     }
 }
 
@@ -2089,6 +2128,23 @@ impl SseEncode for Vec<crate::api::types::ThreadSummary> {
         for item in self {
             <crate::api::types::ThreadSummary>::sse_encode(item, serializer);
         }
+    }
+}
+
+impl SseEncode for crate::api::types::MessageStateDto {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <i32>::sse_encode(
+            match self {
+                crate::api::types::MessageStateDto::Queued => 0,
+                crate::api::types::MessageStateDto::Sent => 1,
+                crate::api::types::MessageStateDto::Delivered => 2,
+                _ => {
+                    unimplemented!("");
+                }
+            },
+            serializer,
+        );
     }
 }
 
