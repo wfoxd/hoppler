@@ -2839,3 +2839,38 @@ fn an_unacknowledged_message_is_not_resent_by_itself() {
         "the mark was cleared by a reunion that did nothing"
     );
 }
+
+/// What a send hands back agrees with what it wrote down.
+///
+/// The row was promoted to `Sent` while the returned DTO still said `Queued` —
+/// one fact in two places, disagreeing. Every caller re-reads the thread after
+/// sending, which is precisely why nothing caught it: the wrong value was
+/// never the one drawn. It would have bitten the first caller that trusted
+/// what it was given.
+#[test]
+fn what_a_send_returns_says_what_the_row_says() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = fresh();
+    let peer = full_peer(&h.air, "peer", "Ada");
+    let device_id = meet_and_pair(&peer);
+    let thread = thread_for_device(device_id).unwrap().unwrap();
+
+    // She is here, so this one really goes.
+    let sent = send_chat_to_thread(thread, "away it goes".into()).unwrap();
+    let msg_id = hex::decode(&sent.msg_id).unwrap();
+    assert_eq!(
+        format!("{:?}", sent.state),
+        message_state_for_test(&msg_id).unwrap().unwrap(),
+        "the value handed back disagreed with the row it wrote"
+    );
+
+    // And with nobody to hand it to, both say it is still waiting.
+    set_discovery(false).unwrap();
+    let held = send_chat_to_thread(thread, "and this one waits".into()).unwrap();
+    let held_id = hex::decode(&held.msg_id).unwrap();
+    assert_eq!(
+        format!("{:?}", held.state),
+        message_state_for_test(&held_id).unwrap().unwrap(),
+        "a message with nowhere to go disagreed with its own row"
+    );
+}
