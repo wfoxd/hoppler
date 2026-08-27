@@ -1704,6 +1704,15 @@ pub fn receive_chat_for_test(device_id: &str, body: &[u8]) -> Result<Option<Core
     store_incoming_chat(device_id, body).map(|landed| landed.event)
 }
 
+/// Why an inbound chat body was turned away, for the contract tests.
+///
+/// `Some` only where a body failed to open — the one refusal that has a shape
+/// worth naming. Everything else this function can return `None` for was
+/// refused for a reason the store already records.
+pub fn refusal_for_test(device_id: &str, body: &[u8]) -> Result<Option<String>, String> {
+    store_incoming_chat(device_id, body).map(|l| l.refused.map(str::to_owned))
+}
+
 /// Take an acknowledgement as if it had arrived, for the contract tests.
 ///
 /// The *receiving* half, which is where the forgery check lives and where it
@@ -1741,6 +1750,16 @@ pub fn acked_on_receipt_for_test(device_id: &str, body: &[u8]) -> Result<bool, S
 /// What arrived, and what to say back about it.
 struct Landed {
     event: Option<CoreEvent>,
+    /// Why a body was turned away, when one was. Never a reason to *keep* it —
+    /// see [`why_refused`].
+    ///
+    /// **Logged, and not yet shown to anybody.** Review was right that the
+    /// design's "the log and the screen can say so" is only half true here: the
+    /// receive path uses `event` and `ack`, and this reaches a log line and the
+    /// contract tests. Putting it on a screen needs a `CoreEvent` and a
+    /// decision about where a dropped message should appear, which is a
+    /// separate slice rather than something to bolt on quietly.
+    refused: Option<&'static str>,
     /// A sealed `msg_id`, when this thread can seal one. `None` on an unpaired
     /// thread — see [`crate::session::frame::FrameKind::Ack`] for why that is a
     /// stated limit rather than a gap.
@@ -1781,10 +1800,18 @@ fn store_incoming_chat(device_id: &str, body: &[u8]) -> Result<Landed, String> {
                 // cannot show, and storing ciphertext as though somebody had
                 // written it would be worse than dropping it. Nothing moved, so
                 // there is nothing to keep.
-                log::warn!("dropping a chat message that would not open: {why}");
+                //
+                // Refused either way. What changes here is only what gets
+                // *said*: every unopenable body used to produce one line, so a
+                // message written before a pairing, a corrupt frame and a
+                // forgery were indistinguishable in a log and invisible on a
+                // screen.
+                let refusal = why_refused(body);
+                log::warn!("dropping a chat message that would not open: {refusal} ({why})");
                 return Ok(Landed {
                     event: None,
                     ack: None,
+                    refused: Some(refusal),
                 });
             }
         };
@@ -1806,6 +1833,7 @@ fn store_incoming_chat(device_id: &str, body: &[u8]) -> Result<Landed, String> {
                 return Ok(Landed {
                     event: None,
                     ack: None,
+                    refused: None,
                 });
             }
         };
@@ -1848,6 +1876,7 @@ fn store_incoming_chat(device_id: &str, body: &[u8]) -> Result<Landed, String> {
                 return Ok(Landed {
                     event: None,
                     ack: None,
+                    refused: None,
                 });
             }
         };
@@ -1892,11 +1921,13 @@ fn store_incoming_chat(device_id: &str, body: &[u8]) -> Result<Landed, String> {
             return Ok(Landed {
                 event: None,
                 ack: seal_ack(core, thread, &envelope.msg_id, now)?,
+                refused: None,
             });
         }
         let ack = seal_ack(core, thread, &envelope.msg_id, now)?;
         Ok(Landed {
             ack,
+            refused: None,
             event: Some(CoreEvent::MessageReceived {
                 thread_id: thread,
                 msg_id: hex::encode(envelope.msg_id),
@@ -1909,6 +1940,42 @@ fn store_incoming_chat(device_id: &str, body: &[u8]) -> Result<Landed, String> {
             }),
         })
     })
+}
+
+/// Why a body would not open, in words a person could be shown.
+///
+/// **A guess about the shape of some bytes, and never a reason to keep them.**
+/// The body has already been refused by the time this runs; nothing here can
+/// change that, and nothing here is trusted. That is what makes it safe to look
+/// at bytes that failed a forgery check — the answer goes to a log and a
+/// screen, not to the store.
+///
+/// A forged body would parse here too. It does not matter: a stranger who
+/// wanted to be told "that looked like a message from before we paired" is
+/// welcome to the sentence, because they had to write the bytes to earn it and
+/// it says nothing they did not already know.
+fn why_refused(body: &[u8]) -> &'static str {
+    if ChatEnvelope::decode(body).is_ok() {
+        // A whole envelope, in the clear, on a thread that now opens only
+        // sealed ones. Almost always a message written before the two of you
+        // paired: it was sealed with what the thread had at the time, which was
+        // nothing.
+        //
+        // Hedged, because it is a guess read off bytes nobody vouched for and
+        // the sentence may reach a person. "It was written before you paired"
+        // states as fact what this can only recognise the shape of — and the
+        // one reader who could be misled by the difference is the one holding
+        // a message that never arrived.
+        return "it looked like a message from before you paired";
+    }
+    if body.len() < ratchet::HEADER_LEN {
+        // Too short to be a ratchet header, so there was never a sealed message
+        // here to open.
+        return "it was too short to be a message";
+    }
+    // A ratchet header this end cannot follow: a chain it does not have, a key
+    // already spent, or bytes somebody made up.
+    "it could not be opened on this conversation"
 }
 
 /// The thread a peer's traffic belongs to, without creating one.

@@ -31,7 +31,7 @@ use rust_lib_hoppler::engine::{
     acked_on_receipt_for_test, has_session, init_with_transport, layer1_public_for_test,
     mark_delivered_for_test, mark_sent_for_test, message_state_for_test,
     queued_for_resend_for_test, queued_on_thread_for_test, ratchet_can_send_for_test,
-    ratchet_fingerprint_for_test, ratchet_size_for_test, receive_chat_for_test,
+    ratchet_fingerprint_for_test, ratchet_size_for_test, receive_chat_for_test, refusal_for_test,
     resend_queued_for_test, thread_rows_for_test,
 };
 use rust_lib_hoppler::identity::Identity;
@@ -2911,5 +2911,45 @@ fn what_a_send_returns_says_what_the_row_says() {
         format!("{:?}", held.state),
         message_state_for_test(&held_id).unwrap().unwrap(),
         "a message with nowhere to go disagreed with its own row"
+    );
+}
+
+/// A refused message says which kind of refusal it was (T12a slice 2).
+///
+/// Every unopenable body used to produce one line — *dropping a chat message
+/// that would not open* — so a message written before a pairing, a corrupt
+/// frame and a forgery were indistinguishable in a log and invisible on a
+/// screen. The bytes are refused either way; what changes is what can be said
+/// about them.
+///
+/// The reading is a guess about a shape and never a reason to keep anything,
+/// which is what makes it safe to look at bytes that just failed a check.
+#[test]
+fn a_refused_message_says_which_kind_of_refusal_it_was() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = fresh();
+    let peer = full_peer(&h.air, "peer", "Ada");
+    meet_and_pair(&peer);
+
+    // The case this slice exists for: a whole envelope in the clear, arriving
+    // on a thread that now opens only sealed ones.
+    let bare = ChatEnvelope::new(1, b"from before we paired".to_vec()).unwrap();
+    assert_eq!(
+        refusal_for_test(&peer.id, &bare.encode())
+            .unwrap()
+            .as_deref(),
+        Some("it looked like a message from before you paired"),
+    );
+
+    // Too short to have been a sealed anything.
+    assert_eq!(
+        refusal_for_test(&peer.id, &[1, 2, 3]).unwrap().as_deref(),
+        Some("it was too short to be a message"),
+    );
+
+    // Long enough to carry a ratchet header, and not one this end can follow.
+    assert_eq!(
+        refusal_for_test(&peer.id, &[0xab; 128]).unwrap().as_deref(),
+        Some("it could not be opened on this conversation"),
     );
 }
