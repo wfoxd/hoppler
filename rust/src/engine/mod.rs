@@ -1691,21 +1691,25 @@ pub fn receive_chat_for_test(device_id: &str, body: &[u8]) -> Result<Option<Core
     store_incoming_chat(device_id, body).map(|landed| landed.event)
 }
 
-/// Whether receiving this body would send an acknowledgement back, for the
-/// contract tests.
+/// Take an acknowledgement as if it had arrived, for the contract tests.
 ///
-/// The decision, not the bytes. Whether an ack goes out is the whole of what
-/// [`crate::session::frame::FrameKind::Ack`] promises and refuses — an
-/// unpaired thread must not produce one, because an unsealed ack is a
-/// forgeable claim that a message arrived — and none of it is visible through
-/// the public API, which reports what was received and never what was said
-/// back.
+/// The *receiving* half, which is where the forgery check lives and where it
+/// was missing: an unsealed body must not promote anything. Nothing on the
+/// public API can drive this — an ack arrives as a transport event and reports
+/// itself only by changing a row.
 pub fn mark_delivered_for_test(device_id: &str, body: &[u8]) -> Result<(), String> {
     mark_delivered(device_id, body)
 }
 
 /// Whether receiving this body would send an acknowledgement back, for the
 /// contract tests.
+///
+/// The *sending* half, and the decision rather than the bytes. Whether an ack
+/// goes out is the whole of what [`crate::session::frame::FrameKind::Ack`]
+/// promises and refuses — an unpaired thread must not produce one, because an
+/// unsealed ack is a forgeable claim that a message arrived — and none of it is
+/// visible through the public API, which reports what was received and never
+/// what was said back.
 pub fn acked_on_receipt_for_test(device_id: &str, body: &[u8]) -> Result<bool, String> {
     store_incoming_chat(device_id, body).map(|landed| landed.ack.is_some())
 }
