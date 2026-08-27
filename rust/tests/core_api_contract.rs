@@ -2748,3 +2748,62 @@ fn an_unpaired_thread_does_not_acknowledge() {
         "an unpaired thread sent an unsealed delivery claim"
     );
 }
+
+/// A message nobody acknowledged is marked, and left alone (T14a).
+///
+/// The decision, and it is a decision rather than a consequence: an unacked
+/// message stays visible as unacked and is **not** resent by itself. Today that
+/// falls out of `queued_for_resend` selecting `Queued` rows, which is an
+/// accident of which state the query names — so it is pinned here before
+/// somebody widens that query and turns every lost acknowledgement into a
+/// duplicate delivery arriving days later.
+///
+/// The alternative was rejected on what it would cost the person rather than
+/// the protocol. A receiver dedupes on `msg_id`, so an automatic resend is safe
+/// — it is just never *finished*: a message that cannot be delivered is retried
+/// at every reunion for ever, and the one thing nobody can do about it is know
+/// that is what is happening. Marked and still costs a decision; resent for
+/// ever costs attention and never asks.
+#[test]
+fn an_unacknowledged_message_is_not_resent_by_itself() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = fresh();
+    let peer = full_peer(&h.air, "peer", "Ada");
+    let device_id = meet_and_pair(&peer);
+    let thread = thread_for_device(device_id.clone()).unwrap().unwrap();
+
+    // Written and away, with nothing coming back — the state this decision is
+    // about.
+    set_discovery(false).unwrap();
+    let sent = send_chat_to_thread(thread, "did that land?".into()).unwrap();
+    let msg_id = hex::decode(&sent.msg_id).unwrap();
+    mark_sent_for_test(thread).unwrap();
+    assert_eq!(
+        message_state_for_test(&msg_id).unwrap().as_deref(),
+        Some("Sent"),
+        "the row is not in the state this test is about"
+    );
+
+    // A reunion. It has plenty to do and nothing to do with this message.
+    set_discovery(true).unwrap();
+    until("the peer to be reachable again", || {
+        pump(&peer);
+        nearby_devices()
+            .unwrap()
+            .iter()
+            .any(|d| d.device_id.as_deref() == Some(peer.id.as_str()))
+    });
+
+    let owed = queued_for_resend_for_test(&device_id).unwrap();
+    assert!(
+        !owed.iter().any(|(_, id)| *id == sent.msg_id),
+        "a reunion resent a message that had already gone, with no request from anyone"
+    );
+    // And it is still marked, so the person can see it never arrived and decide
+    // for themselves.
+    assert_eq!(
+        message_state_for_test(&msg_id).unwrap().as_deref(),
+        Some("Sent"),
+        "the mark was cleared by a reunion that did nothing"
+    );
+}
