@@ -12,6 +12,7 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use rust_lib_hoppler::block::Blocklist;
 use rust_lib_hoppler::discovery::protocol::{Request, Response, PSEUDONYM_LEN, REQUEST_LEN};
 use rust_lib_hoppler::discovery::{hint, Discovery, ROTATION_PERIOD};
 use rust_lib_hoppler::identity::Identity;
@@ -67,6 +68,9 @@ struct Node {
     /// The wall clock this node's hints are computed against, in ms. Shared
     /// with the `Discovery`, so a test moves time by writing to it.
     clock: Arc<Mutex<i64>>,
+    /// The same list the `Discovery` enforces — one object, not a copy. A test
+    /// blocks somebody by writing here, which is what `engine::install` does.
+    blocked: Arc<Blocklist>,
 }
 
 impl Node {
@@ -92,9 +96,11 @@ fn node(net: &LoopbackNet, id: &str, now: Instant) -> Node {
     )));
     let clock = Arc::new(Mutex::new(EPOCH_ZERO));
     let reads = clock.clone();
+    let blocked = Arc::new(Blocklist::default());
     let discovery = Discovery::with_clock(
         transport.clone(),
         identity.clone(),
+        blocked.clone(),
         now,
         Box::new(move || *reads.lock().unwrap_or_else(|e| e.into_inner())),
     );
@@ -108,6 +114,7 @@ fn node(net: &LoopbackNet, id: &str, now: Instant) -> Node {
         id: id.to_string(),
         identity,
         clock,
+        blocked,
     }
 }
 
@@ -173,7 +180,7 @@ fn the_null_response_is_and_stays_nothing() {
 
     // 2. Discovery on, but the requester is blocked.
     responder.discovery.set_enabled(true, now).unwrap();
-    responder.discovery.block(blocked_pseudonym);
+    responder.blocked.block(blocked_pseudonym);
     let blocked = ask(&asker, &responder, &Request::new(blocked_pseudonym), now);
 
     // 3. Discovery on, not blocked, but over its allowance.

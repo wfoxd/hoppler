@@ -26,19 +26,22 @@ use rust_lib_hoppler::api::pairing::{
 };
 use rust_lib_hoppler::api::transfers::offer_drop;
 use rust_lib_hoppler::api::types::{CoreEvent, MessageStateDto};
+use rust_lib_hoppler::block::Blocklist;
 use rust_lib_hoppler::discovery::Discovery;
+use rust_lib_hoppler::engine::fake::placeholder_pseudonym;
 use rust_lib_hoppler::engine::{
     acked_on_receipt_for_test, drain_events_for_test, has_session, init_with_transport,
     layer1_public_for_test, mark_delivered_for_test, mark_sent_for_test, message_state_for_test,
-    queued_for_resend_for_test, queued_on_thread_for_test, ratchet_can_send_for_test,
-    ratchet_fingerprint_for_test, ratchet_size_for_test, receive_chat_for_test,
-    record_events_for_test, refusal_for_test, resend_queued_for_test, stop_recording_for_test,
-    thread_rows_for_test,
+    open_store_for_test, queued_for_resend_for_test, queued_on_thread_for_test,
+    ratchet_can_send_for_test, ratchet_fingerprint_for_test, ratchet_size_for_test,
+    receive_chat_for_test, record_events_for_test, refusal_for_test, resend_queued_for_test,
+    stop_recording_for_test, thread_rows_for_test,
 };
 use rust_lib_hoppler::identity::Identity;
 use rust_lib_hoppler::pairing::invite::Invite;
 use rust_lib_hoppler::session::chat::{ChatEnvelope, MAX_AHEAD, MAX_BODY, MAX_UNACKED};
 use rust_lib_hoppler::session::ratchet::{self, Header, Ratchet};
+use rust_lib_hoppler::store::NewContact;
 use rust_lib_hoppler::transport::loopback::LoopbackNet;
 use rust_lib_hoppler::transport::{Transport, TransportError, TransportEvent};
 
@@ -85,7 +88,12 @@ fn advertising_peer(air: &LoopbackNet, id: &str) -> (Discovery, Receiver<Transpo
     });
     let transport: Arc<dyn Transport> = Arc::new(air.join(id, sink));
     let identity = Arc::new(Mutex::new(Identity::generate(id, 0x00_ff_00)));
-    let d = Discovery::new(transport, identity, Instant::now());
+    let d = Discovery::new(
+        transport,
+        identity,
+        Arc::new(Blocklist::default()),
+        Instant::now(),
+    );
     // What `Net::new` does for the real one. Without it the advert goes out
     // under an id the hint was not computed against, and nothing says so.
     d.set_local_id_for_tiebreak(id);
@@ -112,6 +120,145 @@ fn until(what: &str, mut cond: impl FnMut() -> bool) {
         std::thread::sleep(Duration::from_millis(10));
     }
     panic!("timed out waiting for {what}");
+}
+
+/// A second engine over the same directory — a restart, as far as the store is
+/// concerned.
+///
+/// The rung id differs per boot because a loopback airspace holds one member
+/// per id, and because a restarted device really does come back under a fresh
+/// one (R0-F2).
+fn boot(dir: &tempfile::TempDir, air: &LoopbackNet, id: &str) {
+    let (tx, rx) = channel();
+    let tx = Mutex::new(tx);
+    let sink: Box<dyn Fn(TransportEvent) + Send + Sync> = Box::new(move |e| {
+        let _ = tx.lock().unwrap_or_else(|p| p.into_inner()).send(e);
+    });
+    let transport: Arc<dyn Transport> = Arc::new(air.join(id, sink));
+    init_with_transport(dir.path().to_str().unwrap().to_string(), transport, id, rx).unwrap();
+}
+
+/// A second view of the same database, for a test to write facts the engine has
+/// no API to write yet — the block *action* is T18b.
+fn on_disk(dir: &tempfile::TempDir) -> rust_lib_hoppler::store::Store {
+    open_store_for_test(dir.path().to_str().unwrap().to_string()).unwrap()
+}
+
+/// A block is a fact about a person, not a mood this run happens to be in.
+///
+/// The `blocklist` table has been in the schema since its first version and
+/// nothing has ever read it back, so a block written before this slice was
+/// forgotten at the next launch. What fixes that is one line in `install`,
+/// which is exactly why it gets a test of its own.
+#[test]
+fn a_block_on_disk_is_in_force_at_the_next_launch() {
+    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let air = LoopbackNet::new();
+    boot(&dir, &air, "core-first");
+
+    // Somebody we paired with, so the row comes off the disk with no radio
+    // involved and this test says nothing about discovery timing.
+    let mallory = [7u8; 32];
+    {
+        let store = on_disk(&dir);
+        let id = store
+            .add_contact(&NewContact {
+                pseudonym: mallory,
+                l2_pub: [1u8; 32],
+                name: "Mallory".into(),
+                colour: 0x00_ff_00,
+                persona_version: 1,
+                first_seen: 0,
+            })
+            .unwrap();
+        store
+            .record_pairing(
+                id, &[1u8; 32], "Mallory", 0x00_ff_00, 1, &[2u8; 32], &[3u8; 4], 0,
+            )
+            .unwrap();
+    }
+
+    // The control, and it has to come first: with nothing on the block list the
+    // row is drawn. Without this the assertion below would pass just as well
+    // for a row that was never going to appear.
+    boot(&dir, &air, "core-second");
+    assert!(
+        nearby_devices()
+            .unwrap()
+            .iter()
+            .any(|d| d.name == "Mallory"),
+        "the paired row is not drawn at all, so hiding it proves nothing"
+    );
+
+    on_disk(&dir).block(&mallory, 0, true).unwrap();
+
+    boot(&dir, &air, "core-third");
+    assert!(
+        !nearby_devices()
+            .unwrap()
+            .iter()
+            .any(|d| d.name == "Mallory"),
+        "a block written to disk was forgotten at the next launch: the \
+         list the app enforces is not the list the user wrote"
+    );
+}
+
+/// §12's fourth surface, on the other loop: a blocked device we can currently
+/// see.
+///
+/// Absence is asserted against an ordering rather than a timeout. Both peers
+/// join after the engine, blocked one first, and the pump processes transport
+/// events on one thread in order — so by the time the *second* peer has a row,
+/// the first one's advertisement has certainly been seen and refused.
+#[test]
+fn a_blocked_device_in_front_of_us_draws_no_row() {
+    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let air = LoopbackNet::new();
+    boot(&dir, &air, "core-before");
+
+    // No session has ever proved who this device is, so the row the engine
+    // would draw is keyed on the placeholder derived from its rung id — and
+    // that is what a block written against such a row would hold.
+    let mallory = placeholder_pseudonym("mallory-device");
+    {
+        let store = on_disk(&dir);
+        store
+            .add_contact(&NewContact {
+                pseudonym: mallory,
+                l2_pub: [0u8; 32],
+                name: "Mallory".into(),
+                colour: 0x00_ff_00,
+                persona_version: 1,
+                first_seen: 0,
+            })
+            .unwrap();
+        store.block(&mallory, 0, false).unwrap();
+    }
+
+    boot(&dir, &air, "core-after");
+    let (_blocked, _rb) = advertising_peer(&air, "mallory-device");
+    let (_friend, _rf) = advertising_peer(&air, "friend-device");
+    set_discovery(true).unwrap();
+    until("an unblocked peer to appear", || {
+        nearby_devices()
+            .map(|d| {
+                d.iter()
+                    .any(|d| d.device_id.as_deref() == Some("friend-device"))
+            })
+            .unwrap_or(false)
+    });
+
+    let listed: Vec<String> = nearby_devices()
+        .unwrap()
+        .iter()
+        .filter_map(|d| d.device_id.clone())
+        .collect();
+    assert!(
+        !listed.iter().any(|id| id == "mallory-device"),
+        "a blocked device is still listed as nearby: {listed:?}"
+    );
 }
 
 #[test]
@@ -842,8 +989,13 @@ fn session_peer(air: &LoopbackNet, id: &str, identity: Arc<Mutex<Identity>>) -> 
         let _ = tx.lock().unwrap_or_else(|p| p.into_inner()).send(e);
     });
     let transport: Arc<dyn Transport> = Arc::new(air.join(id, sink));
-    let net =
-        rust_lib_hoppler::engine::net::Net::new(transport.clone(), identity, id, Instant::now());
+    let net = rust_lib_hoppler::engine::net::Net::new(
+        transport.clone(),
+        identity,
+        Arc::new(Blocklist::default()),
+        id,
+        Instant::now(),
+    );
     // Discovery on, or the peer never answers the persona request — and an IK
     // handshake cannot start without the responder's static key in advance, so
     // the session would never form and the rotation would go untested.
@@ -1250,6 +1402,7 @@ fn full_peer_with(air: &LoopbackNet, id: &str, identity: Identity) -> FullPeer {
     let net = rust_lib_hoppler::engine::net::Net::new(
         transport.clone(),
         identity.clone(),
+        Arc::new(Blocklist::default()),
         id,
         Instant::now(),
     );

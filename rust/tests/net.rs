@@ -14,6 +14,8 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use rust_lib_hoppler::block::Blocklist;
+use rust_lib_hoppler::discovery::protocol::Request;
 use rust_lib_hoppler::discovery::ROTATION_PERIOD;
 use rust_lib_hoppler::engine::net::{
     Net, NetEvent, CEREMONY_CONFIRM_DEADLINE, CEREMONY_DEADLINE, PING_DEADLINE,
@@ -32,6 +34,8 @@ struct Node {
     rx: Receiver<TransportEvent>,
     id: String,
     identity: Arc<Mutex<Identity>>,
+    /// The same list this node's `Net` and its `Discovery` both enforce.
+    blocked: Arc<Blocklist>,
 }
 
 /// Every test builds its airspace here, and every one of them fragments.
@@ -56,12 +60,20 @@ fn node(air: &LoopbackNet, id: &str, name: &str, now: Instant) -> Node {
     });
     let transport: Arc<dyn Transport> = Arc::new(air.join(id, sink));
     let identity = Arc::new(Mutex::new(Identity::generate(name, 0x00_88_ff)));
+    let blocked = Arc::new(Blocklist::default());
     Node {
-        net: Net::new(transport.clone(), identity.clone(), id, now),
+        net: Net::new(
+            transport.clone(),
+            identity.clone(),
+            blocked.clone(),
+            id,
+            now,
+        ),
         transport,
         rx,
         id: id.to_string(),
         identity,
+        blocked,
     }
 }
 
@@ -238,7 +250,7 @@ fn a_blocked_peer_gets_no_session_and_no_signal() {
         .unwrap();
         a.pseudonym_toward(&bob_persona.l2_pub).0
     };
-    bob.net.block(alice_pseudonym);
+    bob.blocked.block(alice_pseudonym);
 
     alice.net.reach(&bob.id).unwrap();
     let (a_events, b_events) = settle(&alice, &bob, now);
@@ -476,6 +488,117 @@ fn a_ping_to_an_unreachable_peer_reports_failure() {
     );
 }
 
+/// §12's third surface: a session that is **already open** when the block is
+/// written.
+///
+/// The other block tests here refuse at the handshake, which is the easy case —
+/// no session ever forms. The table names an established session separately for
+/// a reason: T18b will tear one down at block time, and a teardown races the
+/// bytes already in the pipe. The pump thread can be holding a frame while the
+/// user's thumb is still on the button.
+///
+/// So the gate sits at ingress as well, where the race has no wrong outcome —
+/// and where a frame kind added later inherits the enforcement without its
+/// author having to know that it should.
+#[test]
+fn a_block_stops_a_session_that_is_already_open() {
+    let air = air();
+    let now = Instant::now();
+    let alice = node(&air, "alice", "Alice", now);
+    let bob = node(&air, "bob", "Bob", now);
+    bob.net.discovery().set_enabled(true, now).unwrap();
+    alice.net.discovery().set_enabled(true, now).unwrap();
+    alice.net.discovery().start_scanning().unwrap();
+    settle(&alice, &bob, now);
+    alice.net.reach(&bob.id).unwrap();
+    settle(&alice, &bob, now);
+
+    // The control, and it has to come first: a session that works, so the
+    // silence below is the block's doing and not a handshake that never
+    // completed.
+    alice.net.ping(&bob.id, now).unwrap();
+    let (heard_back, heard) = settle(&alice, &bob, now);
+    assert!(
+        heard.iter().any(|e| matches!(e, NetEvent::Pinged { .. })),
+        "no session to block: the unblocked ping never landed: {heard:?}"
+    );
+    assert!(
+        heard_back
+            .iter()
+            .any(|e| matches!(e, NetEvent::PingAcked { .. })),
+        "the unblocked ping was never answered: {heard_back:?}"
+    );
+
+    // Alice's pseudonym toward Bob — the value his handshake proved, and the
+    // only thing in a live session there is to key on.
+    let bob_persona = rust_lib_hoppler::identity::verify_persona_record(
+        &bob.identity.lock().unwrap().persona_record(),
+    )
+    .unwrap();
+    let alice_pseudonym = alice
+        .identity
+        .lock()
+        .unwrap()
+        .pseudonym_toward(&bob_persona.l2_pub)
+        .0;
+    bob.blocked.block(alice_pseudonym);
+
+    // The session is untouched — nothing was torn down — and the frames must
+    // stop anyway.
+    alice.net.ping(&bob.id, now).unwrap();
+    let (after_back, after) = settle(&alice, &bob, now);
+    assert!(
+        !after.iter().any(|e| matches!(e, NetEvent::Pinged { .. })),
+        "a blocked peer's Ping was delivered over a session opened before the \
+         block: {after:?}"
+    );
+    assert!(
+        !after_back
+            .iter()
+            .any(|e| matches!(e, NetEvent::PingAcked { .. })),
+        "the blocked sender was answered, which tells her the session is still \
+         live and she is being ignored on purpose: {after_back:?}"
+    );
+}
+
+/// One list, not two copies kept in step.
+///
+/// `Net` and `Discovery` each held their own `Vec` before this slice, and
+/// `Net::block` wrote both — correct exactly as long as everyone remembered.
+/// This asserts the structure instead: a block written through the session
+/// layer's handle is already in force at the persona endpoint, because there is
+/// only one object.
+#[test]
+fn one_write_shuts_both_doors() {
+    let air = air();
+    let now = Instant::now();
+    let bob = node(&air, "bob", "Bob", now);
+    bob.net.discovery().set_enabled(true, now).unwrap();
+
+    let mallory = [7u8; 32];
+    let stranger = [9u8; 32];
+    let ask = |who: [u8; 32]| {
+        bob.net
+            .discovery()
+            .answer("asker", &Request::new(who).encode(), now)
+    };
+
+    assert!(
+        ask(mallory).is_some(),
+        "the endpoint refused before anybody was blocked — this test proves nothing"
+    );
+    bob.net.blocklist().block(mallory);
+    assert!(
+        ask(mallory).is_none(),
+        "a block written through Net left the persona endpoint answering: the \
+         two layers are not sharing a list"
+    );
+    assert!(
+        ask(stranger).is_some(),
+        "blocking one pseudonym silenced the endpoint for everybody"
+    );
+}
+
 /// ...but a *blocked* peer must still produce nothing.
 ///
 /// The distinction that makes the above safe for R0-F10: an unreachable peer
@@ -501,7 +624,7 @@ fn a_blocked_peer_is_indistinguishable_from_an_absent_one() {
         .unwrap()
         .pseudonym_toward(&bob_persona.l2_pub)
         .0;
-    bob.net.block(pseudonym);
+    bob.blocked.block(pseudonym);
 
     // What an absent peer looks like, to compare against.
     let _ = alice.net.ping("ghost", now);
@@ -1207,7 +1330,13 @@ fn the_clock_asks_about_a_peer_that_has_gone_quiet() {
         asked: asked.clone(),
     });
     let identity = Arc::new(Mutex::new(Identity::generate("Alice", 0x00_88_ff)));
-    let net = Net::new(rung.clone(), identity, "alice", now);
+    let net = Net::new(
+        rung.clone(),
+        identity,
+        Arc::new(Blocklist::default()),
+        "alice",
+        now,
+    );
     net.discovery().set_enabled(true, now).unwrap();
 
     let sighted = |t| {

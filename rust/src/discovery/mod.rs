@@ -35,6 +35,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::block::{Admit, Blocklist};
 use crate::identity::{self, Identity};
 use crate::transport::{PeerId, Transport, TransportError, TransportEvent};
 use hint::HINT_LEN;
@@ -132,7 +133,9 @@ struct Inner {
     /// together that they do not: a peer that rotates has no entry here under
     /// its new id, and has to be learned again.
     personas: Mutex<HashMap<PeerId, identity::VerifiedPersona>>,
-    blocked: Mutex<Vec<[u8; PSEUDONYM_LEN]>>,
+    /// Shared with `engine::net::Net` — one list, not a copy. See
+    /// [`crate::block`] for why there is exactly one.
+    blocked: Arc<Blocklist>,
     buckets: Mutex<Buckets>,
     last_rotation: Mutex<Instant>,
     /// The payload currently on the air, so [`Discovery::publish`] can tell a
@@ -165,9 +168,10 @@ impl Discovery {
     pub fn new(
         transport: Arc<dyn Transport>,
         identity: Arc<Mutex<Identity>>,
+        blocked: Arc<Blocklist>,
         now: Instant,
     ) -> Self {
-        Self::with_clock(transport, identity, now, Box::new(system_millis))
+        Self::with_clock(transport, identity, blocked, now, Box::new(system_millis))
     }
 
     /// As [`Self::new`], with the wall clock supplied.
@@ -179,6 +183,7 @@ impl Discovery {
     pub fn with_clock(
         transport: Arc<dyn Transport>,
         identity: Arc<Mutex<Identity>>,
+        blocked: Arc<Blocklist>,
         now: Instant,
         clock: Box<dyn Fn() -> i64 + Send + Sync>,
     ) -> Self {
@@ -191,7 +196,7 @@ impl Discovery {
                 sightings: Mutex::new(HashMap::new()),
                 last_seen: Mutex::new(HashMap::new()),
                 personas: Mutex::new(HashMap::new()),
-                blocked: Mutex::new(Vec::new()),
+                blocked,
                 buckets: Mutex::new(Buckets {
                     hits: HashMap::new(),
                 }),
@@ -308,14 +313,6 @@ impl Discovery {
             })
             .cloned()
             .collect()
-    }
-
-    /// Block a pseudonym. Silent and local (R0-F10).
-    pub fn block(&self, pseudonym: [u8; PSEUDONYM_LEN]) {
-        let mut blocked = self.inner.blocked.lock().unwrap_or_else(|e| e.into_inner());
-        if !blocked.contains(&pseudonym) {
-            blocked.push(pseudonym);
-        }
     }
 
     /// Rotate the advertised id if it is due. Driven by the caller's clock so
@@ -620,13 +617,14 @@ impl Discovery {
                 .unwrap_or_else(|e| e.into_inner())
                 .allow(&who, now);
 
+            // A first-contact request carries no pseudonym to gate on — the
+            // zero placeholder is not a peer — so it is answered on the
+            // allowance alone. That is not a hole a blocked device can walk
+            // through: the record it gets back is the same public persona it
+            // could read off our advertisement, and every step after it
+            // (handshake, session, frames) asks the gate.
             let blocked = !request.is_first_contact()
-                && self
-                    .inner
-                    .blocked
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .contains(&request.pseudonym);
+                && self.inner.blocked.ingress_gate(&request.pseudonym) == Admit::Silence;
 
             !within_allowance || blocked
         };
