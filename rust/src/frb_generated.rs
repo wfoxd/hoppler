@@ -948,6 +948,16 @@ impl SseDecode for crate::api::types::CoreEvent {
             4 => {
                 let mut var_threadId = <i64>::sse_decode(deserializer);
                 let mut var_msgId = <String>::sse_decode(deserializer);
+                let mut var_state = <crate::api::types::MessageStateDto>::sse_decode(deserializer);
+                return crate::api::types::CoreEvent::MessageStateChanged {
+                    thread_id: var_threadId,
+                    msg_id: var_msgId,
+                    state: var_state,
+                };
+            }
+            5 => {
+                let mut var_threadId = <i64>::sse_decode(deserializer);
+                let mut var_msgId = <String>::sse_decode(deserializer);
                 let mut var_text = <String>::sse_decode(deserializer);
                 return crate::api::types::CoreEvent::MessageReceived {
                     thread_id: var_threadId,
@@ -955,7 +965,7 @@ impl SseDecode for crate::api::types::CoreEvent {
                     text: var_text,
                 };
             }
-            5 => {
+            6 => {
                 let mut var_transferId = <String>::sse_decode(deserializer);
                 let mut var_received = <u64>::sse_decode(deserializer);
                 let mut var_total = <u64>::sse_decode(deserializer);
@@ -965,7 +975,7 @@ impl SseDecode for crate::api::types::CoreEvent {
                     total: var_total,
                 };
             }
-            6 => {
+            7 => {
                 let mut var_transferId = <String>::sse_decode(deserializer);
                 let mut var_success = <bool>::sse_decode(deserializer);
                 return crate::api::types::CoreEvent::TransferCompleted {
@@ -973,7 +983,7 @@ impl SseDecode for crate::api::types::CoreEvent {
                     success: var_success,
                 };
             }
-            7 => {
+            8 => {
                 let mut var_deviceId = <String>::sse_decode(deserializer);
                 let mut var_colours =
                     <Vec<crate::api::types::SasColourDto>>::sse_decode(deserializer);
@@ -984,13 +994,13 @@ impl SseDecode for crate::api::types::CoreEvent {
                     word: var_word,
                 };
             }
-            8 => {
+            9 => {
                 let mut var_deviceId = <String>::sse_decode(deserializer);
                 return crate::api::types::CoreEvent::PairingPeerConfirmed {
                     device_id: var_deviceId,
                 };
             }
-            9 => {
+            10 => {
                 let mut var_deviceId = <String>::sse_decode(deserializer);
                 let mut var_threadId = <i64>::sse_decode(deserializer);
                 let mut var_name = <String>::sse_decode(deserializer);
@@ -1002,7 +1012,7 @@ impl SseDecode for crate::api::types::CoreEvent {
                     colour: var_colour,
                 };
             }
-            10 => {
+            11 => {
                 let mut var_deviceId = <String>::sse_decode(deserializer);
                 let mut var_reason = <String>::sse_decode(deserializer);
                 return crate::api::types::CoreEvent::PairingFailed {
@@ -1010,7 +1020,7 @@ impl SseDecode for crate::api::types::CoreEvent {
                     reason: var_reason,
                 };
             }
-            11 => {
+            12 => {
                 let mut var_available = <bool>::sse_decode(deserializer);
                 let mut var_reason = <Option<String>>::sse_decode(deserializer);
                 return crate::api::types::CoreEvent::RadioChanged {
@@ -1485,12 +1495,23 @@ impl flutter_rust_bridge::IntoDart for crate::api::types::CoreEvent {
                 reason.into_into_dart().into_dart(),
             ]
             .into_dart(),
+            crate::api::types::CoreEvent::MessageStateChanged {
+                thread_id,
+                msg_id,
+                state,
+            } => [
+                4.into_dart(),
+                thread_id.into_into_dart().into_dart(),
+                msg_id.into_into_dart().into_dart(),
+                state.into_into_dart().into_dart(),
+            ]
+            .into_dart(),
             crate::api::types::CoreEvent::MessageReceived {
                 thread_id,
                 msg_id,
                 text,
             } => [
-                4.into_dart(),
+                5.into_dart(),
                 thread_id.into_into_dart().into_dart(),
                 msg_id.into_into_dart().into_dart(),
                 text.into_into_dart().into_dart(),
@@ -1501,7 +1522,7 @@ impl flutter_rust_bridge::IntoDart for crate::api::types::CoreEvent {
                 received,
                 total,
             } => [
-                5.into_dart(),
+                6.into_dart(),
                 transfer_id.into_into_dart().into_dart(),
                 received.into_into_dart().into_dart(),
                 total.into_into_dart().into_dart(),
@@ -1511,7 +1532,7 @@ impl flutter_rust_bridge::IntoDart for crate::api::types::CoreEvent {
                 transfer_id,
                 success,
             } => [
-                6.into_dart(),
+                7.into_dart(),
                 transfer_id.into_into_dart().into_dart(),
                 success.into_into_dart().into_dart(),
             ]
@@ -1521,14 +1542,14 @@ impl flutter_rust_bridge::IntoDart for crate::api::types::CoreEvent {
                 colours,
                 word,
             } => [
-                7.into_dart(),
+                8.into_dart(),
                 device_id.into_into_dart().into_dart(),
                 colours.into_into_dart().into_dart(),
                 word.into_into_dart().into_dart(),
             ]
             .into_dart(),
             crate::api::types::CoreEvent::PairingPeerConfirmed { device_id } => {
-                [8.into_dart(), device_id.into_into_dart().into_dart()].into_dart()
+                [9.into_dart(), device_id.into_into_dart().into_dart()].into_dart()
             }
             crate::api::types::CoreEvent::PairingCompleted {
                 device_id,
@@ -1536,7 +1557,7 @@ impl flutter_rust_bridge::IntoDart for crate::api::types::CoreEvent {
                 name,
                 colour,
             } => [
-                9.into_dart(),
+                10.into_dart(),
                 device_id.into_into_dart().into_dart(),
                 thread_id.into_into_dart().into_dart(),
                 name.into_into_dart().into_dart(),
@@ -1544,13 +1565,13 @@ impl flutter_rust_bridge::IntoDart for crate::api::types::CoreEvent {
             ]
             .into_dart(),
             crate::api::types::CoreEvent::PairingFailed { device_id, reason } => [
-                10.into_dart(),
+                11.into_dart(),
                 device_id.into_into_dart().into_dart(),
                 reason.into_into_dart().into_dart(),
             ]
             .into_dart(),
             crate::api::types::CoreEvent::RadioChanged { available, reason } => [
-                11.into_dart(),
+                12.into_dart(),
                 available.into_into_dart().into_dart(),
                 reason.into_into_dart().into_dart(),
             ]
@@ -1894,12 +1915,22 @@ impl SseEncode for crate::api::types::CoreEvent {
                 <String>::sse_encode(device_id, serializer);
                 <String>::sse_encode(reason, serializer);
             }
+            crate::api::types::CoreEvent::MessageStateChanged {
+                thread_id,
+                msg_id,
+                state,
+            } => {
+                <i32>::sse_encode(4, serializer);
+                <i64>::sse_encode(thread_id, serializer);
+                <String>::sse_encode(msg_id, serializer);
+                <crate::api::types::MessageStateDto>::sse_encode(state, serializer);
+            }
             crate::api::types::CoreEvent::MessageReceived {
                 thread_id,
                 msg_id,
                 text,
             } => {
-                <i32>::sse_encode(4, serializer);
+                <i32>::sse_encode(5, serializer);
                 <i64>::sse_encode(thread_id, serializer);
                 <String>::sse_encode(msg_id, serializer);
                 <String>::sse_encode(text, serializer);
@@ -1909,7 +1940,7 @@ impl SseEncode for crate::api::types::CoreEvent {
                 received,
                 total,
             } => {
-                <i32>::sse_encode(5, serializer);
+                <i32>::sse_encode(6, serializer);
                 <String>::sse_encode(transfer_id, serializer);
                 <u64>::sse_encode(received, serializer);
                 <u64>::sse_encode(total, serializer);
@@ -1918,7 +1949,7 @@ impl SseEncode for crate::api::types::CoreEvent {
                 transfer_id,
                 success,
             } => {
-                <i32>::sse_encode(6, serializer);
+                <i32>::sse_encode(7, serializer);
                 <String>::sse_encode(transfer_id, serializer);
                 <bool>::sse_encode(success, serializer);
             }
@@ -1927,13 +1958,13 @@ impl SseEncode for crate::api::types::CoreEvent {
                 colours,
                 word,
             } => {
-                <i32>::sse_encode(7, serializer);
+                <i32>::sse_encode(8, serializer);
                 <String>::sse_encode(device_id, serializer);
                 <Vec<crate::api::types::SasColourDto>>::sse_encode(colours, serializer);
                 <String>::sse_encode(word, serializer);
             }
             crate::api::types::CoreEvent::PairingPeerConfirmed { device_id } => {
-                <i32>::sse_encode(8, serializer);
+                <i32>::sse_encode(9, serializer);
                 <String>::sse_encode(device_id, serializer);
             }
             crate::api::types::CoreEvent::PairingCompleted {
@@ -1942,19 +1973,19 @@ impl SseEncode for crate::api::types::CoreEvent {
                 name,
                 colour,
             } => {
-                <i32>::sse_encode(9, serializer);
+                <i32>::sse_encode(10, serializer);
                 <String>::sse_encode(device_id, serializer);
                 <i64>::sse_encode(thread_id, serializer);
                 <String>::sse_encode(name, serializer);
                 <u32>::sse_encode(colour, serializer);
             }
             crate::api::types::CoreEvent::PairingFailed { device_id, reason } => {
-                <i32>::sse_encode(10, serializer);
+                <i32>::sse_encode(11, serializer);
                 <String>::sse_encode(device_id, serializer);
                 <String>::sse_encode(reason, serializer);
             }
             crate::api::types::CoreEvent::RadioChanged { available, reason } => {
-                <i32>::sse_encode(11, serializer);
+                <i32>::sse_encode(12, serializer);
                 <bool>::sse_encode(available, serializer);
                 <Option<String>>::sse_encode(reason, serializer);
             }

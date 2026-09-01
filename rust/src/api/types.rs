@@ -129,6 +129,18 @@ pub enum CoreEvent {
     /// no event at all — which is what keeps "blocked" indistinguishable from
     /// "not there" (R0-F10).
     PingFailed { device_id: String, reason: String },
+    /// A message this device sent has got further along.
+    ///
+    /// The state is on the row the moment it changes, and until this existed
+    /// nothing told the screen so — the conversation redrew when a message
+    /// *arrived* and at no other time. A line sat at "not confirmed" while the
+    /// store already said delivered, and only leaving and coming back put it
+    /// right. Watching your own message is exactly when somebody is looking.
+    MessageStateChanged {
+        thread_id: i64,
+        msg_id: String,
+        state: MessageStateDto,
+    },
     /// A message arrived on a thread.
     MessageReceived {
         thread_id: i64,

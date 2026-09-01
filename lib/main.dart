@@ -167,7 +167,12 @@ class _HomePageState extends State<HomePage> {
   ///
   /// Null whenever no thread is open, which is also what stops a closed route
   /// being redrawn.
-  Future<void> Function(int threadId)? _onThreadArrival;
+  /// Re-read the open conversation, whatever moved in it.
+  ///
+  /// One callback for arrivals and for a line of our own changing state. They
+  /// are the same request — *this thread is not what you drew* — and two hooks
+  /// would be two chances for a screen to miss one.
+  Future<void> Function(int threadId)? _onThreadChanged;
   late final PingService _pingService;
 
   @override
@@ -262,7 +267,13 @@ class _HomePageState extends State<HomePage> {
           _log.insert(0, 'Ping failed: $reason');
         case CoreEvent_MessageReceived(:final text, :final threadId):
           _log.insert(0, 'Message: $text');
-          unawaited(_onThreadArrival?.call(threadId.toInt()) ?? Future.value());
+          unawaited(_onThreadChanged?.call(threadId.toInt()) ?? Future.value());
+        // A message of ours got further along. Nothing for the log — the person
+        // sent it and can see it — but the open conversation has to redraw, or
+        // a line sits at "not confirmed" while the store says delivered and
+        // only leaving and coming back puts it right.
+        case CoreEvent_MessageStateChanged(:final threadId):
+          unawaited(_onThreadChanged?.call(threadId.toInt()) ?? Future.value());
         case CoreEvent_TransferProgress(:final received, :final total):
           _transfer = total == BigInt.zero ? 0 : received / total;
         case CoreEvent_TransferCompleted(:final success):
@@ -677,8 +688,8 @@ class _HomePageState extends State<HomePage> {
             // back. Routed through the page's existing subscription rather than
             // opening a second one: the event stream is single-subscription,
             // and two listeners would mean the first one silently winning.
-            _onThreadArrival = (arrived) async {
-              if (arrived != thread) return;
+            _onThreadChanged = (moved) async {
+              if (moved != thread) return;
               final fresh = await read();
               setLocal(() => lines = fresh);
             };
@@ -714,7 +725,7 @@ class _HomePageState extends State<HomePage> {
       ),
     );
     // The route is gone; nothing should still be trying to redraw it.
-    _onThreadArrival = null;
+    _onThreadChanged = null;
   }
 
   /// Run an API call, surfacing any failure in the log instead of leaving an
