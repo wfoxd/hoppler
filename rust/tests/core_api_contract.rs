@@ -195,8 +195,12 @@ fn a_block_on_disk_is_in_force_at_the_next_launch() {
 
     boot(&dir, &air, "core-third");
     assert!(
-        !nearby_devices().unwrap().iter().any(|d| d.name == "Mallory"),
-        "a block written to disk was forgotten at the next launch — the list          the app enforces is not the list the user wrote"
+        !nearby_devices()
+            .unwrap()
+            .iter()
+            .any(|d| d.name == "Mallory"),
+        "a block written to disk was forgotten at the next launch: the \
+         list the app enforces is not the list the user wrote"
     );
 }
 

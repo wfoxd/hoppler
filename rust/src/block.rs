@@ -78,9 +78,26 @@ impl Blocklist {
 
     /// **The gate.** Every ingress point in the app calls this and nothing else.
     ///
-    /// Takes the pseudonym a handshake or a request *proved*, never one a peer
-    /// merely claimed — a claimed pseudonym makes the list advisory, and an
-    /// advisory block list is not one.
+    /// # What the caller must pass, and where that is not yet possible
+    ///
+    /// A block is only worth the strength of the handle it is checked against.
+    /// Three of the four surfaces pass a pseudonym that was **proved**: the
+    /// session handshake and an established session key on the initiator's
+    /// Noise static, which the handshake demonstrates possession of, and the
+    /// nearby list keys on what the store recorded from one of those.
+    ///
+    /// The persona endpoint is the exception and is worth naming rather than
+    /// leaving implied. `discovery::protocol::Request` carries a **claimed**
+    /// pseudonym — nothing in that frame shows the sender holds the matching
+    /// secret — so the check there is advisory: an evader can present any 32
+    /// bytes and be admitted.
+    ///
+    /// That is deliberate and it costs nothing. What passing the endpoint buys
+    /// is a persona record, which is public and already readable off our
+    /// advertisement. To do anything further the same device must complete a
+    /// handshake, and there the pseudonym is a key it has to hold. So the
+    /// endpoint check sheds honest traffic early; it is not what makes a block
+    /// stick.
     ///
     /// A decision that is fetched and then dropped is a door that admits
     /// everyone, so it does not build:
