@@ -67,8 +67,12 @@ struct Core {
 static CORE: Mutex<Option<Core>> = Mutex::new(None);
 static EVENT_SINK: Mutex<Option<StreamSink<CoreEvent>>> = Mutex::new(None);
 
-/// Events with nowhere to go — see [`emit`].
+/// Events kept for a test to read — see [`emit`]. Empty unless a test asked.
 static UNHEARD: Mutex<Vec<CoreEvent>> = Mutex::new(Vec::new());
+
+/// Whether to keep events nobody is listening for. Off in every build that
+/// runs on a phone; see [`record_events_for_test`].
+static RECORDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 // ── event bus ───────────────────────────────────────────────────────────────
 
@@ -88,12 +92,18 @@ pub fn emit(event: CoreEvent) {
         let _ = sink.add(event);
         return;
     }
-    // Nobody is listening, which in practice means a test: `core_init` sets the
-    // sink before anything can emit. Kept rather than dropped so what reaches
-    // the stream is *observable* — the sink is an `frb` type a test cannot
-    // build, so without this every `emit` is invisible and "the screen is told"
-    // becomes a claim no test can check. That is how a conversation ended up
-    // redrawing on arrivals only, with every state change announced to nothing.
+    // Nobody listening. Dropped, exactly as before — unless a test asked to see
+    // what it would have sent.
+    //
+    // Gated on an explicit opt-in rather than on the sink being absent, and
+    // review is why. The sink is attached by `core_event_stream`, which Dart
+    // calls *after* `core_init` — so "no sink" is a real state on a phone
+    // during startup, not just in a test. Keeping events there would have held
+    // up to 256 of them for ever and never delivered one, which is a leak and
+    // a silence at the same time.
+    if !RECORDING.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     let mut unheard = UNHEARD.lock().unwrap_or_else(|e| e.into_inner());
     // Bounded: a long test run must not accumulate for ever.
     if unheard.len() < 256 {
@@ -101,7 +111,24 @@ pub fn emit(event: CoreEvent) {
     }
 }
 
-/// Events emitted while no sink was attached, oldest first, and cleared.
+/// Keep what `emit` could not deliver, so a test can read it.
+///
+/// The sink is an `frb` type a test cannot build, so without this every `emit`
+/// is invisible and "the screen is told" is a claim nothing can check. That is
+/// how a conversation came to redraw on arrivals only: the rule was in a
+/// comment and no test could reach it.
+pub fn record_events_for_test() {
+    RECORDING.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Stop keeping them, so a test can check the shape a phone actually runs in:
+/// no sink yet, nobody recording, and nothing accumulating.
+pub fn stop_recording_for_test() {
+    RECORDING.store(false, std::sync::atomic::Ordering::Relaxed);
+    drain_events_for_test();
+}
+
+/// Events emitted with nobody listening, oldest first, and cleared.
 pub fn drain_events_for_test() -> Vec<CoreEvent> {
     std::mem::take(&mut *UNHEARD.lock().unwrap_or_else(|e| e.into_inner()))
 }

@@ -31,8 +31,9 @@ use rust_lib_hoppler::engine::{
     acked_on_receipt_for_test, drain_events_for_test, has_session, init_with_transport,
     layer1_public_for_test, mark_delivered_for_test, mark_sent_for_test, message_state_for_test,
     queued_for_resend_for_test, queued_on_thread_for_test, ratchet_can_send_for_test,
-    ratchet_fingerprint_for_test, ratchet_size_for_test, receive_chat_for_test, refusal_for_test,
-    resend_queued_for_test, thread_rows_for_test,
+    ratchet_fingerprint_for_test, ratchet_size_for_test, receive_chat_for_test,
+    record_events_for_test, refusal_for_test, resend_queued_for_test, stop_recording_for_test,
+    thread_rows_for_test,
 };
 use rust_lib_hoppler::identity::Identity;
 use rust_lib_hoppler::pairing::invite::Invite;
@@ -2971,6 +2972,7 @@ fn a_row_moving_forward_is_announced() {
     let peer = full_peer(&h.air, "peer", "Ada");
     let device_id = meet_and_pair(&peer);
     let thread = thread_for_device(device_id).unwrap().unwrap();
+    record_events_for_test();
     let _ = drain_events_for_test();
 
     let sent = send_chat_to_thread(thread, "watch this".into()).unwrap();
@@ -3010,5 +3012,30 @@ fn a_row_moving_forward_is_announced() {
             .iter()
             .any(|(id, s)| *id == sent.msg_id && matches!(s, MessageStateDto::Delivered)),
         "the row reached Delivered with nothing told; saw {announced:?}"
+    );
+}
+
+/// With nobody listening, nothing is kept.
+///
+/// The shape a phone runs in for the moment between `core_init` and Dart
+/// subscribing: no sink attached, and events being emitted. Review caught this
+/// buffering them — up to 256 held for ever and never delivered, which is a
+/// leak and a silence at once. Keeping is now something a test asks for, not
+/// something the absence of a listener causes.
+#[test]
+fn events_with_nobody_listening_are_not_kept() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = fresh();
+    let peer = full_peer(&h.air, "peer", "Ada");
+    let device_id = meet_and_pair(&peer);
+    let thread = thread_for_device(device_id).unwrap().unwrap();
+
+    // Explicitly off: the flag is process-wide and another test may have set it.
+    stop_recording_for_test();
+    send_chat_to_thread(thread, "into the void".into()).unwrap();
+
+    assert!(
+        drain_events_for_test().is_empty(),
+        "events piled up with no sink attached and nobody having asked for them"
     );
 }
