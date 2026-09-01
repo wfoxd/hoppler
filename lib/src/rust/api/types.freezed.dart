@@ -55,14 +55,15 @@ extension CoreEventPatterns on CoreEvent {
 /// }
 /// ```
 
-@optionalTypeArgs TResult maybeMap<TResult extends Object?>({TResult Function( CoreEvent_DiscoveryUpdated value)?  discoveryUpdated,TResult Function( CoreEvent_Pinged value)?  pinged,TResult Function( CoreEvent_PingAcked value)?  pingAcked,TResult Function( CoreEvent_PingFailed value)?  pingFailed,TResult Function( CoreEvent_MessageReceived value)?  messageReceived,TResult Function( CoreEvent_TransferProgress value)?  transferProgress,TResult Function( CoreEvent_TransferCompleted value)?  transferCompleted,TResult Function( CoreEvent_PairingSas value)?  pairingSas,TResult Function( CoreEvent_PairingPeerConfirmed value)?  pairingPeerConfirmed,TResult Function( CoreEvent_PairingCompleted value)?  pairingCompleted,TResult Function( CoreEvent_PairingFailed value)?  pairingFailed,TResult Function( CoreEvent_RadioChanged value)?  radioChanged,required TResult orElse(),}){
+@optionalTypeArgs TResult maybeMap<TResult extends Object?>({TResult Function( CoreEvent_DiscoveryUpdated value)?  discoveryUpdated,TResult Function( CoreEvent_Pinged value)?  pinged,TResult Function( CoreEvent_PingAcked value)?  pingAcked,TResult Function( CoreEvent_PingFailed value)?  pingFailed,TResult Function( CoreEvent_MessageStateChanged value)?  messageStateChanged,TResult Function( CoreEvent_MessageReceived value)?  messageReceived,TResult Function( CoreEvent_TransferProgress value)?  transferProgress,TResult Function( CoreEvent_TransferCompleted value)?  transferCompleted,TResult Function( CoreEvent_PairingSas value)?  pairingSas,TResult Function( CoreEvent_PairingPeerConfirmed value)?  pairingPeerConfirmed,TResult Function( CoreEvent_PairingCompleted value)?  pairingCompleted,TResult Function( CoreEvent_PairingFailed value)?  pairingFailed,TResult Function( CoreEvent_RadioChanged value)?  radioChanged,required TResult orElse(),}){
 final _that = this;
 switch (_that) {
 case CoreEvent_DiscoveryUpdated() when discoveryUpdated != null:
 return discoveryUpdated(_that);case CoreEvent_Pinged() when pinged != null:
 return pinged(_that);case CoreEvent_PingAcked() when pingAcked != null:
 return pingAcked(_that);case CoreEvent_PingFailed() when pingFailed != null:
-return pingFailed(_that);case CoreEvent_MessageReceived() when messageReceived != null:
+return pingFailed(_that);case CoreEvent_MessageStateChanged() when messageStateChanged != null:
+return messageStateChanged(_that);case CoreEvent_MessageReceived() when messageReceived != null:
 return messageReceived(_that);case CoreEvent_TransferProgress() when transferProgress != null:
 return transferProgress(_that);case CoreEvent_TransferCompleted() when transferCompleted != null:
 return transferCompleted(_that);case CoreEvent_PairingSas() when pairingSas != null:
@@ -88,14 +89,15 @@ return radioChanged(_that);case _:
 /// }
 /// ```
 
-@optionalTypeArgs TResult map<TResult extends Object?>({required TResult Function( CoreEvent_DiscoveryUpdated value)  discoveryUpdated,required TResult Function( CoreEvent_Pinged value)  pinged,required TResult Function( CoreEvent_PingAcked value)  pingAcked,required TResult Function( CoreEvent_PingFailed value)  pingFailed,required TResult Function( CoreEvent_MessageReceived value)  messageReceived,required TResult Function( CoreEvent_TransferProgress value)  transferProgress,required TResult Function( CoreEvent_TransferCompleted value)  transferCompleted,required TResult Function( CoreEvent_PairingSas value)  pairingSas,required TResult Function( CoreEvent_PairingPeerConfirmed value)  pairingPeerConfirmed,required TResult Function( CoreEvent_PairingCompleted value)  pairingCompleted,required TResult Function( CoreEvent_PairingFailed value)  pairingFailed,required TResult Function( CoreEvent_RadioChanged value)  radioChanged,}){
+@optionalTypeArgs TResult map<TResult extends Object?>({required TResult Function( CoreEvent_DiscoveryUpdated value)  discoveryUpdated,required TResult Function( CoreEvent_Pinged value)  pinged,required TResult Function( CoreEvent_PingAcked value)  pingAcked,required TResult Function( CoreEvent_PingFailed value)  pingFailed,required TResult Function( CoreEvent_MessageStateChanged value)  messageStateChanged,required TResult Function( CoreEvent_MessageReceived value)  messageReceived,required TResult Function( CoreEvent_TransferProgress value)  transferProgress,required TResult Function( CoreEvent_TransferCompleted value)  transferCompleted,required TResult Function( CoreEvent_PairingSas value)  pairingSas,required TResult Function( CoreEvent_PairingPeerConfirmed value)  pairingPeerConfirmed,required TResult Function( CoreEvent_PairingCompleted value)  pairingCompleted,required TResult Function( CoreEvent_PairingFailed value)  pairingFailed,required TResult Function( CoreEvent_RadioChanged value)  radioChanged,}){
 final _that = this;
 switch (_that) {
 case CoreEvent_DiscoveryUpdated():
 return discoveryUpdated(_that);case CoreEvent_Pinged():
 return pinged(_that);case CoreEvent_PingAcked():
 return pingAcked(_that);case CoreEvent_PingFailed():
-return pingFailed(_that);case CoreEvent_MessageReceived():
+return pingFailed(_that);case CoreEvent_MessageStateChanged():
+return messageStateChanged(_that);case CoreEvent_MessageReceived():
 return messageReceived(_that);case CoreEvent_TransferProgress():
 return transferProgress(_that);case CoreEvent_TransferCompleted():
 return transferCompleted(_that);case CoreEvent_PairingSas():
@@ -117,14 +119,15 @@ return radioChanged(_that);}
 /// }
 /// ```
 
-@optionalTypeArgs TResult? mapOrNull<TResult extends Object?>({TResult? Function( CoreEvent_DiscoveryUpdated value)?  discoveryUpdated,TResult? Function( CoreEvent_Pinged value)?  pinged,TResult? Function( CoreEvent_PingAcked value)?  pingAcked,TResult? Function( CoreEvent_PingFailed value)?  pingFailed,TResult? Function( CoreEvent_MessageReceived value)?  messageReceived,TResult? Function( CoreEvent_TransferProgress value)?  transferProgress,TResult? Function( CoreEvent_TransferCompleted value)?  transferCompleted,TResult? Function( CoreEvent_PairingSas value)?  pairingSas,TResult? Function( CoreEvent_PairingPeerConfirmed value)?  pairingPeerConfirmed,TResult? Function( CoreEvent_PairingCompleted value)?  pairingCompleted,TResult? Function( CoreEvent_PairingFailed value)?  pairingFailed,TResult? Function( CoreEvent_RadioChanged value)?  radioChanged,}){
+@optionalTypeArgs TResult? mapOrNull<TResult extends Object?>({TResult? Function( CoreEvent_DiscoveryUpdated value)?  discoveryUpdated,TResult? Function( CoreEvent_Pinged value)?  pinged,TResult? Function( CoreEvent_PingAcked value)?  pingAcked,TResult? Function( CoreEvent_PingFailed value)?  pingFailed,TResult? Function( CoreEvent_MessageStateChanged value)?  messageStateChanged,TResult? Function( CoreEvent_MessageReceived value)?  messageReceived,TResult? Function( CoreEvent_TransferProgress value)?  transferProgress,TResult? Function( CoreEvent_TransferCompleted value)?  transferCompleted,TResult? Function( CoreEvent_PairingSas value)?  pairingSas,TResult? Function( CoreEvent_PairingPeerConfirmed value)?  pairingPeerConfirmed,TResult? Function( CoreEvent_PairingCompleted value)?  pairingCompleted,TResult? Function( CoreEvent_PairingFailed value)?  pairingFailed,TResult? Function( CoreEvent_RadioChanged value)?  radioChanged,}){
 final _that = this;
 switch (_that) {
 case CoreEvent_DiscoveryUpdated() when discoveryUpdated != null:
 return discoveryUpdated(_that);case CoreEvent_Pinged() when pinged != null:
 return pinged(_that);case CoreEvent_PingAcked() when pingAcked != null:
 return pingAcked(_that);case CoreEvent_PingFailed() when pingFailed != null:
-return pingFailed(_that);case CoreEvent_MessageReceived() when messageReceived != null:
+return pingFailed(_that);case CoreEvent_MessageStateChanged() when messageStateChanged != null:
+return messageStateChanged(_that);case CoreEvent_MessageReceived() when messageReceived != null:
 return messageReceived(_that);case CoreEvent_TransferProgress() when transferProgress != null:
 return transferProgress(_that);case CoreEvent_TransferCompleted() when transferCompleted != null:
 return transferCompleted(_that);case CoreEvent_PairingSas() when pairingSas != null:
@@ -149,13 +152,14 @@ return radioChanged(_that);case _:
 /// }
 /// ```
 
-@optionalTypeArgs TResult maybeWhen<TResult extends Object?>({TResult Function( List<NearbyDevice> devices)?  discoveryUpdated,TResult Function( String deviceId,  String name)?  pinged,TResult Function( String deviceId)?  pingAcked,TResult Function( String deviceId,  String reason)?  pingFailed,TResult Function( PlatformInt64 threadId,  String msgId,  String text)?  messageReceived,TResult Function( String transferId,  BigInt received,  BigInt total)?  transferProgress,TResult Function( String transferId,  bool success)?  transferCompleted,TResult Function( String deviceId,  List<SasColourDto> colours,  String word)?  pairingSas,TResult Function( String deviceId)?  pairingPeerConfirmed,TResult Function( String deviceId,  PlatformInt64 threadId,  String name,  int colour)?  pairingCompleted,TResult Function( String deviceId,  String reason)?  pairingFailed,TResult Function( bool available,  String? reason)?  radioChanged,required TResult orElse(),}) {final _that = this;
+@optionalTypeArgs TResult maybeWhen<TResult extends Object?>({TResult Function( List<NearbyDevice> devices)?  discoveryUpdated,TResult Function( String deviceId,  String name)?  pinged,TResult Function( String deviceId)?  pingAcked,TResult Function( String deviceId,  String reason)?  pingFailed,TResult Function( PlatformInt64 threadId,  String msgId,  MessageStateDto state)?  messageStateChanged,TResult Function( PlatformInt64 threadId,  String msgId,  String text)?  messageReceived,TResult Function( String transferId,  BigInt received,  BigInt total)?  transferProgress,TResult Function( String transferId,  bool success)?  transferCompleted,TResult Function( String deviceId,  List<SasColourDto> colours,  String word)?  pairingSas,TResult Function( String deviceId)?  pairingPeerConfirmed,TResult Function( String deviceId,  PlatformInt64 threadId,  String name,  int colour)?  pairingCompleted,TResult Function( String deviceId,  String reason)?  pairingFailed,TResult Function( bool available,  String? reason)?  radioChanged,required TResult orElse(),}) {final _that = this;
 switch (_that) {
 case CoreEvent_DiscoveryUpdated() when discoveryUpdated != null:
 return discoveryUpdated(_that.devices);case CoreEvent_Pinged() when pinged != null:
 return pinged(_that.deviceId,_that.name);case CoreEvent_PingAcked() when pingAcked != null:
 return pingAcked(_that.deviceId);case CoreEvent_PingFailed() when pingFailed != null:
-return pingFailed(_that.deviceId,_that.reason);case CoreEvent_MessageReceived() when messageReceived != null:
+return pingFailed(_that.deviceId,_that.reason);case CoreEvent_MessageStateChanged() when messageStateChanged != null:
+return messageStateChanged(_that.threadId,_that.msgId,_that.state);case CoreEvent_MessageReceived() when messageReceived != null:
 return messageReceived(_that.threadId,_that.msgId,_that.text);case CoreEvent_TransferProgress() when transferProgress != null:
 return transferProgress(_that.transferId,_that.received,_that.total);case CoreEvent_TransferCompleted() when transferCompleted != null:
 return transferCompleted(_that.transferId,_that.success);case CoreEvent_PairingSas() when pairingSas != null:
@@ -181,13 +185,14 @@ return radioChanged(_that.available,_that.reason);case _:
 /// }
 /// ```
 
-@optionalTypeArgs TResult when<TResult extends Object?>({required TResult Function( List<NearbyDevice> devices)  discoveryUpdated,required TResult Function( String deviceId,  String name)  pinged,required TResult Function( String deviceId)  pingAcked,required TResult Function( String deviceId,  String reason)  pingFailed,required TResult Function( PlatformInt64 threadId,  String msgId,  String text)  messageReceived,required TResult Function( String transferId,  BigInt received,  BigInt total)  transferProgress,required TResult Function( String transferId,  bool success)  transferCompleted,required TResult Function( String deviceId,  List<SasColourDto> colours,  String word)  pairingSas,required TResult Function( String deviceId)  pairingPeerConfirmed,required TResult Function( String deviceId,  PlatformInt64 threadId,  String name,  int colour)  pairingCompleted,required TResult Function( String deviceId,  String reason)  pairingFailed,required TResult Function( bool available,  String? reason)  radioChanged,}) {final _that = this;
+@optionalTypeArgs TResult when<TResult extends Object?>({required TResult Function( List<NearbyDevice> devices)  discoveryUpdated,required TResult Function( String deviceId,  String name)  pinged,required TResult Function( String deviceId)  pingAcked,required TResult Function( String deviceId,  String reason)  pingFailed,required TResult Function( PlatformInt64 threadId,  String msgId,  MessageStateDto state)  messageStateChanged,required TResult Function( PlatformInt64 threadId,  String msgId,  String text)  messageReceived,required TResult Function( String transferId,  BigInt received,  BigInt total)  transferProgress,required TResult Function( String transferId,  bool success)  transferCompleted,required TResult Function( String deviceId,  List<SasColourDto> colours,  String word)  pairingSas,required TResult Function( String deviceId)  pairingPeerConfirmed,required TResult Function( String deviceId,  PlatformInt64 threadId,  String name,  int colour)  pairingCompleted,required TResult Function( String deviceId,  String reason)  pairingFailed,required TResult Function( bool available,  String? reason)  radioChanged,}) {final _that = this;
 switch (_that) {
 case CoreEvent_DiscoveryUpdated():
 return discoveryUpdated(_that.devices);case CoreEvent_Pinged():
 return pinged(_that.deviceId,_that.name);case CoreEvent_PingAcked():
 return pingAcked(_that.deviceId);case CoreEvent_PingFailed():
-return pingFailed(_that.deviceId,_that.reason);case CoreEvent_MessageReceived():
+return pingFailed(_that.deviceId,_that.reason);case CoreEvent_MessageStateChanged():
+return messageStateChanged(_that.threadId,_that.msgId,_that.state);case CoreEvent_MessageReceived():
 return messageReceived(_that.threadId,_that.msgId,_that.text);case CoreEvent_TransferProgress():
 return transferProgress(_that.transferId,_that.received,_that.total);case CoreEvent_TransferCompleted():
 return transferCompleted(_that.transferId,_that.success);case CoreEvent_PairingSas():
@@ -209,13 +214,14 @@ return radioChanged(_that.available,_that.reason);}
 /// }
 /// ```
 
-@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>({TResult? Function( List<NearbyDevice> devices)?  discoveryUpdated,TResult? Function( String deviceId,  String name)?  pinged,TResult? Function( String deviceId)?  pingAcked,TResult? Function( String deviceId,  String reason)?  pingFailed,TResult? Function( PlatformInt64 threadId,  String msgId,  String text)?  messageReceived,TResult? Function( String transferId,  BigInt received,  BigInt total)?  transferProgress,TResult? Function( String transferId,  bool success)?  transferCompleted,TResult? Function( String deviceId,  List<SasColourDto> colours,  String word)?  pairingSas,TResult? Function( String deviceId)?  pairingPeerConfirmed,TResult? Function( String deviceId,  PlatformInt64 threadId,  String name,  int colour)?  pairingCompleted,TResult? Function( String deviceId,  String reason)?  pairingFailed,TResult? Function( bool available,  String? reason)?  radioChanged,}) {final _that = this;
+@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>({TResult? Function( List<NearbyDevice> devices)?  discoveryUpdated,TResult? Function( String deviceId,  String name)?  pinged,TResult? Function( String deviceId)?  pingAcked,TResult? Function( String deviceId,  String reason)?  pingFailed,TResult? Function( PlatformInt64 threadId,  String msgId,  MessageStateDto state)?  messageStateChanged,TResult? Function( PlatformInt64 threadId,  String msgId,  String text)?  messageReceived,TResult? Function( String transferId,  BigInt received,  BigInt total)?  transferProgress,TResult? Function( String transferId,  bool success)?  transferCompleted,TResult? Function( String deviceId,  List<SasColourDto> colours,  String word)?  pairingSas,TResult? Function( String deviceId)?  pairingPeerConfirmed,TResult? Function( String deviceId,  PlatformInt64 threadId,  String name,  int colour)?  pairingCompleted,TResult? Function( String deviceId,  String reason)?  pairingFailed,TResult? Function( bool available,  String? reason)?  radioChanged,}) {final _that = this;
 switch (_that) {
 case CoreEvent_DiscoveryUpdated() when discoveryUpdated != null:
 return discoveryUpdated(_that.devices);case CoreEvent_Pinged() when pinged != null:
 return pinged(_that.deviceId,_that.name);case CoreEvent_PingAcked() when pingAcked != null:
 return pingAcked(_that.deviceId);case CoreEvent_PingFailed() when pingFailed != null:
-return pingFailed(_that.deviceId,_that.reason);case CoreEvent_MessageReceived() when messageReceived != null:
+return pingFailed(_that.deviceId,_that.reason);case CoreEvent_MessageStateChanged() when messageStateChanged != null:
+return messageStateChanged(_that.threadId,_that.msgId,_that.state);case CoreEvent_MessageReceived() when messageReceived != null:
 return messageReceived(_that.threadId,_that.msgId,_that.text);case CoreEvent_TransferProgress() when transferProgress != null:
 return transferProgress(_that.transferId,_that.received,_that.total);case CoreEvent_TransferCompleted() when transferCompleted != null:
 return transferCompleted(_that.transferId,_that.success);case CoreEvent_PairingSas() when pairingSas != null:
@@ -499,6 +505,76 @@ class _$CoreEvent_PingFailedCopyWithImpl<$Res>
 deviceId: null == deviceId ? _self.deviceId : deviceId // ignore: cast_nullable_to_non_nullable
 as String,reason: null == reason ? _self.reason : reason // ignore: cast_nullable_to_non_nullable
 as String,
+  ));
+}
+
+
+}
+
+/// @nodoc
+
+
+class CoreEvent_MessageStateChanged extends CoreEvent {
+  const CoreEvent_MessageStateChanged({required this.threadId, required this.msgId, required this.state}): super._();
+  
+
+ final  PlatformInt64 threadId;
+ final  String msgId;
+ final  MessageStateDto state;
+
+/// Create a copy of CoreEvent
+/// with the given fields replaced by the non-null parameter values.
+@JsonKey(includeFromJson: false, includeToJson: false)
+@pragma('vm:prefer-inline')
+$CoreEvent_MessageStateChangedCopyWith<CoreEvent_MessageStateChanged> get copyWith => _$CoreEvent_MessageStateChangedCopyWithImpl<CoreEvent_MessageStateChanged>(this, _$identity);
+
+
+
+@override
+bool operator ==(Object other) {
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is CoreEvent_MessageStateChanged&&(identical(other.threadId, threadId) || other.threadId == threadId)&&(identical(other.msgId, msgId) || other.msgId == msgId)&&(identical(other.state, state) || other.state == state));
+}
+
+
+@override
+int get hashCode => Object.hash(runtimeType,threadId,msgId,state);
+
+@override
+String toString() {
+  return 'CoreEvent.messageStateChanged(threadId: $threadId, msgId: $msgId, state: $state)';
+}
+
+
+}
+
+/// @nodoc
+abstract mixin class $CoreEvent_MessageStateChangedCopyWith<$Res> implements $CoreEventCopyWith<$Res> {
+  factory $CoreEvent_MessageStateChangedCopyWith(CoreEvent_MessageStateChanged value, $Res Function(CoreEvent_MessageStateChanged) _then) = _$CoreEvent_MessageStateChangedCopyWithImpl;
+@useResult
+$Res call({
+ PlatformInt64 threadId, String msgId, MessageStateDto state
+});
+
+
+
+
+}
+/// @nodoc
+class _$CoreEvent_MessageStateChangedCopyWithImpl<$Res>
+    implements $CoreEvent_MessageStateChangedCopyWith<$Res> {
+  _$CoreEvent_MessageStateChangedCopyWithImpl(this._self, this._then);
+
+  final CoreEvent_MessageStateChanged _self;
+  final $Res Function(CoreEvent_MessageStateChanged) _then;
+
+/// Create a copy of CoreEvent
+/// with the given fields replaced by the non-null parameter values.
+@pragma('vm:prefer-inline') $Res call({Object? threadId = null,Object? msgId = null,Object? state = null,}) {
+  return _then(CoreEvent_MessageStateChanged(
+threadId: null == threadId ? _self.threadId : threadId // ignore: cast_nullable_to_non_nullable
+as PlatformInt64,msgId: null == msgId ? _self.msgId : msgId // ignore: cast_nullable_to_non_nullable
+as String,state: null == state ? _self.state : state // ignore: cast_nullable_to_non_nullable
+as MessageStateDto,
   ));
 }
 

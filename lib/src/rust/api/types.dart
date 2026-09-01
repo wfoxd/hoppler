@@ -99,6 +99,19 @@ sealed class CoreEvent with _$CoreEvent {
     required String reason,
   }) = CoreEvent_PingFailed;
 
+  /// A message this device sent has got further along.
+  ///
+  /// The state is on the row the moment it changes, and until this existed
+  /// nothing told the screen so — the conversation redrew when a message
+  /// *arrived* and at no other time. A line sat at "not confirmed" while the
+  /// store already said delivered, and only leaving and coming back put it
+  /// right. Watching your own message is exactly when somebody is looking.
+  const factory CoreEvent.messageStateChanged({
+    required PlatformInt64 threadId,
+    required String msgId,
+    required MessageStateDto state,
+  }) = CoreEvent_MessageStateChanged;
+
   /// A message arrived on a thread.
   const factory CoreEvent.messageReceived({
     required PlatformInt64 threadId,

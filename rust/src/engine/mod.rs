@@ -67,6 +67,13 @@ struct Core {
 static CORE: Mutex<Option<Core>> = Mutex::new(None);
 static EVENT_SINK: Mutex<Option<StreamSink<CoreEvent>>> = Mutex::new(None);
 
+/// Events kept for a test to read — see [`emit`]. Empty unless a test asked.
+static UNHEARD: Mutex<Vec<CoreEvent>> = Mutex::new(Vec::new());
+
+/// Whether to keep events nobody is listening for. Off in every build that
+/// runs on a phone; see [`record_events_for_test`].
+static RECORDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 // ── event bus ───────────────────────────────────────────────────────────────
 
 /// Register the Dart event sink. Replaces any previous one.
@@ -83,7 +90,47 @@ pub fn emit(event: CoreEvent) {
         .as_ref()
     {
         let _ = sink.add(event);
+        return;
     }
+    // Nobody listening. Dropped, exactly as before — unless a test asked to see
+    // what it would have sent.
+    //
+    // Gated on an explicit opt-in rather than on the sink being absent, and
+    // review is why. The sink is attached by `core_event_stream`, which Dart
+    // calls *after* `core_init` — so "no sink" is a real state on a phone
+    // during startup, not just in a test. Keeping events there would have held
+    // up to 256 of them for ever and never delivered one, which is a leak and
+    // a silence at the same time.
+    if !RECORDING.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let mut unheard = UNHEARD.lock().unwrap_or_else(|e| e.into_inner());
+    // Bounded: a long test run must not accumulate for ever.
+    if unheard.len() < 256 {
+        unheard.push(event);
+    }
+}
+
+/// Keep what `emit` could not deliver, so a test can read it.
+///
+/// The sink is an `frb` type a test cannot build, so without this every `emit`
+/// is invisible and "the screen is told" is a claim nothing can check. That is
+/// how a conversation came to redraw on arrivals only: the rule was in a
+/// comment and no test could reach it.
+pub fn record_events_for_test() {
+    RECORDING.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Stop keeping them, so a test can check the shape a phone actually runs in:
+/// no sink yet, nobody recording, and nothing accumulating.
+pub fn stop_recording_for_test() {
+    RECORDING.store(false, std::sync::atomic::Ordering::Relaxed);
+    drain_events_for_test();
+}
+
+/// Events emitted with nobody listening, oldest first, and cleared.
+pub fn drain_events_for_test() -> Vec<CoreEvent> {
+    std::mem::take(&mut *UNHEARD.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 // ── lifecycle ─────────────────────────────────────────────────────────────────
@@ -796,11 +843,7 @@ fn write_then_send(
     let mut dto = dto;
     match net.send_chat(&device_id, wire, std::time::Instant::now()) {
         Ok(()) => {
-            with_core(|core| {
-                core.store
-                    .set_message_state(&envelope.msg_id, MessageState::Sent)?;
-                Ok(())
-            })?;
+            move_state(thread, &envelope.msg_id, MessageState::Sent)?;
             // And on the value handed back, which is the same fact and was two.
             // The row said `Sent` while the returned DTO still said `Queued`, so
             // a caller that drew what it was given — rather than re-reading the
@@ -1436,10 +1479,7 @@ fn resend_queued(device_id: &str) -> Result<(), String> {
         // order matters and a peer who has dropped will not take the next one.
         net.send_chat(device_id, wire, std::time::Instant::now())
             .map_err(|why| why.to_string())?;
-        with_core(|core| {
-            core.store.set_message_state(&msg_id, MessageState::Sent)?;
-            Ok(())
-        })?;
+        move_state(thread, &msg_id, MessageState::Sent)?;
     }
     Ok(())
 }
@@ -2034,10 +2074,10 @@ fn seal_ack(
 /// would, and the advanced state has to land whether or not the row updates —
 /// the chain moved either way.
 fn mark_delivered(device_id: &str, body: &[u8]) -> Result<(), String> {
-    with_core_mut(|core| {
+    let promoted = with_core_mut(|core| {
         let now = now_millis();
         let Some(thread) = thread_for_peer(core, device_id)? else {
-            return Ok(());
+            return Ok(None);
         };
         // Only a sealed one counts, and this is where that is enforced.
         //
@@ -2056,7 +2096,7 @@ fn mark_delivered(device_id: &str, body: &[u8]) -> Result<(), String> {
             Ok(opened) => opened,
             Err(why) => {
                 log::warn!("dropping an acknowledgement that would not open: {why}");
-                return Ok(());
+                return Ok(None);
             }
         };
         if let Some(advanced) = advanced.as_ref() {
@@ -2064,17 +2104,44 @@ fn mark_delivered(device_id: &str, body: &[u8]) -> Result<(), String> {
         }
         let Ok(msg_id) = <[u8; MSG_ID_LEN]>::try_from(plaintext.as_slice()) else {
             log::warn!("an acknowledgement did not name a message");
-            return Ok(());
+            return Ok(None);
         };
         // Only ever forwards. A row already `Delivered` stays there, and one
         // still `Queued` is not promoted by an ack for bytes that have not
         // left — which cannot happen, but the store is where that stays true.
         if core.store.message_state(&msg_id)? == Some(MessageState::Sent) {
-            core.store
-                .set_message_state(&msg_id, MessageState::Delivered)?;
+            return Ok(Some((thread, msg_id)));
         }
-        Ok(())
-    })
+        Ok(None)
+    })?;
+    // Outside the lock, for the reason `move_state` gives.
+    let Some((thread, msg_id)) = promoted else {
+        return Ok(());
+    };
+    move_state(thread, &msg_id, MessageState::Delivered)
+}
+
+/// Move a message's state and tell the screen.
+///
+/// One function because it is one fact. Written as a store call plus an
+/// `emit` at each site, the two drifted immediately: every send updated the row
+/// and none of them announced it, so a conversation showed "not confirmed" over
+/// a message the store already had delivered.
+///
+/// The emit is outside the core lock deliberately. `emit` hands an event to
+/// Dart, and Dart's handler calls back into the engine to re-read the thread —
+/// so announcing while holding the lock invites the deadlock that the pump
+/// thread's own rule already avoids.
+fn move_state(thread: i64, msg_id: &[u8], state: MessageState) -> Result<(), String> {
+    let changed = with_core(|core| core.store.set_message_state(msg_id, state))?;
+    if changed {
+        emit(CoreEvent::MessageStateChanged {
+            thread_id: thread,
+            msg_id: hex::encode(msg_id),
+            state: state_dto(state),
+        });
+    }
+    Ok(())
 }
 
 fn with_core<T>(f: impl FnOnce(&Core) -> Result<T, StoreError>) -> Result<T, String> {

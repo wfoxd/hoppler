@@ -25,14 +25,15 @@ use rust_lib_hoppler::api::pairing::{
     begin_pairing, confirm_pairing, pairing_invite, stop_showing_invite,
 };
 use rust_lib_hoppler::api::transfers::offer_drop;
-use rust_lib_hoppler::api::types::CoreEvent;
+use rust_lib_hoppler::api::types::{CoreEvent, MessageStateDto};
 use rust_lib_hoppler::discovery::Discovery;
 use rust_lib_hoppler::engine::{
-    acked_on_receipt_for_test, has_session, init_with_transport, layer1_public_for_test,
-    mark_delivered_for_test, mark_sent_for_test, message_state_for_test,
+    acked_on_receipt_for_test, drain_events_for_test, has_session, init_with_transport,
+    layer1_public_for_test, mark_delivered_for_test, mark_sent_for_test, message_state_for_test,
     queued_for_resend_for_test, queued_on_thread_for_test, ratchet_can_send_for_test,
-    ratchet_fingerprint_for_test, ratchet_size_for_test, receive_chat_for_test, refusal_for_test,
-    resend_queued_for_test, thread_rows_for_test,
+    ratchet_fingerprint_for_test, ratchet_size_for_test, receive_chat_for_test,
+    record_events_for_test, refusal_for_test, resend_queued_for_test, stop_recording_for_test,
+    thread_rows_for_test,
 };
 use rust_lib_hoppler::identity::Identity;
 use rust_lib_hoppler::pairing::invite::Invite;
@@ -2951,5 +2952,90 @@ fn a_refused_message_says_which_kind_of_refusal_it_was() {
     assert_eq!(
         refusal_for_test(&peer.id, &[0xab; 128]).unwrap().as_deref(),
         Some("it could not be opened on this conversation"),
+    );
+}
+
+/// A row moving forward tells the screen (T14a follow-up).
+///
+/// Found on two phones. The conversation redrew when a message *arrived* and at
+/// no other time, so a line of your own sat at "not confirmed" while the store
+/// already said `Delivered` — and only leaving the screen and coming back put
+/// it right. Watching your own message go is exactly when somebody is looking
+/// at it.
+///
+/// Asserted on what reaches the stream, not on the row. The row was already
+/// correct; what was missing was anybody being told.
+#[test]
+fn a_row_moving_forward_is_announced() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = fresh();
+    let peer = full_peer(&h.air, "peer", "Ada");
+    let device_id = meet_and_pair(&peer);
+    let thread = thread_for_device(device_id).unwrap().unwrap();
+    record_events_for_test();
+    let _ = drain_events_for_test();
+
+    let sent = send_chat_to_thread(thread, "watch this".into()).unwrap();
+
+    // It left: the row is `Sent`, and the screen was told so.
+    let announced: Vec<_> = drain_events_for_test()
+        .into_iter()
+        .filter_map(|e| match e {
+            CoreEvent::MessageStateChanged { msg_id, state, .. } => Some((msg_id, state)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        announced
+            .iter()
+            .any(|(id, s)| *id == sent.msg_id && matches!(s, MessageStateDto::Sent)),
+        "nothing told the screen the message had gone; saw {announced:?}"
+    );
+
+    // And again when she acknowledges it.
+    until("her acknowledgement", || {
+        pump(&peer);
+        message_state_for_test(&hex::decode(&sent.msg_id).unwrap())
+            .unwrap()
+            .as_deref()
+            == Some("Delivered")
+    });
+    let announced: Vec<_> = drain_events_for_test()
+        .into_iter()
+        .filter_map(|e| match e {
+            CoreEvent::MessageStateChanged { msg_id, state, .. } => Some((msg_id, state)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        announced
+            .iter()
+            .any(|(id, s)| *id == sent.msg_id && matches!(s, MessageStateDto::Delivered)),
+        "the row reached Delivered with nothing told; saw {announced:?}"
+    );
+}
+
+/// With nobody listening, nothing is kept.
+///
+/// The shape a phone runs in for the moment between `core_init` and Dart
+/// subscribing: no sink attached, and events being emitted. Review caught this
+/// buffering them — up to 256 held for ever and never delivered, which is a
+/// leak and a silence at once. Keeping is now something a test asks for, not
+/// something the absence of a listener causes.
+#[test]
+fn events_with_nobody_listening_are_not_kept() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = fresh();
+    let peer = full_peer(&h.air, "peer", "Ada");
+    let device_id = meet_and_pair(&peer);
+    let thread = thread_for_device(device_id).unwrap().unwrap();
+
+    // Explicitly off: the flag is process-wide and another test may have set it.
+    stop_recording_for_test();
+    send_chat_to_thread(thread, "into the void".into()).unwrap();
+
+    assert!(
+        drain_events_for_test().is_empty(),
+        "events piled up with no sink attached and nobody having asked for them"
     );
 }
