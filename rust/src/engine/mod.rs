@@ -37,6 +37,7 @@ use crate::api::types::{
     ChatMessageDto, CoreEvent, MessageStateDto, NearbyDevice, PersonaDto, SasColourDto,
     ThreadSummary,
 };
+use crate::block::{Admit, Blocklist};
 use crate::crypto::rng;
 use crate::discovery::{hint, Sighting};
 use crate::frb_generated::StreamSink;
@@ -62,6 +63,11 @@ struct Core {
     /// The radio plane. `None` when no transport could be built — the app still
     /// runs, reports itself unavailable, and does not pretend to be reachable.
     net: Option<Arc<net::Net>>,
+    /// Who this device refuses to hear from (R0-F10). The same `Arc` `Net` and
+    /// `Discovery` enforce, held here too because the nearby list is a surface
+    /// that has to ask and is not on the radio plane — a paired contact draws a
+    /// row off the disk with no transport in sight.
+    blocked: Arc<Blocklist>,
 }
 
 static CORE: Mutex<Option<Core>> = Mutex::new(None);
@@ -353,10 +359,22 @@ fn install(
         needs_name(&store),
     );
 
+    // Read before anything can answer a peer. This one line is the whole of
+    // what makes a block outlive the process: the table has existed since the
+    // first schema and nothing has ever loaded it.
+    let blocked = Arc::new(Blocklist::loaded(
+        store
+            .list_blocks()
+            .map_err(stringify)?
+            .into_iter()
+            .map(|b| b.pseudonym),
+    ));
+
     let net = transport.map(|t| {
         let net = Arc::new(net::Net::new(
             t,
             identity.clone(),
+            blocked.clone(),
             local_id,
             std::time::Instant::now(),
         ));
@@ -369,6 +387,7 @@ fn install(
         store,
         identity,
         net,
+        blocked,
     });
     Ok(dto)
 }
@@ -515,6 +534,15 @@ pub fn nearby_devices() -> Result<Vec<NearbyDevice>, String> {
             let contact = contact_for_sighting(core, &s, &known)?;
             if let Some(id) = contact {
                 in_front_of_us.push(id);
+                // §12's fourth surface. Suppressed here rather than at the
+                // sighting, because a sighting is a rotating id and this is the
+                // first point at which we know whose it is.
+                //
+                // `in_front_of_us` is recorded first, on purpose: it is what
+                // stops the loop below drawing the same person again from disk.
+                if shut_out(core, id)? {
+                    continue;
+                }
             }
             let known = match contact {
                 Some(id) => core.store.contact_by_id(id)?,
@@ -553,6 +581,7 @@ pub fn nearby_devices() -> Result<Vec<NearbyDevice>, String> {
         for contact in core.store.list_contacts()? {
             if in_front_of_us.contains(&contact.id)
                 || core.store.pairing_for_contact(contact.id)?.is_none()
+                || shut_out(core, contact.id)?
             {
                 continue;
             }
@@ -566,6 +595,22 @@ pub fn nearby_devices() -> Result<Vec<NearbyDevice>, String> {
         }
         Ok(rows)
     })
+}
+
+/// Whether this contact is one the user has blocked (R0-F10).
+///
+/// Keyed on whatever the row holds, which is not always a real pseudonym: a
+/// contact no session has ever proved is keyed on a hash of the rotating device
+/// id (see [`fake::placeholder_pseudonym`]). Blocking one of those does work
+/// here, and stops working twelve minutes later when the id rotates — so the
+/// only *durable* block is one against a pseudonym a handshake proved. That
+/// limit is recorded in T18a; it belongs to the block action, which is T18b,
+/// and not to this lookup.
+fn shut_out(core: &Core, contact: i64) -> Result<bool, StoreError> {
+    let Some(c) = core.store.contact_by_id(contact)? else {
+        return Ok(false);
+    };
+    Ok(core.blocked.ingress_gate(&c.pseudonym) == Admit::Silence)
 }
 
 // ── sessions / threads ────────────────────────────────────────────────────────

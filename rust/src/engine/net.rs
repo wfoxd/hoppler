@@ -40,6 +40,7 @@ use std::cmp::Ordering;
 
 use zeroize::Zeroizing;
 
+use crate::block::{Admit, Blocklist};
 use crate::crypto::{dh, sign};
 use crate::discovery::protocol::{Request, Response};
 use crate::discovery::Discovery;
@@ -255,8 +256,10 @@ pub struct Net {
     /// Personas fetched from the discovery endpoint, needed before a Noise IK
     /// handshake can start (it must know the responder's static in advance).
     known: Mutex<HashMap<PeerId, VerifiedPersona>>,
-    /// Pseudonyms the user has blocked (R0-F10).
-    blocked: Mutex<Vec<[u8; 32]>>,
+    /// Pseudonyms the user has blocked (R0-F10). Shared with `Discovery` and
+    /// with the engine — see [`crate::block`] for why there is one list and not
+    /// three.
+    blocked: Arc<Blocklist>,
     /// Pings asked for before a session existed, to be sent once it does —
     /// each with the moment it stops being worth waiting for.
     ///
@@ -313,10 +316,11 @@ impl Net {
     pub fn new(
         transport: Arc<dyn Transport>,
         identity: Arc<Mutex<Identity>>,
+        blocked: Arc<Blocklist>,
         local_id: &str,
         now: Instant,
     ) -> Self {
-        let discovery = Discovery::new(transport.clone(), identity.clone(), now);
+        let discovery = Discovery::new(transport.clone(), identity.clone(), blocked.clone(), now);
         // Seed discovery with the id the transport was built under, so the
         // tie-break has the right answer before the first advertisement.
         discovery.set_local_id_for_tiebreak(local_id);
@@ -327,7 +331,7 @@ impl Net {
             identity,
             pending: Mutex::new(HashMap::new()),
             known: Mutex::new(HashMap::new()),
-            blocked: Mutex::new(Vec::new()),
+            blocked,
             readers: Mutex::new(HashMap::new()),
             pending_pings: Mutex::new(HashMap::new()),
             ceremonies: Mutex::new(HashMap::new()),
@@ -357,12 +361,9 @@ impl Net {
         &self.sessions
     }
 
-    pub fn block(&self, pseudonym: [u8; 32]) {
-        self.discovery.block(pseudonym);
-        let mut blocked = self.blocked.lock().unwrap_or_else(|e| e.into_inner());
-        if !blocked.contains(&pseudonym) {
-            blocked.push(pseudonym);
-        }
+    /// The list this `Net` and its `Discovery` both enforce.
+    pub fn blocklist(&self) -> &Arc<Blocklist> {
+        &self.blocked
     }
 
     /// Reach a peer: dial if needed. The session follows once the pipe opens.
@@ -1364,12 +1365,7 @@ impl Net {
             }
         };
 
-        if self
-            .blocked
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains(&pending.pseudonym().0)
-        {
+        if self.blocked.ingress_gate(&pending.pseudonym().0) == Admit::Silence {
             // Dropped. Not an error frame, not a close — nothing, so a blocked
             // device cannot tell this from us being out of range (R0-F10).
             // Not logged, and that is the point. A block is enforced by
@@ -1442,6 +1438,22 @@ impl Net {
     }
 
     fn on_session_bytes(&self, peer: &str, bytes: &[u8], now: Instant) -> Vec<NetEvent> {
+        // §12's third surface. A block written while a session is live has to
+        // stop the bytes already in flight, and tearing the session down cannot
+        // do it alone: teardown and delivery race, and the pump thread may
+        // already be holding a frame. Gating here means the race has no wrong
+        // outcome — and means a frame kind added later inherits the enforcement
+        // without its author having to know that it should.
+        //
+        // The pseudonym is the one the Noise handshake proved, not one this
+        // peer claimed; there is nothing else in a session to key on.
+        if let Some(who) = self.sessions.pseudonym(peer) {
+            if self.blocked.ingress_gate(&who.0) == Admit::Silence {
+                // Nothing, and no log line — the same silence as the handshake,
+                // for the same reason.
+                return Vec::new();
+            }
+        }
         let frames = match self.sessions.open_frames(peer, bytes, now) {
             Ok(f) => f,
             // The session is already dropped by the table; tell the engine so
@@ -1637,6 +1649,7 @@ mod tests {
         let net = Net::new(
             transport,
             Arc::new(Mutex::new(alice)),
+            Arc::new(Blocklist::default()),
             "alice",
             Instant::now(),
         );
