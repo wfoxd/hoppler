@@ -1884,6 +1884,96 @@ fn a_refused_dial_makes_a_weak_block_durable() {
     );
 }
 
+/// Unblocking a person who taught us a pseudonym must actually unblock them.
+///
+/// The learning path (T18e) puts a pseudonym in the live set and queues it for
+/// disk. An unblock that did not account for both would leave the person
+/// refused by something no screen shows, and the queued entry would write the
+/// block straight back at the next drain — the user told they had lifted a
+/// block that quietly still stands.
+#[test]
+fn unblocking_holds_after_a_block_has_learned() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let air = LoopbackNet::new();
+    let peer = full_peer(&air, "aaa-peer", "Mallory");
+
+    let their_l2 = peer
+        .identity
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .layer2_public()
+        .0;
+    let contact = {
+        let store = on_disk(&dir);
+        let id = store
+            .add_contact(&NewContact {
+                pseudonym: [9u8; 32],
+                l2_pub: their_l2,
+                name: "Mallory".into(),
+                colour: 1,
+                persona_version: 1,
+                first_seen: 0,
+            })
+            .unwrap();
+        store
+            .block(&[(their_l2, Handle::PersonaKey)], Some(id), 0)
+            .unwrap();
+        id
+    };
+
+    boot(&dir, &air, "mmm-core");
+    set_discovery(true).unwrap();
+    peer.net
+        .discovery()
+        .set_enabled(true, Instant::now())
+        .unwrap();
+    peer.net.discovery().start_scanning().unwrap();
+    peer.net.reach("mmm-core").unwrap();
+    until("the block to learn", || {
+        pump(&peer);
+        on_disk(&dir)
+            .list_blocks()
+            .unwrap()
+            .iter()
+            .any(|b| b.kind == Handle::Pseudonym)
+    });
+
+    unblock_person(contact).unwrap();
+
+    // Everything, including what the block taught.
+    assert!(
+        on_disk(&dir).list_blocks().unwrap().is_empty(),
+        "rows survived the unblock"
+    );
+    assert!(blocked_people().unwrap().is_empty());
+
+    // And it stays lifted through another drain and another dial — the two ways
+    // a learned block could come back.
+    for _ in 0..3 {
+        pump(&peer);
+    }
+    assert!(
+        on_disk(&dir).list_blocks().unwrap().is_empty(),
+        "a queued lesson wrote the block back after it was lifted"
+    );
+
+    // The proof it is really lifted, and the half that the store cannot show:
+    // the *live* gate. `nearby_devices` runs every sighting through `shut_out`,
+    // so a row appearing means the in-memory set no longer refuses them —
+    // including the pseudonym learned before the unblock, which never had a
+    // stored row for `unblock_person` to find it by.
+    // Deliberately *not* asserted through `nearby_devices` here. This peer has
+    // no persona on file and no pairing, so a sighting of it resolves to no
+    // contact at all — `shut_out` then asks only with the device-id
+    // placeholder, which was never on the list, and the row is drawn whether
+    // they are blocked or not. It would pass either way, which is worse than
+    // no assertion. (That limit is T18a's, and written down there.)
+    //
+    // The live set losing the learned pseudonym is observable directly, and is
+    // covered by `block::tests::unblocking_forgets_what_the_block_taught`.
+}
+
 /// A device this app has never seen cannot be blocked, because there is
 /// nothing to write that would mean anything.
 ///

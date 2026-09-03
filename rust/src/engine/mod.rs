@@ -785,19 +785,38 @@ fn write_learned_blocks() {
     if learned.is_empty() {
         return;
     }
-    let _ = with_core(|core| {
-        for (matched, proven) in learned {
-            let contact = core
-                .store
-                .list_blocks()?
-                .into_iter()
-                .find(|b| b.handle == matched)
-                .and_then(|b| b.contact);
-            core.store
-                .block(&[(proven, Handle::Pseudonym)], contact, now_millis())?;
+    // Anything that cannot be written goes back on the queue. Dropping it
+    // would be a block that silently goes weak again at the next launch, and a
+    // store error here is transient by nature — the disk is busy, not wrong.
+    let unwritten = with_core(|core| {
+        let mut left = Vec::new();
+        for (i, (matched, proven)) in learned.iter().enumerate() {
+            let write = (|| -> Result<(), StoreError> {
+                let contact = core
+                    .store
+                    .list_blocks()?
+                    .into_iter()
+                    .find(|b| &b.handle == matched)
+                    .and_then(|b| b.contact);
+                core.store
+                    .block(&[(*proven, Handle::Pseudonym)], contact, now_millis())?;
+                Ok(())
+            })();
+            if write.is_err() {
+                left.extend_from_slice(&learned[i..]);
+                break;
+            }
         }
-        Ok(())
+        Ok(left)
     });
+    // An `Err` here is the core having gone away between the two holds: the
+    // lesson is lost and the weak block stands, which is where this started.
+    if let Ok(left) = unwritten {
+        let _ = with_core(|core| {
+            core.blocked.relearn(left);
+            Ok(())
+        });
+    }
 }
 
 /// Lift a block, restoring stranger-level status and nothing else (R0-F10).
@@ -810,6 +829,13 @@ fn write_learned_blocks() {
 /// **The pairing does not come back.** It was revoked when the block was
 /// written and R0-F10 says so explicitly; pairing again costs two people and a
 /// code, which is the point.
+///
+/// Nothing is drained first, and that was tried. A lesson still queued when
+/// this runs is dealt with by `Blocklist::unblock_handle`, which drops the
+/// queued entries a handle produced along with the handle itself — and every
+/// queued entry's *matched* handle is one the live set held, which is one of
+/// this contact's stored rows. Draining first as well changed no test, because
+/// there is no case left for it to cover.
 pub fn unblock_person(contact_id: i64) -> Result<(), String> {
     with_core(|core| {
         let handles: Vec<[u8; 32]> = core
