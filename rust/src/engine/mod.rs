@@ -665,14 +665,7 @@ fn shut_out_contact(core: &Core, contact: i64) -> Result<bool, StoreError> {
 /// store has committed. The reverse order leaves a window in which the session
 /// is gone, the list does not know yet, and a fresh handshake would be admitted.
 pub fn block_device(device_id: String) -> Result<(), String> {
-    let known = with_core(|core| {
-        let contact = contact_id_for_device(core, &device_id)?;
-        write_block(core, contact, Some(&device_id))
-    })?;
-    if !known {
-        return Err("nothing known about that device to block".to_string());
-    }
-    finish_block(Some(&device_id))
+    block(Target::Device(&device_id), "that device")
 }
 
 /// Block the person a conversation is with (R0-F10).
@@ -683,34 +676,63 @@ pub fn block_device(device_id: String) -> Result<(), String> {
 /// `None` exactly then. Blocking somebody who has walked away is not an edge
 /// case; it is the ordinary one.
 pub fn block_thread(thread_id: i64) -> Result<(), String> {
-    let device_id = with_core(|core| device_for_thread(core, thread_id))?;
-    let known = with_core(|core| {
-        let contact = core.store.contact_for_thread(thread_id)?;
-        write_block(core, contact, device_id.as_deref())
-    })?;
+    block(Target::Thread(thread_id), "that conversation")
+}
+
+/// Who a block was asked for, before anything has been looked up.
+///
+/// The two public entry points differ only in this, and passing the *target*
+/// rather than an already-resolved contact and handle is what keeps them from
+/// resolving it twice. See [`write_block`].
+enum Target<'a> {
+    Device(&'a str),
+    Thread(i64),
+}
+
+/// Write the block, then tear down and announce.
+fn block(target: Target, what: &str) -> Result<(), String> {
+    let (known, device_id) = with_core(|core| write_block(core, target))?;
     if !known {
-        return Err("nothing known about that conversation to block".to_string());
+        return Err(format!("nothing known about {what} to block"));
     }
     finish_block(device_id.as_deref())
 }
 
-/// The store write and the in-memory update, under one hold of the core lock.
+/// Resolve, write the rows, and put the handles in force — under **one** hold
+/// of the core lock.
 ///
-/// Both must happen together and neither may happen without the other: the list
-/// is what every ingress consults, and the rows are what survives the process.
-/// `false` means nothing identifiable was found, and the caller refuses rather
-/// than writing a handle that names nobody.
-fn write_block(
-    core: &Core,
-    contact: Option<i64>,
-    device_id: Option<&str>,
-) -> Result<bool, StoreError> {
-    let handles = match device_id {
+/// # Why this takes a target and not a contact
+///
+/// It took `(contact, device_id)` first, and both callers resolved them
+/// themselves. `block_device` resolved them together and was fine;
+/// `block_thread` resolved the device id under one lock hold and the contact
+/// under another, and that is a gap `reconcile_contact` can move a row through
+/// — it re-keys and merges contacts, and it runs from the session-open event on
+/// the pump thread. The two would then name different people, and the block
+/// would unpair one and close the other's session.
+///
+/// This is the second time that shape has produced that bug: the same split
+/// existed in `block_device` in T18b and was found in review there too. So the
+/// resolution moved *inside*, where the lock is already held and a caller has
+/// nothing to get wrong.
+///
+/// Returns whether anything identifiable was found, and the device id if there
+/// is one — the caller needs it to tear a session down, and by then the lock is
+/// released, which is fine: a stale id closes a session that is already gone.
+fn write_block(core: &Core, target: Target) -> Result<(bool, Option<String>), StoreError> {
+    let (contact, device_id) = match target {
+        Target::Device(id) => (contact_id_for_device(core, id)?, Some(id.to_string())),
+        Target::Thread(thread) => (
+            core.store.contact_for_thread(thread)?,
+            device_for_thread(core, thread)?,
+        ),
+    };
+    let handles = match device_id.as_deref() {
         Some(id) => handles_for(core, id, contact)?,
         None => contact_handles(core, contact)?,
     };
     if handles.is_empty() {
-        return Ok(false);
+        return Ok((false, device_id));
     }
     core.store.block(&handles, contact, now_millis())?;
     // In force before the caller tears anything down, so no window exists in
@@ -719,7 +741,7 @@ fn write_block(
     for (handle, _) in &handles {
         core.blocked.block(*handle);
     }
-    Ok(true)
+    Ok((true, device_id))
 }
 
 /// Tear down the live session, if there is one, and tell the screen.
