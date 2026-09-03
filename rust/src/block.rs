@@ -60,11 +60,17 @@ use crate::crypto::dh;
 /// does not know and must not need to.
 pub type Pseudonym = [u8; dh::PUBLIC_LEN];
 
-/// What kind of handle a block was written against, strongest first.
+/// What kind of handle a block was written against.
 ///
-/// The ordering is the whole point and `Ord` is derived from it: the block
-/// action takes the best handle it holds, and an existing block is only ever
-/// rewritten toward a *stronger* one. A block never gets weaker.
+/// **Declared weakest first**, because `Ord` is derived from declaration order
+/// and the useful comparison is "which of these is the strongest claim". A
+/// block records every handle this device holds, so a person has several of
+/// these at once and `max()` over them is how anything reports how durable
+/// their block actually is.
+///
+/// The ordering is a *ranking*, not a storage format. [`Self::to_i64`] maps by
+/// name for exactly that reason: reordering the variants — which is the kind of
+/// edit this derive invites — must not silently rewrite what is on disk.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Handle {
     /// The rotating rung id, hashed. Identifies the peer until the next

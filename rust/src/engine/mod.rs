@@ -645,14 +645,18 @@ fn shut_out_contact(core: &Core, contact: i64) -> Result<bool, StoreError> {
 ///
 /// # What it binds to
 ///
-/// The strongest handle this device holds, which is not always the
-/// Layer-1-derived pseudonym R0-F10 names. That value is only learnable from a
+/// **Every handle this device holds**, not the best one — see `handles_for`.
+/// The Layer-1-derived pseudonym R0-F10 names is only learnable from a
 /// handshake the *peer* opened, and which side dials is a comparison of two
-/// rotating ids — so for roughly half of peers the best available handle is
-/// their Layer-2 persona key, and for one we have never fetched a persona from,
-/// a hash of the rung id. All three are enforced; only the first survives the
-/// peer regenerating their persona. T18b records why offering the weaker ones
-/// beats refusing to block at all.
+/// rotating ids, so for roughly half of peers there is no pseudonym on file at
+/// all and the strongest thing available is their Layer-2 persona key.
+///
+/// Recording only the strongest would leave a hole rather than merely a weaker
+/// block: which handle a given surface can offer *also* depends on who dialled,
+/// so a block holding one value is invisible to the surfaces that hold the
+/// other. All of them are stored, all of them are enforced, and only the
+/// pseudonym survives the peer regenerating their persona. T18b records why
+/// offering the weaker ones beats refusing to block at all.
 ///
 /// # Order
 ///
