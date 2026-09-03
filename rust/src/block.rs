@@ -235,9 +235,16 @@ impl Blocklist {
             .insert(who);
     }
 
-    /// Remove a pseudonym, restoring stranger-level status and nothing else.
-    /// Whatever the block revoked stays revoked; see T18c.
-    pub fn unblock(&self, who: &Pseudonym) {
+    /// Remove **one** handle from the set.
+    ///
+    /// Named for what it does, for the same reason `Store::unblock_handle` is:
+    /// a person is blocked on several handles at once, so lifting a block means
+    /// removing all of theirs. Lifting one leaves the others enforcing, which
+    /// is a person told they are unblocked and still refused.
+    ///
+    /// Restores stranger-level status and nothing else — whatever the block
+    /// revoked stays revoked (R0-F10). The screen for this is T18c.
+    pub fn unblock_handle(&self, who: &Pseudonym) {
         self.who
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -263,7 +270,7 @@ mod tests {
             Admit::Yes,
             "blocking one person closed the door on another"
         );
-        list.unblock(&ALICE);
+        list.unblock_handle(&ALICE);
         assert_eq!(list.ingress_gate(&[ALICE]), Admit::Yes);
     }
 
@@ -325,7 +332,7 @@ mod tests {
         let list = Blocklist::default();
         list.block(ALICE);
         list.block(ALICE);
-        list.unblock(&ALICE);
+        list.unblock_handle(&ALICE);
         assert_eq!(list.ingress_gate(&[ALICE]), Admit::Yes);
     }
 }

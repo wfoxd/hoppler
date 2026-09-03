@@ -1118,12 +1118,35 @@ impl Store {
         Ok(n > 0)
     }
 
-    pub fn unblock(&self, handle: &[u8; 32]) -> Result<(), StoreError> {
+    /// Remove **one** handle row.
+    ///
+    /// Named for what it does, because a block is several rows now — one per
+    /// handle this device held for a person — and a caller reaching for
+    /// "unblock" and getting one row back would leave the rest of the set
+    /// enforcing. To unblock a *person*, use [`Self::unblock_contact`].
+    pub fn unblock_handle(&self, handle: &[u8; 32]) -> Result<(), StoreError> {
         self.conn.execute(
             "DELETE FROM blocklist WHERE pseudonym = ?1",
             params![&handle[..]],
         )?;
         Ok(())
+    }
+
+    /// Remove every handle row belonging to one contact — the whole block.
+    ///
+    /// R0-F10: unblocking restores stranger-level status and **not** the
+    /// pairing the block revoked. Nothing here puts a pairing back, and that is
+    /// deliberate; `revoked_pairing` on the rows about to go is the record that
+    /// one was taken.
+    ///
+    /// Returns how many rows went, so a caller can tell an unblock that did
+    /// something from one that found nothing.
+    pub fn unblock_contact(&self, contact: i64) -> Result<usize, StoreError> {
+        let n = self.conn.execute(
+            "DELETE FROM blocklist WHERE contact_id = ?1",
+            params![contact],
+        )?;
+        Ok(n)
     }
 
     pub fn list_blocks(&self) -> Result<Vec<BlockEntry>, StoreError> {
@@ -2718,7 +2741,7 @@ mod tests {
         assert_eq!(entry.kind, Handle::Pseudonym);
         assert_eq!(entry.contact, None);
         assert!(!entry.revoked_pairing);
-        s.unblock(&p).unwrap();
+        s.unblock_handle(&p).unwrap();
         assert!(!s.is_blocked(&p).unwrap());
     }
 
@@ -2813,6 +2836,36 @@ mod tests {
         let stored = s.list_blocks().unwrap();
         assert_eq!(stored.len(), 1, "the sentinel was stored: {stored:?}");
         assert_eq!(stored[0].handle, [4u8; 32]);
+    }
+
+    /// Unblocking a person takes the whole handle set, not one row of it.
+    ///
+    /// A block is several rows now, and an unblock that removed one would leave
+    /// the others enforcing — a person told they were unblocked who is still
+    /// refused at half the surfaces, with nothing on screen able to explain it.
+    #[test]
+    fn unblocking_a_person_takes_every_handle_they_were_blocked_on() {
+        let (s, _d) = store();
+        let id = s.add_contact(&a_contact()).unwrap();
+        let handles = [
+            ([4u8; 32], Handle::Pseudonym),
+            ([5u8; 32], Handle::PersonaKey),
+            ([6u8; 32], Handle::Device),
+        ];
+        s.block(&handles, Some(id), 5).unwrap();
+        assert_eq!(s.list_blocks().unwrap().len(), 3);
+
+        assert_eq!(s.unblock_contact(id).unwrap(), 3);
+        for (h, _) in handles {
+            assert!(
+                !s.is_blocked(&h).unwrap(),
+                "a handle survived the unblock: {h:?}"
+            );
+        }
+
+        // And it says when it found nothing, so an unblock that did nothing is
+        // distinguishable from one that worked.
+        assert_eq!(s.unblock_contact(id).unwrap(), 0);
     }
 
     /// A block outlives the contact row it came from. `ON DELETE SET NULL`, not
