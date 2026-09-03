@@ -1798,6 +1798,92 @@ fn unblocking_takes_effect_without_a_restart() {
     );
 }
 
+/// T18e: a block bound to a Layer-2 persona key learns the durable pseudonym
+/// the first time the blocked device dials — and is still refused.
+///
+/// This is R0-F10's "a freshly generated Layer-2 persona does not evade it",
+/// for the half of blocks that cannot hold a pseudonym when they are written.
+/// The peer's rung id sorts before the engine's, so the *peer* dials, which is
+/// the only arrangement in which a pseudonym is ever proved to us.
+#[test]
+fn a_refused_dial_makes_a_weak_block_durable() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let air = LoopbackNet::new();
+    let peer = full_peer(&air, "aaa-peer", "Mallory");
+
+    // A block holding only their persona key — what `block_device` records for
+    // somebody this device has only ever dialled. Written straight to the store
+    // so the state is exactly that and not accidentally stronger.
+    let their_l2 = peer
+        .identity
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .layer2_public()
+        .0;
+    let contact = {
+        let store = on_disk(&dir);
+        let id = store
+            .add_contact(&NewContact {
+                pseudonym: [9u8; 32],
+                l2_pub: their_l2,
+                name: "Mallory".into(),
+                colour: 1,
+                persona_version: 1,
+                first_seen: 0,
+            })
+            .unwrap();
+        store
+            .block(&[(their_l2, Handle::PersonaKey)], Some(id), 0)
+            .unwrap();
+        id
+    };
+
+    // Booted *after* the block is on disk, so the live list holds it the way a
+    // launch loads it — and so the engine's rung id sorts after the peer's,
+    // which is what makes the peer the one that dials.
+    boot(&dir, &air, "mmm-core");
+    set_discovery(true).unwrap();
+    peer.net
+        .discovery()
+        .set_enabled(true, Instant::now())
+        .unwrap();
+    peer.net.discovery().start_scanning().unwrap();
+
+    // They dial. Their offer proves a pseudonym before we have said anything.
+    peer.net.reach("mmm-core").unwrap();
+    until("the block to learn the durable handle", || {
+        pump(&peer);
+        on_disk(&dir)
+            .list_blocks()
+            .unwrap()
+            .iter()
+            .any(|b| b.kind == Handle::Pseudonym)
+    });
+
+    let learned = on_disk(&dir)
+        .list_blocks()
+        .unwrap()
+        .into_iter()
+        .find(|b| b.kind == Handle::Pseudonym)
+        .expect("checked above");
+    assert_eq!(
+        learned.contact,
+        Some(contact),
+        "the learned pseudonym was filed under the wrong person"
+    );
+    assert_ne!(
+        learned.handle, their_l2,
+        "what was recorded is the persona key again, not a pseudonym"
+    );
+
+    // And the refusal was a refusal: no session, either side.
+    assert!(
+        !has_session("aaa-peer"),
+        "a blocked device got a session out of the dial that taught us"
+    );
+}
+
 /// A device this app has never seen cannot be blocked, because there is
 /// nothing to write that would mean anything.
 ///

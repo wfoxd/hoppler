@@ -409,6 +409,10 @@ fn spawn_pump(
                 for out in net.handle(event, std::time::Instant::now()) {
                     on_net_event(&net, out);
                 }
+                // A refused dial produces no event at all — that is R0-F10 —
+                // so there is nothing to hang this off except the turn of the
+                // loop that handled it.
+                write_learned_blocks();
             }
         })
         .expect("core event pump");
@@ -448,6 +452,9 @@ fn spawn_clock(net: &Arc<net::Net>, interval: std::time::Duration) {
             for out in net.tick(std::time::Instant::now()) {
                 on_net_event(&net, out);
             }
+            // Belt to the pump's braces: a refusal that arrived while the pump
+            // was between events still lands within a tick.
+            write_learned_blocks();
         })
         // Loudly, like the pump. A dropped spawn error here is silent and total:
         // the id stops rotating and sessions stop expiring, which is precisely
@@ -756,6 +763,41 @@ fn finish_block(device_id: Option<&str>) -> Result<(), String> {
         devices: nearby_devices()?,
     });
     Ok(())
+}
+
+/// Write down any pseudonym a refused dial proved (R0-F10, T18e).
+///
+/// `Net` learns these on the pump thread and has no store, so it queues them —
+/// see [`crate::block::Blocklist::note_proved`] for why not an event and not a
+/// callback. They are already in force in the live list by the time this runs;
+/// this is the part that survives a restart.
+///
+/// The matched handle is how the block's contact is found: `Net` knows a
+/// handle fired and nothing about who it belongs to. A learned pseudonym with
+/// no contact behind it is still written — the block is real either way, and a
+/// row that cannot be named is the same row the blocked list already skips.
+///
+/// Silent, like everything else on this path.
+fn write_learned_blocks() {
+    let Ok(learned) = with_core(|core| Ok(core.blocked.take_learned())) else {
+        return;
+    };
+    if learned.is_empty() {
+        return;
+    }
+    let _ = with_core(|core| {
+        for (matched, proven) in learned {
+            let contact = core
+                .store
+                .list_blocks()?
+                .into_iter()
+                .find(|b| b.handle == matched)
+                .and_then(|b| b.contact);
+            core.store
+                .block(&[(proven, Handle::Pseudonym)], contact, now_millis())?;
+        }
+        Ok(())
+    });
 }
 
 /// Lift a block, restoring stranger-level status and nothing else (R0-F10).

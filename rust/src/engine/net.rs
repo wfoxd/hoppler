@@ -1371,6 +1371,14 @@ impl Net {
         // weaker handle to bind to.
         let handles = [pending.pseudonym().0, pending.persona().l2_pub.0];
         if self.blocked.ingress_gate(&handles) == Admit::Silence {
+            // Keep what this dial just proved. Half of all blocks are bound to
+            // a Layer-2 persona key — the durable pseudonym is only learnable
+            // from a handshake the peer opened — and R0-F10 says a block must
+            // survive that key being regenerated. This is the one moment the
+            // durable value is in our hands, and `read_first` has produced no
+            // bytes, so keeping it costs nothing and changes nothing on the
+            // wire. See T18e.
+            self.blocked.note_proved(&handles, pending.pseudonym().0);
             // Dropped. Not an error frame, not a close — nothing, so a blocked
             // device cannot tell this from us being out of range (R0-F10).
             // Not logged, and that is the point. A block is enforced by
