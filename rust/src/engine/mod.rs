@@ -29,13 +29,14 @@ pub mod fake;
 pub mod net;
 pub mod pipe;
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::api::types::{
-    ChatMessageDto, CoreEvent, MessageStateDto, NearbyDevice, PersonaDto, SasColourDto,
-    ThreadSummary,
+    BlockedPersonDto, ChatMessageDto, CoreEvent, MessageStateDto, NearbyDevice, PersonaDto,
+    SasColourDto, ThreadSummary,
 };
 use crate::block::{Admit, Blocklist, Handle};
 use crate::crypto::rng;
@@ -664,40 +665,188 @@ fn shut_out_contact(core: &Core, contact: i64) -> Result<bool, StoreError> {
 /// store has committed. The reverse order leaves a window in which the session
 /// is gone, the list does not know yet, and a fresh handshake would be admitted.
 pub fn block_device(device_id: String) -> Result<(), String> {
-    // Contact, handles and write under **one** hold of the core lock. Deriving
-    // the handles under one and revoking under another leaves a gap in which
-    // the device's contact can move: `reconcile_contact` re-keys and merges
-    // rows, and it runs from the session-open event on the pump thread. The
-    // revocation would then name a different row than the handles came from —
-    // a block that took a pairing away from the wrong person, or from nobody.
-    let known = with_core(|core| {
-        let contact = contact_id_for_device(core, &device_id)?;
-        let handles = handles_for(core, &device_id, contact)?;
-        if handles.is_empty() {
-            return Ok(false);
-        }
-        core.store.block(&handles, contact, now_millis())?;
-        // In force before anything else happens, including before the teardown
-        // below can let a fresh handshake in.
-        for (handle, _) in &handles {
-            core.blocked.block(*handle);
-        }
-        Ok(true)
-    })?;
+    block(Target::Device(&device_id), "that device")
+}
+
+/// Block the person a conversation is with (R0-F10).
+///
+/// The same act as [`block_device`], reached the way somebody out of range has
+/// to be reached. R0-F4 makes pairing durable, so a paired friend has a row and
+/// a thread whether the radio can see them or not — and their `device_id` is
+/// `None` exactly then. Blocking somebody who has walked away is not an edge
+/// case; it is the ordinary one.
+pub fn block_thread(thread_id: i64) -> Result<(), String> {
+    block(Target::Thread(thread_id), "that conversation")
+}
+
+/// Who a block was asked for, before anything has been looked up.
+///
+/// The two public entry points differ only in this, and passing the *target*
+/// rather than an already-resolved contact and handle is what keeps them from
+/// resolving it twice. See [`write_block`].
+enum Target<'a> {
+    Device(&'a str),
+    Thread(i64),
+}
+
+/// Write the block, then tear down and announce.
+fn block(target: Target, what: &str) -> Result<(), String> {
+    let (known, device_id) = with_core(|core| write_block(core, target))?;
     if !known {
-        return Err("nothing known about that device to block".to_string());
+        return Err(format!("nothing known about {what} to block"));
     }
+    finish_block(device_id.as_deref())
+}
 
-    // Outside the store closure: `close` takes the session table's lock, and
-    // nothing in this crate holds the store lock across a network lock.
-    if let Some(net) = with_core(|core| Ok(core.net.clone()))? {
-        net.sessions().close(&device_id);
+/// Resolve, write the rows, and put the handles in force — under **one** hold
+/// of the core lock.
+///
+/// # Why this takes a target and not a contact
+///
+/// It took `(contact, device_id)` first, and both callers resolved them
+/// themselves. `block_device` resolved them together and was fine;
+/// `block_thread` resolved the device id under one lock hold and the contact
+/// under another, and that is a gap `reconcile_contact` can move a row through
+/// — it re-keys and merges contacts, and it runs from the session-open event on
+/// the pump thread. The two would then name different people, and the block
+/// would unpair one and close the other's session.
+///
+/// This is the second time that shape has produced that bug: the same split
+/// existed in `block_device` in T18b and was found in review there too. So the
+/// resolution moved *inside*, where the lock is already held and a caller has
+/// nothing to get wrong.
+///
+/// Returns whether anything identifiable was found, and the device id if there
+/// is one — the caller needs it to tear a session down, and by then the lock is
+/// released, which is fine: a stale id closes a session that is already gone.
+fn write_block(core: &Core, target: Target) -> Result<(bool, Option<String>), StoreError> {
+    let (contact, device_id) = match target {
+        Target::Device(id) => (contact_id_for_device(core, id)?, Some(id.to_string())),
+        Target::Thread(thread) => (
+            core.store.contact_for_thread(thread)?,
+            device_for_thread(core, thread)?,
+        ),
+    };
+    let handles = match device_id.as_deref() {
+        Some(id) => handles_for(core, id, contact)?,
+        None => contact_handles(core, contact)?,
+    };
+    if handles.is_empty() {
+        return Ok((false, device_id));
     }
+    core.store.block(&handles, contact, now_millis())?;
+    // In force before the caller tears anything down, so no window exists in
+    // which the session is gone, the list does not know, and a fresh handshake
+    // would be admitted.
+    for (handle, _) in &handles {
+        core.blocked.block(*handle);
+    }
+    Ok((true, device_id))
+}
 
+/// Tear down the live session, if there is one, and tell the screen.
+///
+/// Outside the store closure: `close` takes the session table's lock, and
+/// nothing in this crate holds the store lock across a network lock.
+fn finish_block(device_id: Option<&str>) -> Result<(), String> {
+    if let (Some(id), Some(net)) = (device_id, with_core(|core| Ok(core.net.clone()))?) {
+        net.sessions().close(id);
+    }
     emit(CoreEvent::DiscoveryUpdated {
         devices: nearby_devices()?,
     });
     Ok(())
+}
+
+/// Lift a block, restoring stranger-level status and nothing else (R0-F10).
+///
+/// Takes the handles out of the live list as well as the store, and reads them
+/// before deleting for exactly that reason — a store-only unblock leaves every
+/// ingress still refusing until the next launch, which is somebody told they
+/// unblocked a person who is still gone.
+///
+/// **The pairing does not come back.** It was revoked when the block was
+/// written and R0-F10 says so explicitly; pairing again costs two people and a
+/// code, which is the point.
+pub fn unblock_person(contact_id: i64) -> Result<(), String> {
+    with_core(|core| {
+        let handles: Vec<[u8; 32]> = core
+            .store
+            .list_blocks()?
+            .into_iter()
+            .filter(|b| b.contact == Some(contact_id))
+            .map(|b| b.handle)
+            .collect();
+        core.store.unblock_contact(contact_id)?;
+        for h in &handles {
+            core.blocked.unblock_handle(h);
+        }
+        Ok(())
+    })?;
+    emit(CoreEvent::DiscoveryUpdated {
+        devices: nearby_devices()?,
+    });
+    Ok(())
+}
+
+/// Everyone this device is refusing, for the screen that lists them.
+///
+/// One row per person, not per handle — a block is several rows underneath and
+/// that is an implementation detail of how we recognise somebody, not something
+/// to show. Rows whose contact has gone are skipped: they cannot be named, so
+/// there is nothing to draw and nothing an unblock button could sensibly do.
+pub fn blocked_people() -> Result<Vec<BlockedPersonDto>, String> {
+    with_core(|core| {
+        // A set rather than a scan: a block is several rows, so this runs over
+        // roughly three times the number of people, and `insert` both answers
+        // "first time seen" and records it.
+        let mut seen: HashSet<i64> = HashSet::new();
+        let mut out = Vec::new();
+        for entry in core.store.list_blocks()? {
+            let Some(contact) = entry.contact else {
+                continue;
+            };
+            if !seen.insert(contact) {
+                continue;
+            }
+            if let Some(c) = core.store.contact_by_id(contact)? {
+                out.push(BlockedPersonDto {
+                    contact_id: contact,
+                    name: c.name,
+                    colour: c.colour,
+                    blocked_at: entry.created_at,
+                });
+            }
+        }
+        Ok(out)
+    })
+}
+
+/// The handles a contact row alone can supply, for blocking somebody with no
+/// session and no sighting — the paired friend who has walked away.
+fn contact_handles(
+    core: &Core,
+    contact: Option<i64>,
+) -> Result<Vec<([u8; 32], Handle)>, StoreError> {
+    let Some(c) = (match contact {
+        Some(id) => core.store.contact_by_id(id)?,
+        None => None,
+    }) else {
+        return Ok(Vec::new());
+    };
+    let mut out: Vec<([u8; 32], Handle)> = Vec::new();
+    // `contacts.pseudonym` holds whatever `session_key_of` last supplied — a
+    // proven pseudonym, a Layer-2 key, or a device-id placeholder — and nothing
+    // on the row says which, so it is recorded as the weakest of the three.
+    for (handle, kind) in [
+        (c.pseudonym, Handle::Device),
+        (c.l2_pub, Handle::PersonaKey),
+    ] {
+        if handle != [0u8; 32] && !out.iter().any(|(h, _)| h == &handle) {
+            out.push((handle, kind));
+        }
+    }
+    Ok(out)
 }
 
 /// Every handle this device holds for a peer, each tagged with what it is.

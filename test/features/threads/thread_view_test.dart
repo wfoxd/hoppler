@@ -8,6 +8,7 @@ void main() {
     WidgetTester tester, {
     List<ThreadLine> lines = const [],
     bool canSend = true,
+    VoidCallback? onBlock,
   }) async {
     final sent = <String>[];
     await tester.pumpWidget(
@@ -18,11 +19,42 @@ void main() {
           canSend: canSend,
           cannotSendReason: 'This contact is gone.',
           onSend: sent.add,
+          onBlock: onBlock,
         ),
       ),
     );
     return sent;
   }
+
+  /// Block is reachable from inside a conversation (R0-F10), and behind an
+  /// overflow rather than out on the bar — it is destructive, irreversible, and
+  /// the app bar of a chat is where a thumb rests.
+  testWidgets('a conversation offers Block, behind the overflow', (
+    tester,
+  ) async {
+    final blocked = <int>[];
+    await pump(tester, onBlock: () => blocked.add(1));
+
+    // Nothing on the bar itself until it is opened.
+    expect(find.text('Block'), findsNothing);
+
+    await tester.tap(find.byType(PopupMenuButton<void>));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Block'));
+    await tester.pumpAndSettle();
+
+    expect(blocked, hasLength(1));
+  });
+
+  /// A conversation with nobody identifiable has nothing to block, and the menu
+  /// goes rather than sitting there disabled — a tap that quietly fails is the
+  /// worst outcome on the one screen where the action is irreversible.
+  testWidgets('with nobody to block, the menu is not offered at all', (
+    tester,
+  ) async {
+    await pump(tester);
+    expect(find.byType(PopupMenuButton<void>), findsNothing);
+  });
 
   testWidgets('both sides of a conversation are shown', (tester) async {
     await pump(

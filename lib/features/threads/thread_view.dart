@@ -71,6 +71,7 @@ class ThreadView extends StatefulWidget {
     required this.onSend,
     this.canSend = true,
     this.cannotSendReason,
+    this.onBlock,
   });
 
   final String title;
@@ -85,6 +86,18 @@ class ThreadView extends StatefulWidget {
   /// a conversation whose contact is gone.
   final bool canSend;
   final String? cannotSendReason;
+
+  /// Block the person this conversation is with (R0-F10).
+  ///
+  /// `null` hides the menu entirely rather than showing it disabled. A
+  /// conversation with nobody identifiable — no thread and no handle — has
+  /// nothing to block, and offering the action anyway would be a tap that
+  /// quietly fails on the one screen where failing quietly is worst.
+  ///
+  /// The confirming and the doing both belong to the caller: this widget stays
+  /// buildable without the Rust bridge, which is what makes the menu testable
+  /// at all.
+  final VoidCallback? onBlock;
 
   @override
   State<ThreadView> createState() => _ThreadViewState();
@@ -116,7 +129,23 @@ class _ThreadViewState extends State<ThreadView> {
     final canSend = widget.canSend;
     final cannotSendReason = widget.cannotSendReason;
     return Scaffold(
-      appBar: AppBar(title: Text(widget.title)),
+      appBar: AppBar(
+        title: Text(widget.title),
+        actions: [
+          // Behind an overflow rather than out on the bar. It is destructive
+          // and irreversible, and the bar of a conversation is somewhere a
+          // thumb rests.
+          if (widget.onBlock != null)
+            PopupMenuButton<void>(
+              itemBuilder: (context) => [
+                PopupMenuItem<void>(
+                  onTap: widget.onBlock,
+                  child: const Text('Block'),
+                ),
+              ],
+            ),
+        ],
+      ),
       body: Column(
         children: [
           Expanded(

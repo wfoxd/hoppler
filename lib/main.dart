@@ -1,6 +1,8 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:hoppler/features/block/block_confirm.dart';
+import 'package:hoppler/features/block/blocked_view.dart';
 import 'package:hoppler/features/nearby/nearby_tile.dart';
 import 'package:hoppler/features/onboarding/name_view.dart';
 import 'package:hoppler/features/nearby/nearby_view.dart';
@@ -372,6 +374,19 @@ class _HomePageState extends State<HomePage> {
       appBar: AppBar(
         backgroundColor: _personaColour,
         title: Text('Hoppler — ${widget.persona.name}'),
+        actions: [
+          // Where a settings page would put it, until there is one. Blocking is
+          // done from a person; this is only the way back, and the way back is
+          // rare enough to live behind an overflow.
+          PopupMenuButton<void>(
+            itemBuilder: (context) => [
+              PopupMenuItem<void>(
+                onTap: _openBlocked,
+                child: const Text('Blocked'),
+              ),
+            ],
+          ),
+        ],
       ),
       body: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -624,6 +639,11 @@ class _HomePageState extends State<HomePage> {
           size: BigInt.from(5000000),
         ),
       ),
+      onBlock: () => _confirmAndBlock(
+        name: d.name,
+        threadId: d.threadId,
+        deviceId: d.deviceId,
+      ),
     );
   }
 
@@ -701,6 +721,23 @@ class _HomePageState extends State<HomePage> {
               // saying so beats a send that vanishes.
               canSend: thread != null || deviceId != null,
               cannotSendReason: 'there is no way to reach them',
+              // Hidden rather than disabled when there is nobody identifiable
+              // to block — see `ThreadView.onBlock`.
+              onBlock: (thread == null && deviceId == null)
+                  ? null
+                  : () async {
+                      final done = await _confirmAndBlock(
+                        name: title,
+                        threadId: thread,
+                        deviceId: deviceId,
+                      );
+                      // Leave the conversation of somebody just blocked. The
+                      // route is checked rather than assumed: the dialog above
+                      // is awaited, and anything can have happened meanwhile.
+                      if (done && context.mounted) {
+                        Navigator.of(context).maybePop();
+                      }
+                    },
               onSend: (text) async {
                 try {
                   final id = thread;
@@ -726,6 +763,80 @@ class _HomePageState extends State<HomePage> {
     );
     // The route is gone; nothing should still be trying to redraw it.
     _onThreadChanged = null;
+  }
+
+  /// Ask, then block (R0-F10). Returns whether it happened.
+  ///
+  /// One path for both entry points, so the sentence a person reads and the
+  /// call that follows cannot drift apart.
+  ///
+  /// Prefers the thread over the handle. A paired friend who has walked away
+  /// has a thread and no handle at all — R0-F4 makes pairing durable — and that
+  /// is exactly when somebody reaches for this, so the case with no `deviceId`
+  /// is the ordinary one rather than a fallback.
+  Future<bool> _confirmAndBlock({
+    required String name,
+    required int? threadId,
+    required String? deviceId,
+  }) async {
+    if (!await showBlockConfirm(context, name)) return false;
+    try {
+      if (threadId != null) {
+        await blockThread(threadId: threadId);
+      } else if (deviceId != null) {
+        await blockDevice(deviceId: deviceId);
+      } else {
+        return false;
+      }
+    } catch (e) {
+      if (mounted) setState(() => _log.insert(0, 'Error: $e'));
+      return false;
+    }
+    // The nearby list is redrawn by the `DiscoveryUpdated` the core emits, so
+    // nothing is refreshed here — a second refresh would race it.
+    return true;
+  }
+
+  /// The blocked list, and the way back from it.
+  Future<void> _openBlocked() async {
+    List<BlockedPersonDto> people;
+    try {
+      people = await blockedPeople();
+    } catch (e) {
+      if (mounted) setState(() => _log.insert(0, 'Error: $e'));
+      return;
+    }
+    if (!mounted) return;
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => StatefulBuilder(
+          builder: (context, setLocal) => BlockedView(
+            people: [
+              for (final p in people)
+                BlockedPerson(
+                  contactId: p.contactId.toInt(),
+                  name: p.name,
+                  colour: p.colour,
+                ),
+            ],
+            onUnblock: (person) async {
+              try {
+                await unblockPerson(contactId: person.contactId);
+                final fresh = await blockedPeople();
+                // Two awaits, and this screen can be popped across either of
+                // them. `setLocal` on a disposed `StatefulBuilder` throws, and
+                // the unblock itself has already happened by then — so the
+                // check guards the redraw, not the act.
+                if (!context.mounted) return;
+                setLocal(() => people = fresh);
+              } catch (e) {
+                if (mounted) setState(() => _log.insert(0, 'Error: $e'));
+              }
+            },
+          ),
+        ),
+      ),
+    );
   }
 
   /// Run an API call, surfacing any failure in the log instead of leaving an

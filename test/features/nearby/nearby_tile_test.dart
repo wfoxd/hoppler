@@ -38,7 +38,11 @@ NearbyDevice _away({required String name}) => NearbyDevice(
 
 void main() {
   /// Returns a counter of how many times the row asked to be opened.
-  Future<List<int>> pump(WidgetTester tester, NearbyDevice device) async {
+  Future<List<int>> pump(
+    WidgetTester tester,
+    NearbyDevice device, {
+    List<int>? blocked,
+  }) async {
     final opened = <int>[];
     await tester.pumpWidget(
       MaterialApp(
@@ -48,12 +52,49 @@ void main() {
             pingService: _StubPingService(),
             onOpen: () => opened.add(opened.length),
             onDrop: () {},
+            onBlock: blocked == null ? null : () => blocked.add(blocked.length),
           ),
         ),
       ),
     );
     return opened;
   }
+
+  /// A long press blocks, and — the half that matters — does **not** also open
+  /// the conversation.
+  ///
+  /// `ListTile` gives `onTap` and `onLongPress` to the same region, so a long
+  /// press that also fired the tap would drop somebody into the chat of the
+  /// person they were trying to block, behind a dialog they did not expect.
+  testWidgets('a long press offers to block, and does not open the chat', (
+    tester,
+  ) async {
+    final blocked = <int>[];
+    final opened = await pump(tester, _device(name: 'sam'), blocked: blocked);
+
+    await tester.longPress(find.text('sam'));
+    await tester.pumpAndSettle();
+
+    expect(blocked, hasLength(1), reason: 'the long press did not block');
+    expect(
+      opened,
+      isEmpty,
+      reason: 'the long press also opened the conversation',
+    );
+  });
+
+  /// R0-F4 makes pairing durable, so somebody out of range still has a row —
+  /// and blocking them is the ordinary case, not an edge one. Ping and Drop are
+  /// unavailable there; this must not be.
+  testWidgets('somebody out of range can still be blocked', (tester) async {
+    final blocked = <int>[];
+    await pump(tester, _away(name: 'sam'), blocked: blocked);
+
+    await tester.longPress(find.text('sam'));
+    await tester.pumpAndSettle();
+
+    expect(blocked, hasLength(1));
+  });
 
   // A device is listed before anyone knows who it is: the advertisement carries
   // no persona on purpose, so a scanner in range learns only that something is
