@@ -624,7 +624,7 @@ impl Discovery {
             // could read off our advertisement, and every step after it
             // (handshake, session, frames) asks the gate.
             let blocked = !request.is_first_contact()
-                && self.inner.blocked.ingress_gate(&request.pseudonym) == Admit::Silence;
+                && self.inner.blocked.ingress_gate(&[request.pseudonym]) == Admit::Silence;
 
             !within_allowance || blocked
         };

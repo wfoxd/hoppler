@@ -16,7 +16,7 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use rust_lib_hoppler::api::discovery::{nearby_devices, set_discovery};
+use rust_lib_hoppler::api::discovery::{block_device, nearby_devices, set_discovery};
 use rust_lib_hoppler::api::identity::{current_persona, update_persona};
 use rust_lib_hoppler::api::messaging::{
     list_threads, ping, send_chat, send_chat_to_thread, thread_for_device, thread_messages,
@@ -26,7 +26,7 @@ use rust_lib_hoppler::api::pairing::{
 };
 use rust_lib_hoppler::api::transfers::offer_drop;
 use rust_lib_hoppler::api::types::{CoreEvent, MessageStateDto};
-use rust_lib_hoppler::block::Blocklist;
+use rust_lib_hoppler::block::{Blocklist, Handle};
 use rust_lib_hoppler::discovery::Discovery;
 use rust_lib_hoppler::engine::fake::placeholder_pseudonym;
 use rust_lib_hoppler::engine::{
@@ -55,7 +55,7 @@ use rust_lib_hoppler::transport::{Transport, TransportError, TransportEvent};
 static LOCK: Mutex<()> = Mutex::new(());
 
 struct Harness {
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
     air: LoopbackNet,
 }
 
@@ -76,7 +76,7 @@ fn fresh() -> Harness {
         rx,
     )
     .unwrap();
-    Harness { _dir: dir, air }
+    Harness { dir, air }
 }
 
 /// A peer that advertises, so the engine has something to see.
@@ -191,7 +191,9 @@ fn a_block_on_disk_is_in_force_at_the_next_launch() {
         "the paired row is not drawn at all, so hiding it proves nothing"
     );
 
-    on_disk(&dir).block(&mallory, 0, true).unwrap();
+    on_disk(&dir)
+        .block(&[(mallory, Handle::Pseudonym)], None, 0)
+        .unwrap();
 
     boot(&dir, &air, "core-third");
     assert!(
@@ -234,7 +236,7 @@ fn a_blocked_device_in_front_of_us_draws_no_row() {
                 first_seen: 0,
             })
             .unwrap();
-        store.block(&mallory, 0, false).unwrap();
+        store.block(&[(mallory, Handle::Device)], None, 0).unwrap();
     }
 
     boot(&dir, &air, "core-after");
@@ -1621,6 +1623,141 @@ fn a_confirmed_ceremony_leaves_a_thread_behind() {
             .iter()
             .any(|d| d.device_id.as_deref() == Some(peer.id.as_str()) && d.paired)
     });
+}
+
+/// R0-F10 end to end: blocking a paired person revokes the pairing, tears down
+/// the live session, and takes the row off the list.
+///
+/// Every one of those is a separate way for a block to be nominal. A pairing
+/// left in place keeps this device sealing to somebody it has decided not to
+/// hear from; a session left open keeps delivering frames; a row left on screen
+/// invites the next tap to start it all again.
+#[test]
+fn blocking_a_paired_person_revokes_tears_down_and_delists() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = fresh();
+    let peer = full_peer(&h.air, "peer", "Mallory");
+    let device_id = meet_and_pair(&peer);
+    let thread = thread_for_device(device_id.clone()).unwrap().unwrap();
+
+    // The controls, all before the block, so each assertion below has something
+    // it is known to be changing.
+    assert!(has_session(&device_id), "no session to tear down");
+    assert!(
+        ratchet_size_for_test(thread).unwrap().is_some(),
+        "no ratchet to revoke"
+    );
+    assert!(
+        nearby_devices()
+            .unwrap()
+            .iter()
+            .any(|d| d.device_id.as_deref() == Some(device_id.as_str())),
+        "no row to remove"
+    );
+
+    block_device(device_id.clone()).unwrap();
+
+    assert!(
+        !has_session(&device_id),
+        "the session survived the block: frames from a blocked device still arrive"
+    );
+    assert!(
+        ratchet_size_for_test(thread).unwrap().is_none(),
+        "the ratchet survived the block, so this device can still seal to them"
+    );
+    let listed: Vec<String> = nearby_devices()
+        .unwrap()
+        .iter()
+        .filter_map(|d| d.device_id.clone())
+        .collect();
+    assert!(
+        !listed.iter().any(|id| id == &device_id),
+        "a blocked person is still on the nearby list: {listed:?}"
+    );
+    // And not as a paired-but-absent row either, which is drawn off the disk by
+    // a different loop and would be a second way for them to reappear.
+    assert!(
+        nearby_devices()
+            .unwrap()
+            .iter()
+            .all(|d| d.name != "Mallory"),
+        "the blocked person came back as a remembered pairing"
+    );
+}
+
+/// A device this app has never seen cannot be blocked, because there is
+/// nothing to write that would mean anything.
+///
+/// Storing a hash of a rung id we have never seen would look like a block and
+/// be one for nobody: the id is somebody else's within twelve minutes, and the
+/// row would then be a block on whoever inherits it.
+#[test]
+fn a_device_we_know_nothing_about_cannot_be_blocked() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = fresh();
+
+    assert!(
+        block_device("never-seen-this-one".into()).is_err(),
+        "blocked a device the app has no record of"
+    );
+    assert!(
+        on_disk(&h.dir).list_blocks().unwrap().is_empty(),
+        "a block row was written for a device we have never seen"
+    );
+
+    // The control: a device we *have* seen blocks fine, so the refusal above is
+    // about what is known and not about blocking being broken.
+    let peer = full_peer(&h.air, "peer", "Mallory");
+    let device_id = meet_and_pair(&peer);
+    block_device(device_id).unwrap();
+    assert!(!on_disk(&h.dir).list_blocks().unwrap().is_empty());
+}
+
+/// What a block binds to depends on who dialled, so both arrangements are
+/// tested — and the weaker one must not be recorded as though it were durable.
+///
+/// `Net::we_initiate` compares the two rung ids, and the engine's is `core`. So
+/// naming the peer either side of that decides the roles outright, which is the
+/// only reason this can be asserted at all rather than depending on a coin flip.
+#[test]
+fn a_block_records_a_pseudonym_only_when_the_peer_dialled_us() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    for (peer_id, dialled_us, expected) in [
+        ("aaa-peer", true, Handle::Pseudonym),
+        ("zzz-peer", false, Handle::PersonaKey),
+    ] {
+        let h = fresh();
+        let peer = full_peer(&h.air, peer_id, "Mallory");
+        assert_eq!(
+            peer_id < "core",
+            dialled_us,
+            "this test's premise about who dials is wrong"
+        );
+        let device_id = meet_and_pair(&peer);
+
+        block_device(device_id).unwrap();
+
+        let blocks = on_disk(&h.dir).list_blocks().unwrap();
+        let strongest = blocks.iter().map(|b| b.kind).max().unwrap();
+        assert_eq!(
+            strongest, expected,
+            "{peer_id}: wrong strongest handle recorded. A session's remote \
+             static is the peer's pseudonym only when they dialled us; when we \
+             dialled it is their Layer-2 key, and recording that as a pseudonym \
+             credits the block with a durability it has not got"
+        );
+        // Whichever way round, the Layer-2 key is on the list too — that is
+        // what a session we opened can offer the gate, and without it the block
+        // is invisible to exactly half of them.
+        assert!(
+            blocks.iter().any(|b| b.kind == Handle::PersonaKey),
+            "{peer_id}: no persona key recorded"
+        );
+        assert!(
+            blocks.iter().all(|b| b.revoked_pairing),
+            "{peer_id}: the pairing was not revoked"
+        );
+    }
 }
 
 /// Pairing leaves a ratchet behind.

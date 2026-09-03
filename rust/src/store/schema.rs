@@ -186,6 +186,39 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE threads_rebuilt RENAME TO threads;
     CREATE INDEX idx_threads_contact ON threads(contact_id, id);
     "#,
+    // v5 -> v6: what a block is bound to, and who it is about (T18b).
+    //
+    // A block writes **one row per handle** this device holds for a person, all
+    // carrying the same `contact_id`. Which handle a given surface can offer
+    // depends on which side dialled, and that flips with the rotating ids, so
+    // recording only the strongest is not a weaker block — it is one invisible
+    // to half the surfaces that have to enforce it.
+    //
+    // The strongest is not always the Layer-1-derived pseudonym R0-F10 names.
+    // It can only be that when the peer dialled us — Noise IK proves the
+    // *initiator's* static — so for roughly half of peers the best available
+    // handle is their Layer-2 persona key, or a hash of the rung id if no
+    // persona has ever been fetched.
+    //
+    // `kind` records which, per row, so anything reporting on a person's block
+    // can take the strongest of theirs and say how durable it really is.
+    //
+    // Defaulted to 0, the weakest, on the principle that a row from before this
+    // column existed cannot prove anything about itself — and because in
+    // practice there are no such rows: nothing in any shipped build has ever
+    // written to this table.
+    //
+    // `contact_id` is `ON DELETE SET NULL` and deliberately not `CASCADE`. A
+    // block has to outlive the contact row it came from; cascading would make
+    // forgetting somebody a way of unblocking them, which is the one direction
+    // this must never fail in. Nullable because a block can outlive its contact
+    // and because SQLite requires a NULL default when `ADD COLUMN` carries a
+    // foreign key.
+    r#"
+    ALTER TABLE blocklist ADD COLUMN kind INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE blocklist ADD COLUMN contact_id INTEGER
+        REFERENCES contacts(id) ON DELETE SET NULL;
+    "#,
 ];
 
 /// The schema version this build migrates to.

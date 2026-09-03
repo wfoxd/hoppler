@@ -1365,7 +1365,12 @@ impl Net {
             }
         };
 
-        if self.blocked.ingress_gate(&pending.pseudonym().0) == Admit::Silence {
+        // Both handles. The static is the strong one — it is their pseudonym
+        // toward us, proven — and the persona key catches a block that was
+        // written before this device had ever dialled us and so had only the
+        // weaker handle to bind to.
+        let handles = [pending.pseudonym().0, pending.persona().l2_pub.0];
+        if self.blocked.ingress_gate(&handles) == Admit::Silence {
             // Dropped. Not an error frame, not a close — nothing, so a blocked
             // device cannot tell this from us being out of range (R0-F10).
             // Not logged, and that is the point. A block is enforced by
@@ -1447,8 +1452,16 @@ impl Net {
         //
         // The pseudonym is the one the Noise handshake proved, not one this
         // peer claimed; there is nothing else in a session to key on.
-        if let Some(who) = self.sessions.pseudonym(peer) {
-            if self.blocked.ingress_gate(&who.0) == Admit::Silence {
+        //
+        // Both handles, and the second is not belt-and-braces here. In Noise IK
+        // the remote static is whatever the *other* side presented, so it is
+        // their pseudonym only when they dialled us; when we dialled, it is the
+        // `session_pub` out of their persona record, which `Initiator::finish`
+        // asserts. Which role we take is a comparison of two rotating ids, so
+        // for one person it flips every twelve minutes — and a gate asking only
+        // for a pseudonym would admit a blocked device half the time.
+        if let Some(who) = self.sessions.handles(peer) {
+            if self.blocked.ingress_gate(&who) == Admit::Silence {
                 // Nothing, and no log line — the same silence as the handshake,
                 // for the same reason.
                 return Vec::new();
@@ -1521,10 +1534,25 @@ impl Net {
         out
     }
 
-    /// The pseudonym proven for a peer, if a session is live — what a block
-    /// binds to.
-    pub fn pseudonym(&self, peer: &str) -> Option<dh::DhPublic> {
-        self.sessions.pseudonym(peer)
+    /// The remote static a live session's handshake proved.
+    ///
+    /// Called `pseudonym` until T18b, which is what it is only when the peer
+    /// dialled us. See [`SessionTable::remote_static`], and use
+    /// [`Net::session_handles`] for anything deciding about a person.
+    pub fn remote_static(&self, peer: &str) -> Option<dh::DhPublic> {
+        self.sessions.remote_static(peer)
+    }
+
+    /// Everything a live session knows that could identify its peer to the
+    /// block list.
+    pub fn session_handles(&self, peer: &str) -> Option<[[u8; 32]; 2]> {
+        self.sessions.handles(peer)
+    }
+
+    /// The peer's pseudonym toward us, where a live session proves one — which
+    /// it does only if they dialled. See [`SessionTable::proved_pseudonym`].
+    pub fn proved_pseudonym(&self, peer: &str) -> Option<[u8; 32]> {
+        self.sessions.proved_pseudonym(peer)
     }
 }
 

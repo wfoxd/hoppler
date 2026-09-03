@@ -138,13 +138,54 @@ impl SessionTable {
             .map(|s| s.persona.clone())
     }
 
-    /// The pseudonym proven during the handshake — what a block binds to.
-    pub fn pseudonym(&self, peer: &str) -> Option<dh::DhPublic> {
+    /// The remote static this session's handshake proved.
+    ///
+    /// **Not always a pseudonym**, despite what this was called until T18b. In
+    /// Noise IK the remote static is whatever the other side presented: their
+    /// pseudonym toward us when they dialled, and the `session_pub` from their
+    /// persona record when we did — `handshake::Initiator::finish` asserts the
+    /// second. Anything deciding about a *person* wants [`Self::handles`].
+    pub fn remote_static(&self, peer: &str) -> Option<dh::DhPublic> {
         self.sessions
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(peer)
             .map(|s| s.pseudonym)
+    }
+
+    /// The peer's pseudonym toward us, and `None` when this session cannot
+    /// prove one.
+    ///
+    /// It can only prove one when the peer *dialled*: Noise IK authenticates
+    /// the initiator's static, and that static is the pseudonym they derived
+    /// toward us. When this device dialled, the remote static is the
+    /// `session_pub` published in their persona record — which
+    /// `handshake::Initiator::finish` asserts, and which is what this compares
+    /// against. A Layer-2 key regenerates; a pseudonym does not, and R0-F10
+    /// rests on the difference.
+    pub fn proved_pseudonym(&self, peer: &str) -> Option<[u8; 32]> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(peer)
+            .filter(|s| s.pseudonym.0 != s.persona.session_pub.0)
+            .map(|s| s.pseudonym.0)
+    }
+
+    /// Everything this session knows that could identify its peer to a block
+    /// list — the proven static, and the Layer-2 key of the persona bound to
+    /// it.
+    ///
+    /// Two, because neither alone is enough: the static is only a pseudonym
+    /// when they dialled us, and the persona key is evadable by regenerating a
+    /// persona. Together they cover both roles, and the strong one still means
+    /// what R0-F10 says it means when it is the one on file.
+    pub fn handles(&self, peer: &str) -> Option<[[u8; 32]; 2]> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(peer)
+            .map(|s| [s.pseudonym.0, s.persona.l2_pub.0])
     }
 
     /// Encrypt a frame, ready to hand to the transport.
