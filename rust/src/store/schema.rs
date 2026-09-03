@@ -201,10 +201,12 @@ const MIGRATIONS: &[&str] = &[
     // persona has ever been fetched.
     //
     // `kind` records which, per row, so anything reporting on a person's block
-    // can take the strongest of theirs and say how durable it really is. Defaulted to 0, the weakest, on the principle that
-    // a row from before this column existed cannot prove anything about itself
-    // — and because in practice there are no such rows: nothing in any shipped
-    // build has ever written to this table.
+    // can take the strongest of theirs and say how durable it really is.
+    //
+    // Defaulted to 0, the weakest, on the principle that a row from before this
+    // column existed cannot prove anything about itself — and because in
+    // practice there are no such rows: nothing in any shipped build has ever
+    // written to this table.
     //
     // `contact_id` is `ON DELETE SET NULL` and deliberately not `CASCADE`. A
     // block has to outlive the contact row it came from; cascading would make
