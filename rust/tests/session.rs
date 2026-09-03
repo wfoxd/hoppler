@@ -567,7 +567,7 @@ mod table {
     fn who_we_are_talking_to_is_the_proven_identity() {
         let (a, _, _) = linked();
         assert_eq!(a.persona("bob").unwrap().name, "Bob");
-        assert!(a.pseudonym("bob").is_some());
+        assert!(a.remote_static("bob").is_some());
         assert!(a.persona("nobody").is_none());
     }
 

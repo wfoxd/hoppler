@@ -15,12 +15,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rust_lib_hoppler::block::Blocklist;
+use rust_lib_hoppler::crypto::sign::SigningKeyPair;
 use rust_lib_hoppler::discovery::protocol::Request;
 use rust_lib_hoppler::discovery::ROTATION_PERIOD;
 use rust_lib_hoppler::engine::net::{
     Net, NetEvent, CEREMONY_CONFIRM_DEADLINE, CEREMONY_DEADLINE, PING_DEADLINE,
 };
-use rust_lib_hoppler::identity::Identity;
+use rust_lib_hoppler::identity::{Identity, Persona};
 use rust_lib_hoppler::pairing::invite::Invite;
 use rust_lib_hoppler::pairing::sas::Sas;
 use rust_lib_hoppler::session::chat::ChatEnvelope;
@@ -53,13 +54,19 @@ fn air() -> LoopbackNet {
 }
 
 fn node(air: &LoopbackNet, id: &str, name: &str, now: Instant) -> Node {
+    node_with(air, id, Identity::generate(name, 0x00_88_ff), now)
+}
+
+/// As [`node`], with the identity supplied — so a test can stand up *the same
+/// person* under a fresh Layer-2 persona and a fresh rung id.
+fn node_with(air: &LoopbackNet, id: &str, identity: Identity, now: Instant) -> Node {
     let (tx, rx) = channel();
     let tx = Mutex::new(tx);
     let sink: Box<dyn Fn(TransportEvent) + Send + Sync> = Box::new(move |e| {
         let _ = tx.lock().unwrap_or_else(|p| p.into_inner()).send(e);
     });
     let transport: Arc<dyn Transport> = Arc::new(air.join(id, sink));
-    let identity = Arc::new(Mutex::new(Identity::generate(name, 0x00_88_ff)));
+    let identity = Arc::new(Mutex::new(identity));
     let blocked = Arc::new(Blocklist::default());
     Node {
         net: Net::new(
@@ -341,7 +348,7 @@ fn a_live_session_exposes_the_pseudonym_a_block_would_use() {
 
     let seen_by_bob = bob
         .net
-        .pseudonym(&alice.id)
+        .remote_static(&alice.id)
         .expect("no session on Bob's side");
     let bob_persona = rust_lib_hoppler::identity::verify_persona_record(
         &bob.identity.lock().unwrap().persona_record(),
@@ -558,6 +565,134 @@ fn a_block_stops_a_session_that_is_already_open() {
             .any(|e| matches!(e, NetEvent::PingAcked { .. })),
         "the blocked sender was answered, which tells her the session is still \
          live and she is being ignored on purpose: {after_back:?}"
+    );
+}
+
+/// R0-F10's acceptance clause, the hard half: a blocked device that
+/// **regenerates its Layer-2 persona** is still refused.
+///
+/// The identity layer already pins that a pseudonym survives its owner's own
+/// Layer-2 rotation. What that does not say is that a *block* does — the block
+/// list is a different thing, written from a different value, and the two only
+/// compose if what was written was the pseudonym and not something derived from
+/// the persona. This is that composition, and it is the requirement's own
+/// wording.
+///
+/// The regenerated device arrives under a new rung id as well, because a real
+/// one would: R0-F2 rotates it, and nothing about the block may depend on it.
+#[test]
+fn regenerating_a_persona_does_not_evade_a_block() {
+    let air = air();
+    let now = Instant::now();
+    let alice = node(&air, "aaa-alice", "Alice", now);
+    let bob = node(&air, "bob", "Bob", now);
+    bob.net.discovery().set_enabled(true, now).unwrap();
+    alice.net.discovery().set_enabled(true, now).unwrap();
+    alice.net.discovery().start_scanning().unwrap();
+    settle(&alice, &bob, now);
+
+    let bob_persona = rust_lib_hoppler::identity::verify_persona_record(
+        &bob.identity.lock().unwrap().persona_record(),
+    )
+    .unwrap();
+
+    // Bob blocks Alice, and *only* on her pseudonym. Nothing derived from her
+    // persona is on the list, so if the refusal below happens for any other
+    // reason this test would not notice.
+    let alice_pseudonym = alice
+        .identity
+        .lock()
+        .unwrap()
+        .pseudonym_toward(&bob_persona.l2_pub)
+        .0;
+    bob.blocked.block(alice_pseudonym);
+
+    // Same person — same Layer-1 seed — with a brand new Layer-2 persona: a new
+    // name, a new colour, a new key, a new signature, a new session static.
+    let regenerated = Identity::from_parts(
+        &alice.identity.lock().unwrap().layer1_seed(),
+        &SigningKeyPair::generate().to_seed(),
+        Persona {
+            name: "Someone Else".into(),
+            colour: 0x00_11_22,
+            version: 2,
+        },
+    );
+    assert_ne!(
+        regenerated.layer2_public().0,
+        alice.identity.lock().unwrap().layer2_public().0,
+        "the persona was not actually regenerated"
+    );
+    assert_eq!(
+        regenerated.pseudonym_toward(&bob_persona.l2_pub).0,
+        alice_pseudonym,
+        "the pseudonym moved, so this test is about something else"
+    );
+
+    let reborn = node_with(&air, "aab-alice", regenerated, now);
+    reborn.net.discovery().start_scanning().unwrap();
+    settle(&reborn, &bob, now);
+    reborn.net.reach(&bob.id).unwrap();
+    let (a_events, b_events) = settle(&reborn, &bob, now);
+
+    assert!(
+        opened_with(&b_events).is_none(),
+        "a blocked device evaded its block by regenerating its persona: {b_events:?}"
+    );
+    assert!(
+        opened_with(&a_events).is_none(),
+        "the regenerated device believes it has a session: {a_events:?}"
+    );
+}
+
+/// The gap T18a left, and the reason the gate takes a slice.
+///
+/// A session records the static the handshake proved, and in Noise IK that is
+/// whatever the *other* side presented — their pseudonym when they dialled, the
+/// `session_pub` from their persona record when we did. A gate asking only for
+/// a pseudonym is therefore blind on every session this device opened, and
+/// which of the two it is flips with the rotating ids.
+///
+/// Here the blocker is the dialler, so the only handle its session can offer is
+/// the peer's Layer-2 key — which is exactly what `block_device` records
+/// alongside the pseudonym.
+#[test]
+fn a_session_we_dialled_still_refuses_a_blocked_peer() {
+    let air = air();
+    let now = Instant::now();
+    // The blocker's id sorts first, so the blocker is the one that dials.
+    let blocker = node(&air, "aaa-blocker", "Blocker", now);
+    let nuisance = node(&air, "zzz-nuisance", "Nuisance", now);
+    nuisance.net.discovery().set_enabled(true, now).unwrap();
+    blocker.net.discovery().set_enabled(true, now).unwrap();
+    blocker.net.discovery().start_scanning().unwrap();
+    settle(&blocker, &nuisance, now);
+    blocker.net.reach(&nuisance.id).unwrap();
+    settle(&blocker, &nuisance, now);
+
+    assert!(
+        blocker.net.proved_pseudonym(&nuisance.id).is_none(),
+        "the blocker dialled, so its session must not claim to prove a pseudonym"
+    );
+
+    // The control: the session works both ways before the block.
+    nuisance.net.ping(&blocker.id, now).unwrap();
+    let (heard, _) = settle(&blocker, &nuisance, now);
+    assert!(
+        heard.iter().any(|e| matches!(e, NetEvent::Pinged { .. })),
+        "no working session to block: {heard:?}"
+    );
+
+    // The Layer-2 key is all this session can offer, and it is enough.
+    let nuisance_l2 = nuisance.identity.lock().unwrap().layer2_public().0;
+    blocker.blocked.block(nuisance_l2);
+
+    nuisance.net.ping(&blocker.id, now).unwrap();
+    let (after, _) = settle(&blocker, &nuisance, now);
+    assert!(
+        !after.iter().any(|e| matches!(e, NetEvent::Pinged { .. })),
+        "a blocked peer's frames still arrive over a session this device \
+         dialled — the gate is only asking with a pseudonym: {after:?}"
     );
 }
 

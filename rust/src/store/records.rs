@@ -7,6 +7,7 @@
 use rusqlite::{params, OptionalExtension};
 use zeroize::Zeroizing;
 
+use crate::block::Handle;
 use crate::session::chat::MAX_AHEAD;
 
 use super::{Store, StoreError};
@@ -212,10 +213,18 @@ pub enum InsertOutcome {
     Duplicate,
 }
 
-/// A block-list entry (keyed by the per-counterparty pseudonym).
+/// A block-list entry.
+///
+/// `handle` is whatever this device could bind to — see [`crate::block::Handle`]
+/// — and `kind` says which, so nothing downstream has to guess how durable a
+/// block is. `contact` is who it is about, where that was known; it is
+/// nullable and `ON DELETE SET NULL`, because a block outlives the contact row
+/// it came from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockEntry {
-    pub pseudonym: [u8; 32],
+    pub handle: [u8; 32],
+    pub kind: Handle,
+    pub contact: Option<i64>,
     pub created_at: i64,
     pub revoked_pairing: bool,
 }
@@ -757,6 +766,18 @@ impl Store {
     /// keys is worse than one that did neither.
     pub fn unpair_contact(&self, contact_id: i64) -> Result<bool, StoreError> {
         let tx = self.conn.unchecked_transaction()?;
+        let revoked = self.revoke_pairing_within(contact_id)?;
+        tx.commit()?;
+        Ok(revoked)
+    }
+
+    /// The revocation itself, without a transaction of its own.
+    ///
+    /// Split out because [`Self::block`] has to do this *and* write a block row
+    /// as one fact, and SQLite has no nested transactions — calling
+    /// `unpair_contact` from inside one fails at run time with "cannot start a
+    /// transaction within a transaction". Every caller must already hold one.
+    fn revoke_pairing_within(&self, contact_id: i64) -> Result<bool, StoreError> {
         // Before the pairing goes, so the thread is still findable through it.
         if let Some(thread) = self.thread_for_contact(contact_id)? {
             self.conn
@@ -766,7 +787,6 @@ impl Store {
             "DELETE FROM pairings WHERE contact_id = ?1",
             params![contact_id],
         )?;
-        tx.commit()?;
         Ok(n > 0)
     }
 
@@ -1019,52 +1039,97 @@ impl Store {
 
     // ── blocklist ───────────────────────────────────────────────────────────
 
+    /// Write a block, and revoke the pairing it makes meaningless, as one fact.
+    ///
+    /// One transaction, for the same reason `unpair_contact` is one: a block
+    /// that landed without the revocation would leave this device sealing to
+    /// somebody it has decided not to hear from, and a revocation without the
+    /// block would drop a pairing for no stated reason at all.
+    ///
+    /// # Every handle, not the best one
+    ///
+    /// A row per handle the caller holds, all tagged with the same contact.
+    /// Recording only the strongest looks tidier and leaves a hole: which of a
+    /// peer's handles a given surface can offer depends on **which side dialled**
+    /// (see [`crate::block`]), and that flips with the rotating ids. A block
+    /// holding only a pseudonym is invisible to a session this device opened,
+    /// whose static is the peer's Layer-2 key.
+    ///
+    /// They are all the same person, so unblocking takes the whole set.
+    ///
+    /// `revoked_pairing` is the *outcome*, recorded rather than requested —
+    /// R0-F10 says unblocking restores stranger-level status and not the
+    /// pairing, so what was actually taken away is worth being able to say.
     pub fn block(
         &self,
-        pseudonym: &[u8; 32],
+        handles: &[([u8; 32], Handle)],
+        contact: Option<i64>,
         created_at: i64,
-        revoked_pairing: bool,
-    ) -> Result<(), StoreError> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO blocklist (pseudonym, created_at, revoked_pairing)
-             VALUES (?1, ?2, ?3)",
-            params![&pseudonym[..], created_at, revoked_pairing as i64],
-        )?;
-        Ok(())
+    ) -> Result<bool, StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let revoked = match contact {
+            Some(id) => self.revoke_pairing_within(id)?,
+            None => false,
+        };
+        for (handle, kind) in handles {
+            self.conn.execute(
+                "INSERT OR REPLACE INTO blocklist
+                     (pseudonym, kind, contact_id, created_at, revoked_pairing)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    &handle[..],
+                    kind.to_i64(),
+                    contact,
+                    created_at,
+                    revoked as i64
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(revoked)
     }
 
-    pub fn is_blocked(&self, pseudonym: &[u8; 32]) -> Result<bool, StoreError> {
+    pub fn is_blocked(&self, handle: &[u8; 32]) -> Result<bool, StoreError> {
         let n: i64 = self.conn.query_row(
             "SELECT count(*) FROM blocklist WHERE pseudonym = ?1",
-            params![&pseudonym[..]],
+            params![&handle[..]],
             |r| r.get(0),
         )?;
         Ok(n > 0)
     }
 
-    pub fn unblock(&self, pseudonym: &[u8; 32]) -> Result<(), StoreError> {
+    pub fn unblock(&self, handle: &[u8; 32]) -> Result<(), StoreError> {
         self.conn.execute(
             "DELETE FROM blocklist WHERE pseudonym = ?1",
-            params![&pseudonym[..]],
+            params![&handle[..]],
         )?;
         Ok(())
     }
 
     pub fn list_blocks(&self) -> Result<Vec<BlockEntry>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT pseudonym, created_at, revoked_pairing FROM blocklist ORDER BY created_at",
+            "SELECT pseudonym, kind, contact_id, created_at, revoked_pairing
+             FROM blocklist ORDER BY created_at",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, Vec<u8>>(0)?,
                 r.get::<_, i64>(1)?,
-                r.get::<_, i64>(2)?,
+                r.get::<_, Option<i64>>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
             ))
         })?;
         rows.map(|r| {
-            let (pseudonym, created_at, revoked) = r?;
+            let (handle, kind, contact, created_at, revoked) = r?;
             Ok(BlockEntry {
-                pseudonym: blob32(pseudonym)?,
+                handle: blob32(handle)?,
+                // A kind this build does not recognise is read as the weakest
+                // one rather than refused. The handle is still a handle and the
+                // block still holds; over-crediting its durability is the only
+                // outcome worth avoiding, and this is the direction that does.
+                kind: Handle::from_i64(kind).unwrap_or(Handle::Device),
+                contact,
                 created_at,
                 revoked_pairing: revoked != 0,
             })
@@ -2624,11 +2689,70 @@ mod tests {
         let (s, _d) = store();
         let p = [3u8; 32];
         assert!(!s.is_blocked(&p).unwrap());
-        s.block(&p, 5, true).unwrap();
+        assert!(
+            !s.block(&[(p, Handle::Pseudonym)], None, 5).unwrap(),
+            "nothing was paired, so nothing can have been revoked"
+        );
         assert!(s.is_blocked(&p).unwrap());
-        assert!(s.list_blocks().unwrap()[0].revoked_pairing);
+        let entry = &s.list_blocks().unwrap()[0];
+        assert_eq!(entry.kind, Handle::Pseudonym);
+        assert_eq!(entry.contact, None);
+        assert!(!entry.revoked_pairing);
         s.unblock(&p).unwrap();
         assert!(!s.is_blocked(&p).unwrap());
+    }
+
+    /// R0-F10: blocking a paired person revokes the pairing. One transaction,
+    /// because a block that landed without the revocation would leave this
+    /// device sealing to somebody it has decided not to hear from.
+    #[test]
+    fn blocking_a_paired_contact_revokes_the_pairing_with_it() {
+        let (s, _d) = store();
+        let id = s.add_contact(&a_contact()).unwrap();
+        let thread = s
+            .record_pairing(id, &[7u8; 32], "Ada", 1, 1, &[9u8; 32], b"ratchet", 2000)
+            .unwrap();
+        assert!(s.pairing_for_contact(id).unwrap().is_some());
+        assert!(s.ratchet_state(thread).unwrap().is_some());
+
+        assert!(
+            s.block(&[([3u8; 32], Handle::Pseudonym)], Some(id), 5)
+                .unwrap(),
+            "the pairing was not reported as revoked"
+        );
+
+        assert!(
+            s.pairing_for_contact(id).unwrap().is_none(),
+            "the pairing survived a block"
+        );
+        assert!(
+            s.ratchet_state(thread).unwrap().is_none(),
+            "the ratchet survived a block, so this device can still seal to them"
+        );
+        let entry = &s.list_blocks().unwrap()[0];
+        assert_eq!(entry.contact, Some(id));
+        assert!(entry.revoked_pairing, "the revocation was not recorded");
+    }
+
+    /// A block outlives the contact row it came from. `ON DELETE SET NULL`, not
+    /// `CASCADE` — cascading would make forgetting somebody a way of unblocking
+    /// them.
+    #[test]
+    fn deleting_a_contact_does_not_delete_the_block() {
+        let (s, _d) = store();
+        let id = s.add_contact(&a_contact()).unwrap();
+        s.block(&[([3u8; 32], Handle::Pseudonym)], Some(id), 5)
+            .unwrap();
+        // Straight to SQL, as the ratchet cascade test does: there is no public
+        // delete, and the property under test is the schema's.
+        s.conn
+            .execute("DELETE FROM contacts WHERE id = ?1", params![id])
+            .unwrap();
+        assert!(
+            s.is_blocked(&[3u8; 32]).unwrap(),
+            "forgetting a contact unblocked them"
+        );
+        assert_eq!(s.list_blocks().unwrap()[0].contact, None);
     }
 
     // ── thread receive state (T12) ──────────────────────────────────────────

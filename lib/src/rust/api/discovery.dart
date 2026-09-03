@@ -14,3 +14,12 @@ Future<void> setDiscovery({required bool enabled}) =>
 /// The devices currently visible (empty when Discovery is off).
 Future<List<NearbyDevice>> nearbyDevices() =>
     RustLib.instance.api.crateApiDiscoveryNearbyDevices();
+
+/// Block a device (R0-F10). Silent and local: nothing reaches the person
+/// blocked, and being blocked is indistinguishable from this device having
+/// Discovery closed.
+///
+/// Revokes any pairing with them, tears down any live session, and takes them
+/// off the nearby list. Emits `discovery.updated`.
+Future<void> blockDevice({required String deviceId}) =>
+    RustLib.instance.api.crateApiDiscoveryBlockDevice(deviceId: deviceId);

@@ -186,6 +186,33 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE threads_rebuilt RENAME TO threads;
     CREATE INDEX idx_threads_contact ON threads(contact_id, id);
     "#,
+    // v5 -> v6: what a block is bound to, and who it is about (T18b).
+    //
+    // A block binds to the strongest handle this device holds for a person, and
+    // that is not always the Layer-1-derived pseudonym R0-F10 names. It can
+    // only be that when the peer dialled us — Noise IK proves the *initiator's*
+    // static, and which side dials is a comparison of two rotating ids — so for
+    // roughly half of peers the best available handle is their Layer-2 persona
+    // key, or a hash of the rung id if no persona has ever been fetched.
+    //
+    // `kind` records which, so the block list can eventually tell a person how
+    // durable theirs is, and so an upgrade to a stronger handle can never write
+    // a weaker one over it. Defaulted to 0, the weakest, on the principle that
+    // a row from before this column existed cannot prove anything about itself
+    // — and because in practice there are no such rows: nothing in any shipped
+    // build has ever written to this table.
+    //
+    // `contact_id` is `ON DELETE SET NULL` and deliberately not `CASCADE`. A
+    // block has to outlive the contact row it came from; cascading would make
+    // forgetting somebody a way of unblocking them, which is the one direction
+    // this must never fail in. Nullable because a block can outlive its contact
+    // and because SQLite requires a NULL default when `ADD COLUMN` carries a
+    // foreign key.
+    r#"
+    ALTER TABLE blocklist ADD COLUMN kind INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE blocklist ADD COLUMN contact_id INTEGER
+        REFERENCES contacts(id) ON DELETE SET NULL;
+    "#,
 ];
 
 /// The schema version this build migrates to.

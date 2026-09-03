@@ -37,7 +37,7 @@ use crate::api::types::{
     ChatMessageDto, CoreEvent, MessageStateDto, NearbyDevice, PersonaDto, SasColourDto,
     ThreadSummary,
 };
-use crate::block::{Admit, Blocklist};
+use crate::block::{Admit, Blocklist, Handle};
 use crate::crypto::rng;
 use crate::discovery::{hint, Sighting};
 use crate::frb_generated::StreamSink;
@@ -367,7 +367,7 @@ fn install(
             .list_blocks()
             .map_err(stringify)?
             .into_iter()
-            .map(|b| b.pseudonym),
+            .map(|b| b.handle),
     ));
 
     let net = transport.map(|t| {
@@ -533,16 +533,19 @@ pub fn nearby_devices() -> Result<Vec<NearbyDevice>, String> {
         for s in sightings {
             let contact = contact_for_sighting(core, &s, &known)?;
             if let Some(id) = contact {
+                // Recorded before the gate below can `continue`, on purpose: it
+                // is what stops the loop over the disk drawing the same person
+                // again.
                 in_front_of_us.push(id);
-                // §12's fourth surface. Suppressed here rather than at the
-                // sighting, because a sighting is a rotating id and this is the
-                // first point at which we know whose it is.
-                //
-                // `in_front_of_us` is recorded first, on purpose: it is what
-                // stops the loop below drawing the same person again from disk.
-                if shut_out(core, id)? {
-                    continue;
-                }
+            }
+            // §12's fourth surface, and it asks about the *sighting* rather
+            // than only about a contact. A blocked peer often resolves to
+            // nobody: the block revoked their pairing, so the advert hint is
+            // gone, and it tore down the session, so there is no proved
+            // pseudonym either. Gating only on an attributed contact therefore
+            // fails in exactly the case the block just created.
+            if shut_out(core, contact, &s)? {
+                continue;
             }
             let known = match contact {
                 Some(id) => core.store.contact_by_id(id)?,
@@ -581,7 +584,7 @@ pub fn nearby_devices() -> Result<Vec<NearbyDevice>, String> {
         for contact in core.store.list_contacts()? {
             if in_front_of_us.contains(&contact.id)
                 || core.store.pairing_for_contact(contact.id)?.is_none()
-                || shut_out(core, contact.id)?
+                || shut_out_contact(core, contact.id)?
             {
                 continue;
             }
@@ -597,20 +600,154 @@ pub fn nearby_devices() -> Result<Vec<NearbyDevice>, String> {
     })
 }
 
-/// Whether this contact is one the user has blocked (R0-F10).
+/// Whether a row about to be drawn belongs to somebody blocked (R0-F10).
 ///
-/// Keyed on whatever the row holds, which is not always a real pseudonym: a
-/// contact no session has ever proved is keyed on a hash of the rotating device
-/// id (see [`fake::placeholder_pseudonym`]). Blocking one of those does work
-/// here, and stops working twelve minutes later when the id rotates — so the
-/// only *durable* block is one against a pseudonym a handshake proved. That
-/// limit is recorded in T18a; it belongs to the block action, which is T18b,
-/// and not to this lookup.
-fn shut_out(core: &Core, contact: i64) -> Result<bool, StoreError> {
+/// Asks with everything the row could be identified by, because a block holds
+/// every handle this device had for that person and any of them is enough —
+/// see [`crate::block::Handle`]. In particular `contacts.pseudonym` is not
+/// reliably a pseudonym: it holds whatever [`session_key_of`] supplied, which
+/// is the peer's Layer-2 key on a session this device dialled, or a placeholder
+/// derived from the rotating id when no session ever happened.
+///
+/// Takes the sighting as well as the contact, and works with either missing.
+/// A blocked peer frequently resolves to no contact at all — blocking revoked
+/// the pairing that carried the advert hint and tore down the session that
+/// proved a pseudonym — so a gate that needed an attributed contact would fail
+/// in precisely the state a block creates.
+fn shut_out(core: &Core, contact: Option<i64>, seen: &Sighting) -> Result<bool, StoreError> {
+    let mut handles = vec![fake::placeholder_pseudonym(&seen.peer)];
+    if let Some(p) = seen.persona.as_ref() {
+        handles.push(p.l2_pub.0);
+    }
+    if let Some(c) = match contact {
+        Some(id) => core.store.contact_by_id(id)?,
+        None => None,
+    } {
+        handles.push(c.pseudonym);
+        handles.push(c.l2_pub);
+    }
+    Ok(core.blocked.ingress_gate(&handles) == Admit::Silence)
+}
+
+/// As [`shut_out`], for a contact drawn off the disk with no sighting at all.
+fn shut_out_contact(core: &Core, contact: i64) -> Result<bool, StoreError> {
     let Some(c) = core.store.contact_by_id(contact)? else {
         return Ok(false);
     };
-    Ok(core.blocked.ingress_gate(&c.pseudonym) == Admit::Silence)
+    Ok(core.blocked.ingress_gate(&[c.pseudonym, c.l2_pub]) == Admit::Silence)
+}
+
+/// Block a device (R0-F10).
+///
+/// Silent and local. Nothing goes to the person being blocked — not a frame,
+/// not a close, not a persona — and after this returns every ingress in the app
+/// refuses them; see [`crate::block`].
+///
+/// # What it binds to
+///
+/// The strongest handle this device holds, which is not always the
+/// Layer-1-derived pseudonym R0-F10 names. That value is only learnable from a
+/// handshake the *peer* opened, and which side dials is a comparison of two
+/// rotating ids — so for roughly half of peers the best available handle is
+/// their Layer-2 persona key, and for one we have never fetched a persona from,
+/// a hash of the rung id. All three are enforced; only the first survives the
+/// peer regenerating their persona. T18b records why offering the weaker ones
+/// beats refusing to block at all.
+///
+/// # Order
+///
+/// The list is updated before the session is torn down, and both after the
+/// store has committed. The reverse order leaves a window in which the session
+/// is gone, the list does not know yet, and a fresh handshake would be admitted.
+pub fn block_device(device_id: String) -> Result<(), String> {
+    let handles = with_core(|core| handles_for(core, &device_id))?;
+    if handles.is_empty() {
+        return Err("nothing known about that device to block".to_string());
+    }
+
+    with_core(|core| {
+        let contact = contact_id_for_device(core, &device_id)?;
+        core.store.block(&handles, contact, now_millis())?;
+        // In force before anything else happens, including before the teardown
+        // below can let a fresh handshake in.
+        for (handle, _) in &handles {
+            core.blocked.block(*handle);
+        }
+        Ok(())
+    })?;
+
+    // Outside the store closure: `close` takes the session table's lock, and
+    // nothing in this crate holds the store lock across a network lock.
+    if let Some(net) = with_core(|core| Ok(core.net.clone()))? {
+        net.sessions().close(&device_id);
+    }
+
+    emit(CoreEvent::DiscoveryUpdated {
+        devices: nearby_devices()?,
+    });
+    Ok(())
+}
+
+/// Every handle this device holds for a peer, each tagged with what it is.
+///
+/// **All of them, not the best one.** Which handle a surface can offer depends
+/// on which side dialled — a session this device opened knows the peer's
+/// Layer-2 key and not their pseudonym — and that flips every time the rotating
+/// ids do. A block recording only the strongest value is therefore invisible to
+/// half the surfaces that have to enforce it.
+///
+/// Empty only when the device id names nobody at all: no session, no sighting,
+/// no contact row. There is then nothing to write that would mean anything, and
+/// `block_device` refuses rather than storing a handle for a stranger it has
+/// never seen.
+fn handles_for(core: &Core, device_id: &str) -> Result<Vec<([u8; 32], Handle)>, StoreError> {
+    let mut out: Vec<([u8; 32], Handle)> = Vec::new();
+    let mut add = |handle: [u8; 32], kind: Handle| {
+        // The zero sentinel is `Request::UNKNOWN` and the `l2_pub` of a contact
+        // whose persona was never fetched; `Blocklist::block` refuses it too,
+        // and it must not reach the store either.
+        if handle != [0u8; 32] && !out.iter().any(|(h, _)| h == &handle) {
+            out.push((handle, kind));
+        }
+    };
+
+    let contact = contact_id_for_device(core, device_id)?;
+
+    // The pseudonym, but only where the session really proves one — which is
+    // only when the peer dialled. When this device dialled, the remote static
+    // is the `session_pub` from their persona record, and recording that as a
+    // pseudonym would credit the block with a durability it has not got.
+    if let Some(net) = core.net.as_ref() {
+        if let Some(p) = net.proved_pseudonym(device_id) {
+            add(p, Handle::Pseudonym);
+        }
+        if let Some([_, l2_pub]) = net.session_handles(device_id) {
+            add(l2_pub, Handle::PersonaKey);
+        }
+    }
+
+    // Their Layer-2 key from a live sighting, and whatever the contact row
+    // holds — which may be either kind, since `session_key_of` fed it.
+    if let Some(p) = sighting_of(core, device_id).and_then(|s| s.persona) {
+        add(p.l2_pub.0, Handle::PersonaKey);
+    }
+    if let Some(c) = match contact {
+        Some(id) => core.store.contact_by_id(id)?,
+        None => None,
+    } {
+        add(c.l2_pub, Handle::PersonaKey);
+        // Weakest claim of the three: this column holds a proven pseudonym, a
+        // Layer-2 key or a device-id placeholder depending on how the row was
+        // made, and nothing on it says which.
+        add(c.pseudonym, Handle::Device);
+    }
+
+    // The rotating id, hashed. Good until the next rotation and no longer,
+    // which is sometimes the whole of what this device knows about them.
+    if contact.is_some() || sighting_of(core, device_id).is_some() {
+        add(fake::placeholder_pseudonym(device_id), Handle::Device);
+    }
+    Ok(out)
 }
 
 // ── sessions / threads ────────────────────────────────────────────────────────
@@ -2593,7 +2730,7 @@ fn contact_id_for_device(core: &Core, device_id: &str) -> Result<Option<i64>, St
 
 /// A contact keyed on an identity the peer has actually proved.
 fn proved_contact(core: &Core, device_id: &str) -> Result<Option<i64>, StoreError> {
-    let Some(real) = pseudonym_of(core, device_id) else {
+    let Some(real) = session_key_of(core, device_id) else {
         return Ok(None);
     };
     Ok(core.store.contact_by_pseudonym(&real)?.map(|c| c.id))
@@ -2653,11 +2790,23 @@ impl Recogniser {
     }
 }
 
-/// The peer's durable identity, if a session has authenticated one.
-fn pseudonym_of(core: &Core, device_id: &str) -> Option<[u8; 32]> {
+/// The remote static a live session's handshake proved, if there is one.
+///
+/// Called `pseudonym_of` until T18b, and the rename is the point. In Noise IK
+/// the remote static is whatever the other side presented: their pseudonym
+/// toward us when they dialled, and the `session_pub` from their persona record
+/// when we dialled. Which role we take is a comparison of two rotating ids, so
+/// for one person it changes every twelve minutes.
+///
+/// Contacts are keyed on this, and stay resolvable anyway — a row keyed under
+/// one of the two values is still found by `contact_for`'s persona route. What
+/// it *does* mean is that `contacts.pseudonym` may hold either kind, so nothing
+/// deciding about a person may treat this as the one true handle. The block
+/// list asks with all of them for exactly this reason.
+fn session_key_of(core: &Core, device_id: &str) -> Option<[u8; 32]> {
     core.net
         .as_ref()
-        .and_then(|net| net.pseudonym(device_id))
+        .and_then(|net| net.remote_static(device_id))
         .map(|p| p.0)
 }
 
@@ -2691,7 +2840,7 @@ fn pseudonym_of(core: &Core, device_id: &str) -> Option<[u8; 32]> {
 /// the next session proved it was them — so this either re-keys the stray or
 /// folds it into the row that already owns the real key.
 fn reconcile_contact(core: &Core, device_id: &str) -> Result<(), StoreError> {
-    let Some(real) = pseudonym_of(core, device_id) else {
+    let Some(real) = session_key_of(core, device_id) else {
         return Ok(());
     };
     let Some(stray) = core
@@ -2722,7 +2871,7 @@ fn ensure_contact(core: &Core, device_id: &str, now: i64) -> Result<i64, StoreEr
     // Nothing on file. Prefer the durable key if a session has proved one;
     // otherwise the device id, which `reconcile_contact` will move later.
     let key =
-        pseudonym_of(core, device_id).unwrap_or_else(|| fake::placeholder_pseudonym(device_id));
+        session_key_of(core, device_id).unwrap_or_else(|| fake::placeholder_pseudonym(device_id));
     let (name, colour) = fake::peer(device_id)
         .map(|p| (p.name.to_owned(), p.colour))
         .unwrap_or_else(|| ("Unknown".into(), 0));
