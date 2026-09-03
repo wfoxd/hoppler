@@ -1884,6 +1884,76 @@ fn a_refused_dial_makes_a_weak_block_durable() {
     );
 }
 
+/// A block that could only bind to a rung id still refuses a dial — and that
+/// dial is what turns it into one that lasts.
+///
+/// Somebody whose persona was never fetched leaves a contact row keyed on a
+/// hash of their rotating id, and `block_device` has nothing else to record.
+/// Until T18e the handshake did not ask with that handle, so such a block hid a
+/// row and stopped nothing: the person could still open a session. It also
+/// meant the block could never be upgraded, because it never matched.
+#[test]
+fn a_block_with_only_a_rung_id_still_refuses_and_learns() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let air = LoopbackNet::new();
+    let peer = full_peer(&air, "aaa-peer", "Mallory");
+
+    // The weakest block there is: a hash of the rung id and nothing else.
+    let placeholder = placeholder_pseudonym("aaa-peer");
+    let contact = {
+        let store = on_disk(&dir);
+        let id = store
+            .add_contact(&NewContact {
+                pseudonym: placeholder,
+                l2_pub: [0u8; 32],
+                name: "Mallory".into(),
+                colour: 1,
+                persona_version: 1,
+                first_seen: 0,
+            })
+            .unwrap();
+        store
+            .block(&[(placeholder, Handle::Device)], Some(id), 0)
+            .unwrap();
+        id
+    };
+
+    boot(&dir, &air, "mmm-core");
+    set_discovery(true).unwrap();
+    peer.net
+        .discovery()
+        .set_enabled(true, Instant::now())
+        .unwrap();
+    peer.net.discovery().start_scanning().unwrap();
+    peer.net.reach("mmm-core").unwrap();
+
+    until("the rung-id block to learn a durable handle", || {
+        pump(&peer);
+        on_disk(&dir)
+            .list_blocks()
+            .unwrap()
+            .iter()
+            .any(|b| b.kind == Handle::Pseudonym)
+    });
+
+    assert!(
+        !has_session("aaa-peer"),
+        "a device blocked by its rung id opened a session anyway"
+    );
+    let learned = on_disk(&dir)
+        .list_blocks()
+        .unwrap()
+        .into_iter()
+        .find(|b| b.kind == Handle::Pseudonym)
+        .expect("checked above");
+    assert_eq!(learned.contact, Some(contact));
+    assert_ne!(
+        learned.handle, placeholder,
+        "what was recorded is the rung id again, which is gone in twelve minutes"
+    );
+}
+
 /// Unblocking a person who taught us a pseudonym must actually unblock them.
 ///
 /// The learning path (T18e) puts a pseudonym in the live set and queues it for
