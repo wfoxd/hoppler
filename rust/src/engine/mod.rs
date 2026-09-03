@@ -29,6 +29,7 @@ pub mod fake;
 pub mod net;
 pub mod pipe;
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -774,16 +775,18 @@ pub fn unblock_person(contact_id: i64) -> Result<(), String> {
 /// there is nothing to draw and nothing an unblock button could sensibly do.
 pub fn blocked_people() -> Result<Vec<BlockedPersonDto>, String> {
     with_core(|core| {
-        let mut seen: Vec<i64> = Vec::new();
+        // A set rather than a scan: a block is several rows, so this runs over
+        // roughly three times the number of people, and `insert` both answers
+        // "first time seen" and records it.
+        let mut seen: HashSet<i64> = HashSet::new();
         let mut out = Vec::new();
         for entry in core.store.list_blocks()? {
             let Some(contact) = entry.contact else {
                 continue;
             };
-            if seen.contains(&contact) {
+            if !seen.insert(contact) {
                 continue;
             }
-            seen.push(contact);
             if let Some(c) = core.store.contact_by_id(contact)? {
                 out.push(BlockedPersonDto {
                     contact_id: contact,

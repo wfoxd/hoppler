@@ -1754,6 +1754,19 @@ fn unblocking_takes_effect_without_a_restart() {
             .any(|p| p.name == "Mallory"),
         "the blocked list does not show who was just blocked"
     );
+    // One row per *person*. A block is several handle rows underneath — that is
+    // how T18b covers both dialling roles — so a list built straight off the
+    // table would show the same person two or three times, with nothing on
+    // screen to explain why.
+    assert!(
+        on_disk(&h.dir).list_blocks().unwrap().len() > 1,
+        "this person was blocked on one handle, so the dedupe below proves nothing"
+    );
+    assert_eq!(
+        blocked_people().unwrap().len(),
+        1,
+        "one person appears more than once on the blocked list"
+    );
 
     unblock_person(contact).unwrap();
 

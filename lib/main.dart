@@ -823,6 +823,11 @@ class _HomePageState extends State<HomePage> {
               try {
                 await unblockPerson(contactId: person.contactId);
                 final fresh = await blockedPeople();
+                // Two awaits, and this screen can be popped across either of
+                // them. `setLocal` on a disposed `StatefulBuilder` throws, and
+                // the unblock itself has already happened by then — so the
+                // check guards the redraw, not the act.
+                if (!context.mounted) return;
                 setLocal(() => people = fresh);
               } catch (e) {
                 if (mounted) setState(() => _log.insert(0, 'Error: $e'));
