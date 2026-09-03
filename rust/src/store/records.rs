@@ -1057,6 +1057,8 @@ impl Store {
     ///
     /// They are all the same person, so unblocking takes the whole set.
     ///
+    /// An empty `handles` does nothing at all — see the guard below.
+    ///
     /// `revoked_pairing` is the *outcome*, recorded rather than requested —
     /// R0-F10 says unblocking restores stranger-level status and not the
     /// pairing, so what was actually taken away is worth being able to say.
@@ -1066,6 +1068,14 @@ impl Store {
         contact: Option<i64>,
         created_at: i64,
     ) -> Result<bool, StoreError> {
+        // Nothing to bind to is not a block, and a revocation on its own is the
+        // one outcome this must never produce: it would take a pairing away and
+        // leave the person able to walk straight back in, with no record saying
+        // why they were unpaired. The caller checks too; this is the check that
+        // cannot be skipped by a future one.
+        if handles.is_empty() {
+            return Ok(false);
+        }
         let tx = self.conn.unchecked_transaction()?;
         let revoked = match contact {
             Some(id) => self.revoke_pairing_within(id)?,
@@ -2732,6 +2742,31 @@ mod tests {
         let entry = &s.list_blocks().unwrap()[0];
         assert_eq!(entry.contact, Some(id));
         assert!(entry.revoked_pairing, "the revocation was not recorded");
+    }
+
+    /// A revocation must never happen on its own.
+    ///
+    /// `block` takes the handles as a slice, so an empty one is a mistake a
+    /// caller can make by accident — and the result would be a pairing taken
+    /// away with nothing on the list to say why, leaving the person able to
+    /// walk straight back in.
+    #[test]
+    fn a_block_with_nothing_to_bind_to_revokes_nothing() {
+        let (s, _d) = store();
+        let id = s.add_contact(&a_contact()).unwrap();
+        s.record_pairing(id, &[7u8; 32], "Ada", 1, 1, &[9u8; 32], b"ratchet", 2000)
+            .unwrap();
+
+        assert!(!s.block(&[], Some(id), 5).unwrap());
+
+        assert!(
+            s.pairing_for_contact(id).unwrap().is_some(),
+            "a pairing was revoked by a block that bound to nothing"
+        );
+        assert!(
+            s.list_blocks().unwrap().is_empty(),
+            "an empty block wrote a row"
+        );
     }
 
     /// A block outlives the contact row it came from. `ON DELETE SET NULL`, not

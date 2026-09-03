@@ -1685,6 +1685,34 @@ fn blocking_a_paired_person_revokes_tears_down_and_delists() {
     );
 }
 
+/// A device this app has never seen cannot be blocked, because there is
+/// nothing to write that would mean anything.
+///
+/// Storing a hash of a rung id we have never seen would look like a block and
+/// be one for nobody: the id is somebody else's within twelve minutes, and the
+/// row would then be a block on whoever inherits it.
+#[test]
+fn a_device_we_know_nothing_about_cannot_be_blocked() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = fresh();
+
+    assert!(
+        block_device("never-seen-this-one".into()).is_err(),
+        "blocked a device the app has no record of"
+    );
+    assert!(
+        on_disk(&h.dir).list_blocks().unwrap().is_empty(),
+        "a block row was written for a device we have never seen"
+    );
+
+    // The control: a device we *have* seen blocks fine, so the refusal above is
+    // about what is known and not about blocking being broken.
+    let peer = full_peer(&h.air, "peer", "Mallory");
+    let device_id = meet_and_pair(&peer);
+    block_device(device_id).unwrap();
+    assert!(!on_disk(&h.dir).list_blocks().unwrap().is_empty());
+}
+
 /// What a block binds to depends on who dialled, so both arrangements are
 /// tested — and the weaker one must not be recorded as though it were durable.
 ///

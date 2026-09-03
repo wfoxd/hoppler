@@ -664,21 +664,29 @@ fn shut_out_contact(core: &Core, contact: i64) -> Result<bool, StoreError> {
 /// store has committed. The reverse order leaves a window in which the session
 /// is gone, the list does not know yet, and a fresh handshake would be admitted.
 pub fn block_device(device_id: String) -> Result<(), String> {
-    let handles = with_core(|core| handles_for(core, &device_id))?;
-    if handles.is_empty() {
-        return Err("nothing known about that device to block".to_string());
-    }
-
-    with_core(|core| {
+    // Contact, handles and write under **one** hold of the core lock. Deriving
+    // the handles under one and revoking under another leaves a gap in which
+    // the device's contact can move: `reconcile_contact` re-keys and merges
+    // rows, and it runs from the session-open event on the pump thread. The
+    // revocation would then name a different row than the handles came from —
+    // a block that took a pairing away from the wrong person, or from nobody.
+    let known = with_core(|core| {
         let contact = contact_id_for_device(core, &device_id)?;
+        let handles = handles_for(core, &device_id, contact)?;
+        if handles.is_empty() {
+            return Ok(false);
+        }
         core.store.block(&handles, contact, now_millis())?;
         // In force before anything else happens, including before the teardown
         // below can let a fresh handshake in.
         for (handle, _) in &handles {
             core.blocked.block(*handle);
         }
-        Ok(())
+        Ok(true)
     })?;
+    if !known {
+        return Err("nothing known about that device to block".to_string());
+    }
 
     // Outside the store closure: `close` takes the session table's lock, and
     // nothing in this crate holds the store lock across a network lock.
@@ -704,7 +712,15 @@ pub fn block_device(device_id: String) -> Result<(), String> {
 /// no contact row. There is then nothing to write that would mean anything, and
 /// `block_device` refuses rather than storing a handle for a stranger it has
 /// never seen.
-fn handles_for(core: &Core, device_id: &str) -> Result<Vec<([u8; 32], Handle)>, StoreError> {
+///
+/// `contact` is passed in rather than looked up here, so that the caller's
+/// revocation and this handle set are derived from the same one — see
+/// `block_device` on why a second lookup is a gap and not a tidy-up.
+fn handles_for(
+    core: &Core,
+    device_id: &str,
+    contact: Option<i64>,
+) -> Result<Vec<([u8; 32], Handle)>, StoreError> {
     let mut out: Vec<([u8; 32], Handle)> = Vec::new();
     let mut add = |handle: [u8; 32], kind: Handle| {
         // The zero sentinel is `Request::UNKNOWN` and the `l2_pub` of a contact
@@ -714,8 +730,6 @@ fn handles_for(core: &Core, device_id: &str) -> Result<Vec<([u8; 32], Handle)>, 
             out.push((handle, kind));
         }
     };
-
-    let contact = contact_id_for_device(core, device_id)?;
 
     // The pseudonym, but only where the session really proves one — which is
     // only when the peer dialled. When this device dialled, the remote static
