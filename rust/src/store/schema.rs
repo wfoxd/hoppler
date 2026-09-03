@@ -188,16 +188,20 @@ const MIGRATIONS: &[&str] = &[
     "#,
     // v5 -> v6: what a block is bound to, and who it is about (T18b).
     //
-    // A block binds to the strongest handle this device holds for a person, and
-    // that is not always the Layer-1-derived pseudonym R0-F10 names. It can
-    // only be that when the peer dialled us — Noise IK proves the *initiator's*
-    // static, and which side dials is a comparison of two rotating ids — so for
-    // roughly half of peers the best available handle is their Layer-2 persona
-    // key, or a hash of the rung id if no persona has ever been fetched.
+    // A block writes **one row per handle** this device holds for a person, all
+    // carrying the same `contact_id`. Which handle a given surface can offer
+    // depends on which side dialled, and that flips with the rotating ids, so
+    // recording only the strongest is not a weaker block — it is one invisible
+    // to half the surfaces that have to enforce it.
     //
-    // `kind` records which, so the block list can eventually tell a person how
-    // durable theirs is, and so an upgrade to a stronger handle can never write
-    // a weaker one over it. Defaulted to 0, the weakest, on the principle that
+    // The strongest is not always the Layer-1-derived pseudonym R0-F10 names.
+    // It can only be that when the peer dialled us — Noise IK proves the
+    // *initiator's* static — so for roughly half of peers the best available
+    // handle is their Layer-2 persona key, or a hash of the rung id if no
+    // persona has ever been fetched.
+    //
+    // `kind` records which, per row, so anything reporting on a person's block
+    // can take the strongest of theirs and say how durable it really is. Defaulted to 0, the weakest, on the principle that
     // a row from before this column existed cannot prove anything about itself
     // — and because in practice there are no such rows: nothing in any shipped
     // build has ever written to this table.

@@ -1057,7 +1057,8 @@ impl Store {
     ///
     /// They are all the same person, so unblocking takes the whole set.
     ///
-    /// An empty `handles` does nothing at all — see the guard below.
+    /// Handles that are the all-zero sentinel are dropped, and a call left with
+    /// none does nothing at all — no rows, and no revocation.
     ///
     /// `revoked_pairing` is the *outcome*, recorded rather than requested —
     /// R0-F10 says unblocking restores stranger-level status and not the
@@ -1068,11 +1069,20 @@ impl Store {
         contact: Option<i64>,
         created_at: i64,
     ) -> Result<bool, StoreError> {
-        // Nothing to bind to is not a block, and a revocation on its own is the
-        // one outcome this must never produce: it would take a pairing away and
-        // leave the person able to walk straight back in, with no record saying
-        // why they were unpaired. The caller checks too; this is the check that
-        // cannot be skipped by a future one.
+        // The all-zero sentinel is not a handle. It is `Request::UNKNOWN` and
+        // the `l2_pub` of a contact whose persona was never fetched, so a row
+        // holding it would match every such peer — one block silently becoming
+        // a block on all of them. `Blocklist::block` refuses it in memory and
+        // `engine::handles_for` filters it upstream; this is the same refusal
+        // at the last door, because the table outlives both.
+        let handles: Vec<&([u8; 32], Handle)> =
+            handles.iter().filter(|(h, _)| h != &[0u8; 32]).collect();
+
+        // Nothing bindable left is not a block, and a revocation on its own is
+        // the one outcome this must never produce: it would take a pairing away
+        // and leave the person able to walk straight back in, with no record
+        // saying why they were unpaired. Checked after the filter, so a slice of
+        // nothing but sentinels is caught by the same guard as an empty one.
         if handles.is_empty() {
             return Ok(false);
         }
@@ -2767,6 +2777,42 @@ mod tests {
             s.list_blocks().unwrap().is_empty(),
             "an empty block wrote a row"
         );
+    }
+
+    /// The all-zero sentinel must not reach the table either.
+    ///
+    /// `Blocklist::block` refuses it in memory and `engine::handles_for`
+    /// filters it upstream, but the table outlives both — and a stored zero
+    /// would match every peer whose persona has never been fetched, turning one
+    /// block into a block on all of them.
+    #[test]
+    fn the_zero_sentinel_is_not_a_handle_worth_revoking_a_pairing_for() {
+        let (s, _d) = store();
+        let id = s.add_contact(&a_contact()).unwrap();
+        s.record_pairing(id, &[7u8; 32], "Ada", 1, 1, &[9u8; 32], b"ratchet", 2000)
+            .unwrap();
+
+        // Nothing but sentinels: the same nothing as an empty slice.
+        assert!(!s
+            .block(&[([0u8; 32], Handle::PersonaKey)], Some(id), 5)
+            .unwrap());
+        assert!(
+            s.pairing_for_contact(id).unwrap().is_some(),
+            "a pairing was revoked for a handle that identifies nobody"
+        );
+        assert!(s.list_blocks().unwrap().is_empty());
+
+        // Mixed: the real handle lands, the sentinel does not.
+        assert!(s
+            .block(
+                &[([0u8; 32], Handle::PersonaKey), ([4u8; 32], Handle::Device)],
+                Some(id),
+                5
+            )
+            .unwrap());
+        let stored = s.list_blocks().unwrap();
+        assert_eq!(stored.len(), 1, "the sentinel was stored: {stored:?}");
+        assert_eq!(stored[0].handle, [4u8; 32]);
     }
 
     /// A block outlives the contact row it came from. `ON DELETE SET NULL`, not
