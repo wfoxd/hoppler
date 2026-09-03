@@ -779,16 +779,18 @@ fn finish_block(device_id: Option<&str>) -> Result<(), String> {
 ///
 /// Silent, like everything else on this path.
 fn write_learned_blocks() {
-    let Ok(learned) = with_core(|core| Ok(core.blocked.take_learned())) else {
-        return;
-    };
-    if learned.is_empty() {
-        return;
-    }
-    // Anything that cannot be written goes back on the queue. Dropping it
-    // would be a block that silently goes weak again at the next launch, and a
-    // store error here is transient by nature — the disk is busy, not wrong.
-    let unwritten = with_core(|core| {
+    // **One hold of the core lock**, drain and write together. Splitting them
+    // let `unblock_person` interleave: it would delete the matched handle's row
+    // after the queue was emptied but before the pseudonym was written, and the
+    // row that landed then had no contact behind it — a block `blocked_people`
+    // skips and no unblock can reach, with the pseudonym still refusing in the
+    // live set. Both run under `with_core`, so holding it throughout is the
+    // whole of the fix.
+    let _ = with_core(|core| {
+        let learned = core.blocked.take_learned();
+        if learned.is_empty() {
+            return Ok(());
+        }
         let mut left = Vec::new();
         for (i, (matched, proven)) in learned.iter().enumerate() {
             let write = (|| -> Result<(), StoreError> {
@@ -802,21 +804,18 @@ fn write_learned_blocks() {
                     .block(&[(*proven, Handle::Pseudonym)], contact, now_millis())?;
                 Ok(())
             })();
+            // Anything that cannot be written goes back on the queue. Dropping
+            // it would be a block that silently goes weak again at the next
+            // launch, and a store error here is transient by nature — the disk
+            // is busy, not wrong.
             if write.is_err() {
                 left.extend_from_slice(&learned[i..]);
                 break;
             }
         }
-        Ok(left)
+        core.blocked.relearn(left);
+        Ok(())
     });
-    // An `Err` here is the core having gone away between the two holds: the
-    // lesson is lost and the weak block stands, which is where this started.
-    if let Ok(left) = unwritten {
-        let _ = with_core(|core| {
-            core.blocked.relearn(left);
-            Ok(())
-        });
-    }
 }
 
 /// Lift a block, restoring stranger-level status and nothing else (R0-F10).

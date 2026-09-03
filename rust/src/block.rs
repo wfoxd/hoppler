@@ -148,6 +148,14 @@ pub struct Blocklist {
     /// Each entry pairs the handle that *matched* with the pseudonym now
     /// proven: the first is how the engine finds which contact the block
     /// belongs to, which `Net` has no way of knowing.
+    ///
+    /// **Lock order: `who` before `learned`, never the reverse.** The two are
+    /// needed together wherever a lesson and the set it came from must move as
+    /// one — learning it, and forgetting it on an unblock. Taking them one
+    /// after the other instead lets an unblock and a refused dial interleave,
+    /// and the row that gets written then names a contact whose block has just
+    /// been deleted: a block nothing on screen can show and no unblock can
+    /// reach.
     learned: Mutex<Vec<(Pseudonym, Pseudonym)>>,
 }
 
@@ -269,7 +277,9 @@ impl Blocklist {
         if proven == [0u8; dh::PUBLIC_LEN] {
             return;
         }
+        // Both locks, in the stated order — see the note on `learned`.
         let mut who = self.who.lock().unwrap_or_else(|e| e.into_inner());
+        let mut learned = self.learned.lock().unwrap_or_else(|e| e.into_inner());
         // Already durable, or this was not a block at all.
         if who.contains(&proven) {
             return;
@@ -279,11 +289,7 @@ impl Blocklist {
         };
         let pair = (*matched, proven);
         who.insert(proven);
-        drop(who);
-        self.learned
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(pair);
+        learned.push(pair);
     }
 
     /// Take what has been learned since the last call, for writing down.
@@ -331,20 +337,25 @@ impl Blocklist {
     ///
     /// So removing a handle also drops anything it taught: the queued entries
     /// it produced, and the pseudonyms they carry.
-    pub fn unblock_handle(&self, who: &Pseudonym) {
+    pub fn unblock_handle(&self, handle: &Pseudonym) {
+        // Both locks, in the stated order — see the note on `learned`. Held
+        // together and not one after the other: a `note_proved` slipping
+        // between them would re-queue a lesson for the handle being lifted, and
+        // the row it later wrote would name a contact whose block has just been
+        // deleted.
+        let mut who = self.who.lock().unwrap_or_else(|e| e.into_inner());
         let mut learned = self.learned.lock().unwrap_or_else(|e| e.into_inner());
+
         let taught: Vec<Pseudonym> = learned
             .iter()
-            .filter(|(matched, _)| matched == who)
+            .filter(|(matched, _)| matched == handle)
             .map(|(_, proven)| *proven)
             .collect();
-        learned.retain(|(matched, _)| matched != who);
-        drop(learned);
+        learned.retain(|(matched, _)| matched != handle);
 
-        let mut set = self.who.lock().unwrap_or_else(|e| e.into_inner());
-        set.remove(who);
+        who.remove(handle);
         for p in taught {
-            set.remove(&p);
+            who.remove(&p);
         }
     }
 }
