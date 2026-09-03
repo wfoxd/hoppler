@@ -234,3 +234,20 @@ pub struct PersonaColourDto {
     /// Packed 0xRRGGBB, as [`PersonaDto::colour`].
     pub value: u32,
 }
+
+/// One person this device is refusing to hear from (R0-F10).
+///
+/// Deliberately says nothing about *how* the block is bound. A block holds
+/// several handles underneath, of differing durability, and a person reviewing
+/// their list can do nothing with that — it is a fact about our key material,
+/// not about them. See T18b for the decision and T18c for why it does not
+/// surface here either.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockedPersonDto {
+    /// What `unblock_person` is called with.
+    pub contact_id: i64,
+    pub name: String,
+    pub colour: u32,
+    /// Milliseconds since the Unix epoch.
+    pub blocked_at: i64,
+}

@@ -8,7 +8,45 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 import 'package:freezed_annotation/freezed_annotation.dart' hide protected;
 part 'types.freezed.dart';
 
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_fields_are_eq`, `clone`, `eq`, `fmt`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_fields_are_eq`, `assert_fields_are_eq`, `clone`, `clone`, `eq`, `eq`, `fmt`, `fmt`
+
+/// One person this device is refusing to hear from (R0-F10).
+///
+/// Deliberately says nothing about *how* the block is bound. A block holds
+/// several handles underneath, of differing durability, and a person reviewing
+/// their list can do nothing with that — it is a fact about our key material,
+/// not about them. See T18b for the decision and T18c for why it does not
+/// surface here either.
+class BlockedPersonDto {
+  /// What `unblock_person` is called with.
+  final PlatformInt64 contactId;
+  final String name;
+  final int colour;
+
+  /// Milliseconds since the Unix epoch.
+  final PlatformInt64 blockedAt;
+
+  const BlockedPersonDto({
+    required this.contactId,
+    required this.name,
+    required this.colour,
+    required this.blockedAt,
+  });
+
+  @override
+  int get hashCode =>
+      contactId.hashCode ^ name.hashCode ^ colour.hashCode ^ blockedAt.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is BlockedPersonDto &&
+          runtimeType == other.runtimeType &&
+          contactId == other.contactId &&
+          name == other.name &&
+          colour == other.colour &&
+          blockedAt == other.blockedAt;
+}
 
 /// A stored chat message, as the UI sees it.
 class ChatMessageDto {

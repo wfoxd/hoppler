@@ -16,7 +16,9 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use rust_lib_hoppler::api::discovery::{block_device, nearby_devices, set_discovery};
+use rust_lib_hoppler::api::discovery::{
+    block_device, block_thread, blocked_people, nearby_devices, set_discovery, unblock_person,
+};
 use rust_lib_hoppler::api::identity::{current_persona, update_persona};
 use rust_lib_hoppler::api::messaging::{
     list_threads, ping, send_chat, send_chat_to_thread, thread_for_device, thread_messages,
@@ -1682,6 +1684,104 @@ fn blocking_a_paired_person_revokes_tears_down_and_delists() {
             .iter()
             .all(|d| d.name != "Mallory"),
         "the blocked person came back as a remembered pairing"
+    );
+}
+
+/// Blocking somebody who is **not in the room**.
+///
+/// The ordinary case, not an edge one: R0-F4 makes pairing durable, so a paired
+/// friend has a row and a thread whether the radio can see them or not — and
+/// their `device_id` is `None` exactly then. `block_device` cannot be called at
+/// all, which is why `block_thread` exists.
+#[test]
+fn a_paired_person_who_has_walked_away_can_still_be_blocked() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = fresh();
+    let peer = full_peer(&h.air, "peer", "Mallory");
+    let device_id = meet_and_pair(&peer);
+    let thread = thread_for_device(device_id.clone()).unwrap().unwrap();
+
+    // They leave. Discovery off is the bluntest way to make the sighting go,
+    // and it leaves the paired row drawn off the disk with no handle — which is
+    // the state under test.
+    set_discovery(false).unwrap();
+    let away = nearby_devices().unwrap();
+    let row = away
+        .iter()
+        .find(|d| d.name == "Mallory")
+        .expect("a paired person must still have a row when out of range");
+    assert!(
+        row.device_id.is_none(),
+        "this test needs them out of range, with no handle to block by"
+    );
+
+    block_thread(thread).unwrap();
+
+    assert!(
+        nearby_devices()
+            .unwrap()
+            .iter()
+            .all(|d| d.name != "Mallory"),
+        "a blocked person is still drawn as a remembered pairing"
+    );
+    let blocks = on_disk(&h.dir).list_blocks().unwrap();
+    assert!(!blocks.is_empty(), "no block was written");
+    assert!(
+        blocks.iter().all(|b| b.revoked_pairing),
+        "the pairing was not revoked"
+    );
+}
+
+/// Unblocking has to reach the **live** list, not only the table.
+///
+/// A store-only unblock leaves every ingress refusing until the next launch,
+/// which is a person told they unblocked somebody who is still gone. Asserted
+/// through the nearby list, which consults the in-memory gate.
+#[test]
+fn unblocking_takes_effect_without_a_restart() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = fresh();
+    let peer = full_peer(&h.air, "peer", "Mallory");
+    let device_id = meet_and_pair(&peer);
+    let thread = thread_for_device(device_id.clone()).unwrap().unwrap();
+    let contact = on_disk(&h.dir).contact_for_thread(thread).unwrap().unwrap();
+
+    block_thread(thread).unwrap();
+    assert!(
+        blocked_people()
+            .unwrap()
+            .iter()
+            .any(|p| p.name == "Mallory"),
+        "the blocked list does not show who was just blocked"
+    );
+
+    unblock_person(contact).unwrap();
+
+    assert!(
+        blocked_people().unwrap().is_empty(),
+        "the block survived being lifted"
+    );
+    assert!(
+        on_disk(&h.dir).list_blocks().unwrap().is_empty(),
+        "the rows survived being lifted"
+    );
+    // The live gate, not the table: this row is drawn only if `shut_out` lets
+    // it through, and nothing has restarted.
+    until("the unblocked person to come back", || {
+        pump(&peer);
+        nearby_devices()
+            .unwrap()
+            .iter()
+            .any(|d| d.name == "Mallory")
+    });
+
+    // And what unblocking does *not* restore (R0-F10).
+    assert!(
+        on_disk(&h.dir)
+            .pairing_for_contact(contact)
+            .unwrap()
+            .is_none(),
+        "unblocking brought the revoked pairing back"
     );
 }
 

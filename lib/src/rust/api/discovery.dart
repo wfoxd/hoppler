@@ -23,3 +23,20 @@ Future<List<NearbyDevice>> nearbyDevices() =>
 /// off the nearby list. Emits `discovery.updated`.
 Future<void> blockDevice({required String deviceId}) =>
     RustLib.instance.api.crateApiDiscoveryBlockDevice(deviceId: deviceId);
+
+/// Block the person a conversation is with (R0-F10).
+///
+/// The way to block somebody who is out of range: a paired friend has a thread
+/// whether the radio can see them or not, and no `device_id` while they are
+/// away.
+Future<void> blockThread({required PlatformInt64 threadId}) =>
+    RustLib.instance.api.crateApiDiscoveryBlockThread(threadId: threadId);
+
+/// Lift a block. Restores stranger-level status and **not** the pairing it
+/// revoked (R0-F10).
+Future<void> unblockPerson({required PlatformInt64 contactId}) =>
+    RustLib.instance.api.crateApiDiscoveryUnblockPerson(contactId: contactId);
+
+/// Everyone this device is currently refusing.
+Future<List<BlockedPersonDto>> blockedPeople() =>
+    RustLib.instance.api.crateApiDiscoveryBlockedPeople();

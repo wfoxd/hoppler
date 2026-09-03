@@ -16,6 +16,7 @@ class NearbyTile extends StatelessWidget {
     required this.pingService,
     required this.onOpen,
     required this.onDrop,
+    this.onBlock,
   });
 
   final NearbyDevice device;
@@ -32,6 +33,17 @@ class NearbyTile extends StatelessWidget {
   /// without the Rust bridge.
   final VoidCallback onOpen;
   final VoidCallback onDrop;
+
+  /// Block this person (R0-F10), on a long press.
+  ///
+  /// Not a third icon button. The row already carries Ping and Drop, and a
+  /// short tap opens the conversation — putting a destructive, irreversible
+  /// action one mis-tap from a chat is the wrong trade for discoverability.
+  ///
+  /// Long press is the Material convention for exactly this, and the action is
+  /// reachable a second way from inside the conversation, which is where
+  /// somebody is most likely to be when they decide.
+  final VoidCallback? onBlock;
 
   /// Whether we know who this is yet.
   ///
@@ -91,6 +103,7 @@ class NearbyTile extends StatelessWidget {
       // deeper in the tree — a *disabled* one does not, which is why the two
       // below are wrapped. See [`_unavailable`].
       onTap: onOpen,
+      onLongPress: onBlock,
       leading: CircleAvatar(
         // Colour arrives with the persona. Until then it is 0, which renders as
         // flat black and looks like a rendering fault rather than an absence.
