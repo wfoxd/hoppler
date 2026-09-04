@@ -568,6 +568,60 @@ fn a_block_stops_a_session_that_is_already_open() {
     );
 }
 
+/// A Pong that arrives after this device has given up must not contradict it.
+///
+/// `PingAcked` is what the UI renders as "Ping answered by <them>". Once the
+/// deadline has passed and the screen has been told the Ping could not be
+/// delivered, a late answer arriving would put both claims up, the wrong one
+/// last. So the answer counts only while the Ping it answers is still
+/// outstanding — which also means a Pong nobody asked for cannot make this
+/// phone claim it pinged somebody.
+#[test]
+fn a_pong_that_missed_its_deadline_does_not_undo_the_failure() {
+    let air = air();
+    let now = Instant::now();
+    let alice = node(&air, "alice", "Alice", now);
+    let bob = node(&air, "bob", "Bob", now);
+    bob.net.discovery().set_enabled(true, now).unwrap();
+    alice.net.discovery().set_enabled(true, now).unwrap();
+    alice.net.discovery().start_scanning().unwrap();
+    settle(&alice, &bob, now);
+    alice.net.reach(&bob.id).unwrap();
+    settle(&alice, &bob, now);
+
+    // Sent, then given up on before Bob's answer has been taken in.
+    alice.net.ping(&bob.id, now).unwrap();
+    let gave_up = alice.net.expire_pings(now + PING_DEADLINE);
+    assert!(
+        gave_up
+            .iter()
+            .any(|e| matches!(e, NetEvent::PingUndeliverable { peer, .. } if peer == &bob.id)),
+        "the Ping was not given up on, so nothing below is about a late answer"
+    );
+
+    // Bob's Pong lands now.
+    let (heard, _) = settle(&alice, &bob, now);
+    assert!(
+        !heard
+            .iter()
+            .any(|e| matches!(e, NetEvent::PingAcked { .. })),
+        "a Pong that missed the deadline was reported as an answer, leaving \
+         the screen saying both that the Ping failed and that it did not: \
+         {heard:?}"
+    );
+
+    // The control: an answer that arrives in time is still an answer, so the
+    // gate above has not simply switched the feature off.
+    alice.net.ping(&bob.id, now).unwrap();
+    let (answered, _) = settle(&alice, &bob, now);
+    assert!(
+        answered
+            .iter()
+            .any(|e| matches!(e, NetEvent::PingAcked { .. })),
+        "a Ping answered in time stopped being reported: {answered:?}"
+    );
+}
+
 /// A Ping into a session the far side has stopped honouring must say so — in
 /// the same words an absent peer produces.
 ///

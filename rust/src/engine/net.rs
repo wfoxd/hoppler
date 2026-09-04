@@ -416,7 +416,13 @@ impl Net {
         accepted
     }
 
-    /// Give up on queued Pings whose deadline has passed, and say so.
+    /// Give up on Pings whose deadline has passed, and say so.
+    ///
+    /// Every Ping, not only the ones still waiting for a session. Since T13a a
+    /// deadline covers the whole life of one — recorded when it is asked for,
+    /// kept across the flush into a new session, and cleared only by a Pong —
+    /// so what expires here is any Ping nobody answered, whatever stage it
+    /// reached.
     ///
     /// Someone has to call this — nothing in the engine ticks, and `handle`
     /// only runs when the transport has something to say, which in exactly the
@@ -1545,16 +1551,34 @@ impl Net {
                 // Never answered — see `FrameKind::Pong`. Two devices that each
                 // replied to the other's answer would nudge forever.
                 FrameKind::Pong => {
-                    // An answer is what ends a Ping's deadline. Without this
+                    // An answer is what ends a Ping's deadline — without this
                     // every successful Ping would report itself undeliverable
-                    // ten seconds later.
-                    self.pending_pings
+                    // ten seconds later — and it is also what makes the answer
+                    // *ours* to report.
+                    //
+                    // Only then. A Pong with nothing pending is one of two
+                    // things, and neither should reach a screen: an answer that
+                    // missed its deadline, after this device has already said
+                    // it could not reach them, or a Pong nobody asked for. The
+                    // second is the one that decides it — a peer must not be
+                    // able to make this phone say "Ping answered by <them>"
+                    // when nobody pinged.
+                    //
+                    // The cost is a late answer dropped, and the screen keeps
+                    // the failure. That is the conservative direction and the
+                    // one this project already takes with delivery: better a
+                    // claim withheld than a claim that outruns what is known.
+                    let was_ours = self
+                        .pending_pings
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .remove(peer);
-                    out.push(NetEvent::PingAcked {
-                        peer: peer.to_string(),
-                    });
+                        .remove(peer)
+                        .is_some();
+                    if was_ours {
+                        out.push(NetEvent::PingAcked {
+                            peer: peer.to_string(),
+                        });
+                    }
                 }
                 // Passed on sealed. This layer has no ratchet and so no way to
                 // read a chat frame, and no business forming an opinion about
