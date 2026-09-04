@@ -1451,14 +1451,22 @@ impl Net {
         self.discovery
             .note_persona(peer, established.persona.clone());
         self.sessions.open(peer, established, now);
-        // Anything asked for before the session existed goes now. The deadline
-        // stays: it is cleared by an answer, and the Ping has only just left.
-        if self
+        // Anything asked for before the session existed goes now — unless its
+        // deadline has already passed, in which case the session arrived too
+        // late and the Ping is somebody else's to report. The entry stays for
+        // `expire_pings`; sending it would put a frame on the air for a nudge
+        // this device has already given up on, and could have the answer read
+        // as on time.
+        //
+        // Otherwise the deadline stays: it is cleared by an answer, and the
+        // Ping has only just left.
+        let still_wanted = self
             .pending_pings
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .contains_key(peer)
-        {
+            .get(peer)
+            .is_some_and(|&deadline| now < deadline);
+        if still_wanted {
             let _ = self.send_frame(peer, FrameKind::Ping, Vec::new(), now);
         }
         // In order. A ceremony's messages are a sequence, and Noise refuses one
@@ -1568,13 +1576,25 @@ impl Net {
                     // the failure. That is the conservative direction and the
                     // one this project already takes with delivery: better a
                     // claim withheld than a claim that outruns what is known.
-                    let was_ours = self
-                        .pending_pings
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .remove(peer)
-                        .is_some();
-                    if was_ours {
+                    // Measured against the deadline this Ping was given, not
+                    // against whether the watcher has got round to sweeping it.
+                    // The two differ by the watcher's scheduling, so gating on
+                    // the entry alone made "was this answered in time" depend on
+                    // thread timing — and a Pong landing in that gap counted as
+                    // on time. A late one is left in place, so `expire_pings`
+                    // still reports the failure it is owed.
+                    let on_time = {
+                        let mut pings =
+                            self.pending_pings.lock().unwrap_or_else(|e| e.into_inner());
+                        match pings.get(peer) {
+                            Some(&deadline) if now < deadline => {
+                                pings.remove(peer);
+                                true
+                            }
+                            _ => false,
+                        }
+                    };
+                    if on_time {
                         out.push(NetEvent::PingAcked {
                             peer: peer.to_string(),
                         });
