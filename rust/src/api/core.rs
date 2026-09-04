@@ -46,3 +46,16 @@ pub fn core_init(support_dir: String, radio: RadioChoice) -> Result<PersonaDto, 
         },
     )
 }
+
+/// Destroy everything this device is (R0-F9).
+///
+/// Irreversible. Afterwards there is no identity, no conversation and no file
+/// left, and the core is not running: call `core_init` again to come back, and
+/// it will be a first launch — a new identity, and nobody recognises this
+/// device as who it was.
+///
+/// The guarded gesture that reaches this is the caller's; there is no second
+/// confirmation in here.
+pub fn wipe(support_dir: String) -> Result<(), String> {
+    crate::engine::wipe(support_dir)
+}

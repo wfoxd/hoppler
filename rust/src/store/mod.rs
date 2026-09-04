@@ -182,15 +182,44 @@ impl Store {
     /// them. An interruption after the master is gone still leaves nothing
     /// recoverable.
     pub fn crypto_erase(self) -> Result<(), StoreError> {
-        self.keystore.wipe(MASTER_LABEL)?;
-        drop(self.conn); // close the database handle before deleting the file
-        let _ = std::fs::remove_file(&self.db_path);
-        for suffix in ["-wal", "-shm", "-journal"] {
-            let _ = std::fs::remove_file(with_suffix(&self.db_path, suffix));
-        }
-        let _ = std::fs::remove_dir_all(&self.files_dir);
+        self.keystore.wipe(MASTER_LABEL)?; // the point of no return, first
+        let (db_path, files_dir) = (self.db_path.clone(), self.files_dir.clone());
+        drop(self); // close the database handle before deleting the file
+        delete_store_files(&db_path, &files_dir);
         Ok(())
     }
+
+    /// Crypto-erase a store **without opening it** (R0-F9).
+    ///
+    /// Same order and same guarantee as [`Self::crypto_erase`], for the caller
+    /// that must erase a store it may not be able to open: a wipe being
+    /// finished after an interruption, where the master may already be gone or
+    /// the database may be half-deleted. [`Self::open`] is no use there — it
+    /// *creates* a master when it finds none, which would mean sealing a fresh
+    /// secret purely to destroy it, and it fails outright on a database this
+    /// build cannot read, leaving the bytes behind.
+    ///
+    /// Idempotent, which is what lets a resumption be a plain redo rather than
+    /// a second code path that has to know how far the first got.
+    pub fn erase_at(
+        keystore: &dyn Keystore,
+        db_path: &Path,
+        files_dir: &Path,
+    ) -> Result<(), StoreError> {
+        keystore.wipe(MASTER_LABEL)?;
+        delete_store_files(db_path, files_dir);
+        Ok(())
+    }
+}
+
+/// Best effort, and deliberately so: the master is already gone by the time
+/// this runs, so anything left behind is ciphertext nobody can key.
+fn delete_store_files(db_path: &Path, files_dir: &Path) {
+    let _ = std::fs::remove_file(db_path);
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let _ = std::fs::remove_file(with_suffix(db_path, suffix));
+    }
+    let _ = std::fs::remove_dir_all(files_dir);
 }
 
 /// Apply the SQLCipher raw key. The key must be a literal `x'HEX'`, so it can't
@@ -356,6 +385,38 @@ mod tests {
         assert!(!db.exists());
         assert!(!files_dir.exists()); // the file store directory is gone too
         assert!(!pre_erase.is_empty()); // the copy exists but is now orphaned ciphertext
+    }
+
+    /// `erase_at` is the wipe path that cannot open the store, so its whole job
+    /// is to destroy the master without one. A version that only deleted files
+    /// would leave the key to any copy of the database taken beforehand — which
+    /// is precisely what crypto-erase exists to prevent.
+    #[test]
+    fn erase_at_destroys_the_master_without_opening_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let ks: Arc<dyn Keystore> = Arc::new(SoftwareKeystore::new());
+        let db = dir.path().join("hoppler.db");
+        let files_dir = dir.path().join("files");
+        {
+            let s = Store::open(Arc::clone(&ks), &db, &files_dir).unwrap();
+            s.files().put("attachment", b"photo bytes").unwrap();
+        }
+        assert!(Store::master_is_sealed(ks.as_ref()));
+
+        Store::erase_at(ks.as_ref(), &db, &files_dir).unwrap();
+
+        assert_eq!(
+            ks.unseal(MASTER_LABEL).unwrap_err(),
+            KeystoreError::NotFound,
+            "the master survived, so a copy of the database taken before the \
+             wipe is still readable"
+        );
+        assert!(!db.exists());
+        assert!(!files_dir.exists());
+
+        // Idempotent, which is what lets an interrupted wipe be finished by
+        // simply running it again.
+        Store::erase_at(ks.as_ref(), &db, &files_dir).unwrap();
     }
 
     fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {

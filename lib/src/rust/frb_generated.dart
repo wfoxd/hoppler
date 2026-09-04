@@ -74,7 +74,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.12.0';
 
   @override
-  int get rustContentHash => -1193484049;
+  int get rustContentHash => -1386223932;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -163,6 +163,8 @@ abstract class RustLibApi extends BaseApi {
     required String name,
     required int colour,
   });
+
+  Future<void> crateApiCoreWipe({required String supportDir});
 }
 
 class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
@@ -990,6 +992,34 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         debugName: "update_persona",
         argNames: ["name", "colour"],
       );
+
+  @override
+  Future<void> crateApiCoreWipe({required String supportDir}) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(supportDir, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 29,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiCoreWipeConstMeta,
+        argValues: [supportDir],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiCoreWipeConstMeta =>
+      const TaskConstMeta(debugName: "wipe", argNames: ["supportDir"]);
 
   @protected
   AnyhowException dco_decode_AnyhowException(dynamic raw) {

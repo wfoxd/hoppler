@@ -312,6 +312,14 @@ fn harden(files: FileKeystore) -> Result<Arc<dyn Keystore>, String> {
     Ok(Arc::new(files))
 }
 
+/// The file whose existence means a wipe was started and not seen through.
+///
+/// A plain file rather than a row or a keystore entry, because it has to be
+/// readable when the database cannot be opened and when every secret is already
+/// gone — which is exactly the state it describes. It carries nothing; its
+/// existence is the whole message, so there is nothing in it to leak.
+const WIPE_MARKER: &str = ".wiping";
+
 fn open_store(support_dir: String) -> Result<Opened, String> {
     let dir = PathBuf::from(support_dir);
     let db = dir.join("hoppler.db");
@@ -325,6 +333,23 @@ fn open_store(support_dir: String) -> Result<Opened, String> {
     // Which means the reset below has, until this line changed, run on every
     // single launch and never once in the situation it was written for.
     let keystore = platform_keystore(&dir)?;
+
+    // Finish a wipe that did not finish, before anything opens anything. Both
+    // halves are idempotent, so this is a redo from the top rather than a
+    // resumption that has to know how far the last attempt got — which is what
+    // keeps it from having failure modes of its own.
+    //
+    // It must run *here*, above the stale-database path below: that path was
+    // written to clear an unkeyable database and would happily repair a
+    // half-wiped device into a working one holding its old identity.
+    if dir.join(WIPE_MARKER).exists() {
+        log::warn!("a wipe did not finish; completing it before opening anything");
+        erase_everything(&dir, keystore.as_ref())?;
+        // And the marker goes, or every launch after this one wipes the device
+        // again — including the identity it is about to generate.
+        std::fs::remove_file(dir.join(WIPE_MARKER))
+            .map_err(|e| format!("could not clear the wipe marker: {e}"))?;
+    }
 
     // Record whether a master already existed *before* open (open seals a fresh
     // one on first use). A stale DB is safe to reset only when no master
@@ -461,6 +486,64 @@ fn spawn_clock(net: &Arc<net::Net>, interval: std::time::Duration) {
         // the state this thread was added to end, restored without a trace. It
         // was written `let _ =` first, and review was right to call that out.
         .expect("core clock");
+}
+
+/// Destroy everything this device is (R0-F9).
+///
+/// A single guarded gesture, from the caller's side. Afterwards there is no
+/// identity, no database, no file store and no running core: the next `init` is
+/// a genuine first launch, generating a new Layer-1 and asking for a name.
+///
+/// # Why this does not re-initialise
+///
+/// Dart calls `init` again, exactly as it does at start-up. One path into a
+/// running core rather than two, and the alternative would mean building a
+/// transport in here to hand to a core nobody has asked for yet.
+///
+/// # Interruption
+///
+/// The marker goes down before anything is destroyed and comes up after
+/// everything is, so a wipe cut short at any point is finished by the next
+/// launch — see `open_store`. Without it either order leaves a usable half: the
+/// seeds first and the database is still readable under a surviving master; the
+/// master first and the existing stale-database path *repairs* the device into
+/// a working one wearing its old Layer-1.
+pub fn wipe(support_dir: String) -> Result<(), String> {
+    let dir = PathBuf::from(&support_dir);
+    let keystore = platform_keystore(&dir)?;
+
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot reach app storage: {e}"))?;
+    std::fs::write(dir.join(WIPE_MARKER), b"")
+        .map_err(|e| format!("cannot record that a wipe started: {e}"))?;
+
+    // The core goes first, and not for tidiness: its `Store` holds an open
+    // handle on the database file, and its `Net` is a live radio that would go
+    // on writing to both. Dropped here, before anything is destroyed.
+    *CORE.lock().map_err(|_| "core lock".to_string())? = None;
+
+    erase_everything(&dir, keystore.as_ref())?;
+    let _ = std::fs::remove_file(dir.join(WIPE_MARKER));
+    log::warn!("wiped: identity, database and files are gone");
+    Ok(())
+}
+
+/// The destruction itself, in the order that matters, and safe to repeat.
+///
+/// Identity before store. If both are going anyway, the identity is the one
+/// whose survival R0-F10 explicitly relies on being impossible — *evasion
+/// requires destroying the whole Layer-1 identity (R0-F9)* — so it is the one
+/// that must not be left behind by a half-run.
+///
+/// Every step is idempotent: `Keystore::wipe` is documented so, and the deletes
+/// are best effort. That is what lets the resumption be a plain redo.
+fn erase_everything(dir: &Path, keystore: &dyn Keystore) -> Result<(), String> {
+    for label in [Identity::LAYER1_LABEL, Identity::LAYER2_LABEL] {
+        keystore
+            .wipe(label)
+            .map_err(|e| format!("could not destroy this device's identity: {e}"))?;
+    }
+
+    Store::erase_at(keystore, &dir.join("hoppler.db"), &dir.join("files")).map_err(stringify)
 }
 
 /// A fresh node id for the rung: random, and carrying nothing derived from our
