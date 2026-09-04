@@ -387,15 +387,22 @@ impl Net {
     /// `Ok` means accepted, as it already did — the peer's screen is still the
     /// only proof of delivery.
     pub fn ping(&self, peer: &str, now: Instant) -> Result<(), String> {
+        // The deadline covers the whole life of the Ping, not just the wait for
+        // a session. Recorded on both paths and cleared only by a Pong, because
+        // "sent and never answered" is the case a person actually taps into —
+        // and because reporting nothing there, while an absent peer reports,
+        // makes the two distinguishable. That is the R0-F10 line, and it was on
+        // the wrong side of it: a peer who blocks you mid-session was the one
+        // peer whose Ping said nothing at all. See T13a.
+        self.pending_pings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(peer.to_string(), now + PING_DEADLINE);
         if self.sessions.is_open(peer) {
             return self
                 .send_frame(peer, FrameKind::Ping, Vec::new(), now)
                 .map_err(|e| e.to_string());
         }
-        self.pending_pings
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(peer.to_string(), now + PING_DEADLINE);
         log::info!("ping to {peer} queued: no session yet, reaching");
         self.reach(peer).map_err(|e| e.to_string())
     }
@@ -419,11 +426,12 @@ impl Net {
             due
         };
         for peer in &expired {
-            // Distinguishes the two ways a Ping can be reported undeliverable.
-            // This one means the pipe was fine and the session simply did not
-            // arrive in time — on a slow rung that may be the deadline being
-            // wrong rather than the peer being unreachable.
-            log::warn!("ping to {peer} expired: no session within the deadline");
+            // Local only, and deliberately vague about which of the three it
+            // was: no session in time, a session that never carried it, or a
+            // session whose far side has stopped answering. The event below
+            // says the same thing for all of them; this line exists to say a
+            // Ping went unanswered, not why.
+            log::warn!("ping to {peer} expired unanswered");
         }
         expired
             .into_iter()
@@ -1428,13 +1436,13 @@ impl Net {
         self.discovery
             .note_persona(peer, established.persona.clone());
         self.sessions.open(peer, established, now);
-        // Anything asked for before the session existed goes now.
+        // Anything asked for before the session existed goes now. The deadline
+        // stays: it is cleared by an answer, and the Ping has only just left.
         if self
             .pending_pings
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(peer)
-            .is_some()
+            .contains_key(peer)
         {
             let _ = self.send_frame(peer, FrameKind::Ping, Vec::new(), now);
         }
@@ -1528,6 +1536,13 @@ impl Net {
                 // Never answered — see `FrameKind::Pong`. Two devices that each
                 // replied to the other's answer would nudge forever.
                 FrameKind::Pong => {
+                    // An answer is what ends a Ping's deadline. Without this
+                    // every successful Ping would report itself undeliverable
+                    // ten seconds later.
+                    self.pending_pings
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(peer);
                     out.push(NetEvent::PingAcked {
                         peer: peer.to_string(),
                     });

@@ -568,6 +568,77 @@ fn a_block_stops_a_session_that_is_already_open() {
     );
 }
 
+/// A Ping into a session the far side has stopped honouring must say so — in
+/// the same words an absent peer produces.
+///
+/// This is the gap `a_blocked_peer_is_indistinguishable_from_an_absent_one`
+/// leaves. That test blocks *before* a session exists, so no session opens and
+/// the deadline fires on its own. Block while one is open and the sender used
+/// to hear nothing at all — and silence, where every other peer reports, is
+/// precisely the signal that test exists to prevent. Found on hardware.
+#[test]
+fn a_ping_nobody_answers_says_so_even_over_a_live_session() {
+    let air = air();
+    let now = Instant::now();
+    let alice = node(&air, "alice", "Alice", now);
+    let bob = node(&air, "bob", "Bob", now);
+    bob.net.discovery().set_enabled(true, now).unwrap();
+    alice.net.discovery().set_enabled(true, now).unwrap();
+    alice.net.discovery().start_scanning().unwrap();
+    settle(&alice, &bob, now);
+    alice.net.reach(&bob.id).unwrap();
+    settle(&alice, &bob, now);
+
+    // What an absent peer says, to compare against.
+    let _ = alice.net.ping("ghost", now);
+    let absent_why = alice
+        .net
+        .expire_pings(now + PING_DEADLINE)
+        .into_iter()
+        .find_map(|e| match e {
+            NetEvent::PingUndeliverable { peer, why } if peer == "ghost" => Some(why),
+            _ => None,
+        })
+        .expect("an absent peer's Ping must be reported");
+
+    // The control: while the session is honoured, an answered Ping reports
+    // nothing at the deadline. Without this the assertion below would pass for
+    // an implementation that simply reports every Ping as undeliverable.
+    alice.net.ping(&bob.id, now).unwrap();
+    settle(&alice, &bob, now);
+    assert!(
+        alice
+            .net
+            .expire_pings(now + PING_DEADLINE)
+            .into_iter()
+            .all(|e| !matches!(e, NetEvent::PingUndeliverable { ref peer, .. } if peer == &bob.id)),
+        "an answered Ping reported itself undeliverable"
+    );
+
+    // Now Bob stops honouring the session — which is what a block does to it.
+    bob.net.sessions().close(&alice.id);
+    alice.net.ping(&bob.id, now).unwrap();
+    settle(&alice, &bob, now);
+
+    let why = alice
+        .net
+        .expire_pings(now + PING_DEADLINE)
+        .into_iter()
+        .find_map(|e| match e {
+            NetEvent::PingUndeliverable { peer, why } if peer == bob.id => Some(why),
+            _ => None,
+        })
+        .expect(
+            "a Ping into a session the far side has dropped was never reported — \
+             the sender is left with silence where every other peer reports, \
+             which is how they learn they were refused",
+        );
+    assert_eq!(
+        why, absent_why,
+        "unanswered and absent must read identically to the person holding the phone"
+    );
+}
+
 /// R0-F10's acceptance clause, the hard half: a blocked device that
 /// **regenerates its Layer-2 persona** is still refused.
 ///
