@@ -16,6 +16,7 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use rust_lib_hoppler::api::core::wipe;
 use rust_lib_hoppler::api::discovery::{
     block_device, block_thread, blocked_people, nearby_devices, set_discovery, unblock_person,
 };
@@ -33,12 +34,14 @@ use rust_lib_hoppler::discovery::Discovery;
 use rust_lib_hoppler::engine::fake::placeholder_pseudonym;
 use rust_lib_hoppler::engine::{
     acked_on_receipt_for_test, drain_events_for_test, has_session, init_with_transport,
-    layer1_public_for_test, mark_delivered_for_test, mark_sent_for_test, message_state_for_test,
-    open_store_for_test, queued_for_resend_for_test, queued_on_thread_for_test,
-    ratchet_can_send_for_test, ratchet_fingerprint_for_test, ratchet_size_for_test,
-    receive_chat_for_test, record_events_for_test, refusal_for_test, resend_queued_for_test,
-    stop_recording_for_test, thread_rows_for_test,
+    launch_needs_name_for_test, layer1_public_for_test, mark_delivered_for_test,
+    mark_sent_for_test, message_state_for_test, open_store_for_test, queued_for_resend_for_test,
+    queued_on_thread_for_test, ratchet_can_send_for_test, ratchet_fingerprint_for_test,
+    ratchet_size_for_test, receive_chat_for_test, record_events_for_test, refusal_for_test,
+    resend_queued_for_test, stop_recording_for_test, thread_rows_for_test,
 };
+use rust_lib_hoppler::identity::filekeystore::FileKeystore;
+use rust_lib_hoppler::identity::keystore::{Keystore, KeystoreError};
 use rust_lib_hoppler::identity::Identity;
 use rust_lib_hoppler::pairing::invite::Invite;
 use rust_lib_hoppler::session::chat::{ChatEnvelope, MAX_AHEAD, MAX_BODY, MAX_UNACKED};
@@ -2042,6 +2045,250 @@ fn unblocking_holds_after_a_block_has_learned() {
     //
     // The live set losing the learned pseudonym is observable directly, and is
     // covered by `block::tests::unblocking_forgets_what_the_block_taught`.
+}
+
+/// R0-F9's acceptance, and the half that was missing: after a wipe this device
+/// is a **different person**.
+///
+/// `Store::crypto_erase` destroyed the store master and nothing else, so both
+/// identity seeds survived and `load_identity` reconstructed them on the next
+/// launch. The device came back looking like a first launch — the persona row
+/// went with the database, so onboarding showed — wearing the same Layer-1, and
+/// therefore the same pseudonym toward everyone it had ever met. R0-F10 leans on
+/// this in as many words: *evasion requires destroying the whole Layer-1
+/// identity (R0-F9)*.
+#[test]
+fn a_wipe_makes_this_device_somebody_else() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let air = LoopbackNet::new();
+    boot(&dir, &air, "core");
+
+    update_persona("peter".into(), 0x00_ff_00).unwrap();
+    let was = layer1_public_for_test().unwrap();
+    let peer = full_peer(&air, "peer", "Mallory");
+    let device_id = meet_and_pair(&peer);
+    assert!(thread_for_device(device_id).unwrap().is_some());
+
+    wipe(dir.path().to_str().unwrap().to_string()).unwrap();
+
+    boot(&dir, &air, "core-after");
+    assert_ne!(
+        layer1_public_for_test().unwrap(),
+        was,
+        "the same Layer-1 came back, so everyone who knew this device still \
+         knows it and everyone who blocked it still blocks it"
+    );
+    assert!(
+        list_threads().unwrap().is_empty(),
+        "a conversation survived the wipe"
+    );
+    assert!(
+        launch_needs_name_for_test(dir.path().to_str().unwrap().to_string()).unwrap(),
+        "the device did not come back to onboarding"
+    );
+}
+
+/// R0-F9's acceptance read literally: *post-wipe inspection of app storage
+/// finds no key material*.
+///
+/// The test above infers it from behaviour — a different Layer-1 comes back —
+/// and behaviour cannot see a seed that survived and was later overwritten. So
+/// this one looks in the keystore directly, before anything has had a chance to
+/// write over what is there.
+#[test]
+fn a_wipe_leaves_no_seed_behind_to_find() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let air = LoopbackNet::new();
+    boot(&dir, &air, "core");
+
+    let keys = dir.path().join("keys");
+    let before = FileKeystore::open(&keys).unwrap();
+    for label in [Identity::LAYER1_LABEL, Identity::LAYER2_LABEL] {
+        assert!(
+            before.unseal(label).is_ok(),
+            "{label} was not there to begin with, so losing it proves nothing"
+        );
+    }
+    drop(before);
+
+    wipe(dir.path().to_str().unwrap().to_string()).unwrap();
+
+    let after = FileKeystore::open(&keys).unwrap();
+    for label in [Identity::LAYER1_LABEL, Identity::LAYER2_LABEL] {
+        assert_eq!(
+            after.unseal(label).unwrap_err(),
+            KeystoreError::NotFound,
+            "{label} is still on disk after a wipe"
+        );
+    }
+}
+
+/// A wipe that finished but died before taking its note down.
+///
+/// The narrowest window there is: everything already destroyed, the marker
+/// still on disk. The next launch must erase what is already gone without
+/// complaining, clear the marker, and come up as a working first launch — not
+/// refuse to start, and not spend every future launch erasing the identity it
+/// has just made.
+#[test]
+fn a_launch_finishes_a_wipe_that_had_nothing_left_to_do() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let air = LoopbackNet::new();
+    boot(&dir, &air, "core");
+    wipe(dir.path().to_str().unwrap().to_string()).unwrap();
+
+    // The device dies here, between the last deletion and the marker's removal.
+    std::fs::write(dir.path().join(".wiping"), b"").unwrap();
+
+    boot(&dir, &air, "core-after");
+    let first = layer1_public_for_test().unwrap();
+    assert!(
+        !dir.path().join(".wiping").exists(),
+        "the marker survived, so this device wipes itself on every launch"
+    );
+
+    // And the identity this launch generated is still there on the next one,
+    // which is the thing a lingering marker would quietly destroy.
+    boot(&dir, &air, "core-third");
+    assert_eq!(
+        layer1_public_for_test().unwrap(),
+        first,
+        "the identity did not survive to the following launch"
+    );
+}
+
+/// A wipe whose note cannot be taken down says so, rather than leaving the
+/// device to erase itself on every launch.
+///
+/// The erase itself succeeds — the keystore keeps its own permissions — and
+/// only the marker's removal fails, because a new directory entry cannot be
+/// removed from a directory that is not writable. Swallowed, that leaves a
+/// device which redoes the wipe at every launch, destroying each identity it
+/// generates, with nothing having reported a problem.
+#[cfg(unix)]
+#[test]
+fn a_wipe_that_cannot_take_its_note_down_reports_it() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let air = LoopbackNet::new();
+    boot(&dir, &air, "core");
+    let was = layer1_public_for_test().unwrap();
+
+    // The marker already exists, so writing it does not need a new directory
+    // entry — but removing it does need a writable directory.
+    std::fs::write(dir.path().join(".wiping"), b"").unwrap();
+    let restore = std::fs::metadata(dir.path()).unwrap().permissions();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let outcome = wipe(dir.path().to_str().unwrap().to_string());
+
+    std::fs::set_permissions(dir.path(), restore).unwrap();
+    assert!(
+        outcome.is_err(),
+        "the marker could not be removed and nothing said so"
+    );
+
+    // The erase really did happen — this is a report about the note, not about
+    // the wipe failing.
+    boot(&dir, &air, "core-after");
+    assert_ne!(layer1_public_for_test().unwrap(), was);
+}
+
+/// A wipe that cannot record that it started does not start.
+///
+/// The marker is what makes an interruption survivable, so writing it is not a
+/// formality — it is the first step, and failing it has to stop the whole thing
+/// before a single secret is destroyed. Otherwise a device could be taken apart
+/// with nothing on disk saying so, which is the half-wiped state T19 calls the
+/// sharp edge.
+///
+/// Made to fail by taking write permission off the support directory, so a new
+/// file cannot be created in it. The keystore inside keeps its own permissions
+/// and is untouched, which is what leaves the wipe free to do damage if it
+/// ignores the marker.
+#[cfg(unix)]
+#[test]
+fn a_wipe_that_cannot_record_itself_does_not_start() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let air = LoopbackNet::new();
+    boot(&dir, &air, "core");
+    let was = layer1_public_for_test().unwrap();
+
+    let restore = std::fs::metadata(dir.path()).unwrap().permissions();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+    let outcome = wipe(dir.path().to_str().unwrap().to_string());
+    std::fs::set_permissions(dir.path(), restore).unwrap();
+
+    assert!(
+        outcome.is_err(),
+        "a wipe that could not record itself reported success"
+    );
+    assert!(
+        !dir.path().join(".wiping").exists(),
+        "a marker appeared in a directory that cannot be written to"
+    );
+
+    // Nothing was destroyed, which is the point: the device is untouched rather
+    // than half taken apart with no note saying so.
+    boot(&dir, &air, "core-after");
+    assert_eq!(
+        layer1_public_for_test().unwrap(),
+        was,
+        "the wipe destroyed the identity anyway, without recording that it had \
+         begun — an interruption there leaves a working device that is no \
+         longer anybody, and nothing to say why"
+    );
+}
+
+/// A wipe cut short is finished by the next launch — and never leaves a working
+/// app holding anything from before.
+///
+/// The marker is the whole mechanism: written before anything is destroyed, so
+/// an interruption at any point is visible to the next launch, which redoes the
+/// erase from the top. Both halves are idempotent, so a redo is safe.
+///
+/// Simulated by writing the marker and killing the core, which is what a
+/// battery pull between those two moments leaves behind: everything still on
+/// disk, and a note saying it should not be.
+#[test]
+fn a_wipe_interrupted_before_it_destroyed_anything_still_finishes() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let air = LoopbackNet::new();
+    boot(&dir, &air, "core");
+    update_persona("peter".into(), 0x00_ff_00).unwrap();
+    let was = layer1_public_for_test().unwrap();
+    let peer = full_peer(&air, "peer", "Mallory");
+    meet_and_pair(&peer);
+
+    // The device dies here: the marker is down, nothing is destroyed yet.
+    std::fs::write(dir.path().join(".wiping"), b"").unwrap();
+
+    boot(&dir, &air, "core-after");
+
+    assert_ne!(
+        layer1_public_for_test().unwrap(),
+        was,
+        "an interrupted wipe left the old identity in place — a half-wiped \
+         device that still works and is still the same person"
+    );
+    assert!(
+        list_threads().unwrap().is_empty(),
+        "a conversation survived"
+    );
+    assert!(
+        !dir.path().join(".wiping").exists(),
+        "the marker outlived the wipe it describes, so every future launch \
+         would wipe again"
+    );
 }
 
 /// A device this app has never seen cannot be blocked, because there is
