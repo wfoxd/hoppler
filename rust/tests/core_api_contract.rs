@@ -2125,6 +2125,80 @@ fn a_wipe_leaves_no_seed_behind_to_find() {
     }
 }
 
+/// A wipe that finished but died before taking its note down.
+///
+/// The narrowest window there is: everything already destroyed, the marker
+/// still on disk. The next launch must erase what is already gone without
+/// complaining, clear the marker, and come up as a working first launch — not
+/// refuse to start, and not spend every future launch erasing the identity it
+/// has just made.
+#[test]
+fn a_launch_finishes_a_wipe_that_had_nothing_left_to_do() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let air = LoopbackNet::new();
+    boot(&dir, &air, "core");
+    wipe(dir.path().to_str().unwrap().to_string()).unwrap();
+
+    // The device dies here, between the last deletion and the marker's removal.
+    std::fs::write(dir.path().join(".wiping"), b"").unwrap();
+
+    boot(&dir, &air, "core-after");
+    let first = layer1_public_for_test().unwrap();
+    assert!(
+        !dir.path().join(".wiping").exists(),
+        "the marker survived, so this device wipes itself on every launch"
+    );
+
+    // And the identity this launch generated is still there on the next one,
+    // which is the thing a lingering marker would quietly destroy.
+    boot(&dir, &air, "core-third");
+    assert_eq!(
+        layer1_public_for_test().unwrap(),
+        first,
+        "the identity did not survive to the following launch"
+    );
+}
+
+/// A wipe whose note cannot be taken down says so, rather than leaving the
+/// device to erase itself on every launch.
+///
+/// The erase itself succeeds — the keystore keeps its own permissions — and
+/// only the marker's removal fails, because a new directory entry cannot be
+/// removed from a directory that is not writable. Swallowed, that leaves a
+/// device which redoes the wipe at every launch, destroying each identity it
+/// generates, with nothing having reported a problem.
+#[cfg(unix)]
+#[test]
+fn a_wipe_that_cannot_take_its_note_down_reports_it() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let air = LoopbackNet::new();
+    boot(&dir, &air, "core");
+    let was = layer1_public_for_test().unwrap();
+
+    // The marker already exists, so writing it does not need a new directory
+    // entry — but removing it does need a writable directory.
+    std::fs::write(dir.path().join(".wiping"), b"").unwrap();
+    let restore = std::fs::metadata(dir.path()).unwrap().permissions();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let outcome = wipe(dir.path().to_str().unwrap().to_string());
+
+    std::fs::set_permissions(dir.path(), restore).unwrap();
+    assert!(
+        outcome.is_err(),
+        "the marker could not be removed and nothing said so"
+    );
+
+    // The erase really did happen — this is a report about the note, not about
+    // the wipe failing.
+    boot(&dir, &air, "core-after");
+    assert_ne!(layer1_public_for_test().unwrap(), was);
+}
+
 /// A wipe that cannot record that it started does not start.
 ///
 /// The marker is what makes an interruption survivable, so writing it is not a

@@ -347,8 +347,7 @@ fn open_store(support_dir: String) -> Result<Opened, String> {
         erase_everything(&dir, keystore.as_ref())?;
         // And the marker goes, or every launch after this one wipes the device
         // again — including the identity it is about to generate.
-        std::fs::remove_file(dir.join(WIPE_MARKER))
-            .map_err(|e| format!("could not clear the wipe marker: {e}"))?;
+        clear_wipe_marker(&dir)?;
     }
 
     // Record whether a master already existed *before* open (open seals a fresh
@@ -513,8 +512,7 @@ pub fn wipe(support_dir: String) -> Result<(), String> {
     let keystore = platform_keystore(&dir)?;
 
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot reach app storage: {e}"))?;
-    std::fs::write(dir.join(WIPE_MARKER), b"")
-        .map_err(|e| format!("cannot record that a wipe started: {e}"))?;
+    mark_wipe_started(&dir)?;
 
     // The core goes first, and not for tidiness: its `Store` holds an open
     // handle on the database file, and its `Net` is a live radio that would go
@@ -522,9 +520,62 @@ pub fn wipe(support_dir: String) -> Result<(), String> {
     *CORE.lock().map_err(|_| "core lock".to_string())? = None;
 
     erase_everything(&dir, keystore.as_ref())?;
-    let _ = std::fs::remove_file(dir.join(WIPE_MARKER));
+    clear_wipe_marker(&dir)?;
     log::warn!("wiped: identity, database and files are gone");
     Ok(())
+}
+
+/// Record that a wipe has begun, durably.
+///
+/// The file is empty — its existence is the whole message — so what has to
+/// reach the disk is the *directory entry*, not any contents. Synced for the
+/// same reason `FileKeystore::seal` syncs: this exists to survive a power loss,
+/// and a marker still sitting in the page cache when the battery goes is a
+/// marker that was never written, which is the one failure it is here to
+/// prevent.
+///
+/// Neither fsync is covered by a test and neither can be — observing the
+/// difference needs the power cut — so a surviving mutant here reads as an
+/// untestable property rather than a hole to be filled by deleting the lines.
+fn mark_wipe_started(dir: &Path) -> Result<(), String> {
+    let path = dir.join(WIPE_MARKER);
+    let file = std::fs::File::create(&path)
+        .map_err(|e| format!("cannot record that a wipe started: {e}"))?;
+    file.sync_all()
+        .map_err(|e| format!("cannot record that a wipe started: {e}"))?;
+    if let Ok(parent) = std::fs::File::open(dir) {
+        let _ = parent.sync_all();
+    }
+    Ok(())
+}
+
+/// Take the marker down, treating an absent one as already done.
+///
+/// `NotFound` is success, and not merely tolerated: the marker's whole meaning
+/// is "a wipe is unfinished", so its absence *is* the finished state. Both call
+/// sites reach here after an `exists` check, and turning the gap between the
+/// two into a startup failure would be a device that will not launch because a
+/// file it wanted to delete was already gone.
+///
+/// Anything else is reported rather than swallowed. A marker that cannot be
+/// removed is a device that erases itself on every launch — including the
+/// identity it generated moments earlier — and that is not something to
+/// discover later.
+///
+/// The `NotFound` arm has no test and cannot have one: reaching it needs the
+/// file to vanish between the `exists` check and this call, which no test here
+/// can arrange. Recorded like the fsyncs in `FileKeystore::seal`, so a
+/// surviving mutant reads as what it is — an untestable guard — rather than as
+/// a hole somebody later fills by deleting the line.
+fn clear_wipe_marker(dir: &Path) -> Result<(), String> {
+    match std::fs::remove_file(dir.join(WIPE_MARKER)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!(
+            "the wipe finished, but the note saying it started could not be \
+             removed, so the next launch will erase again: {e}"
+        )),
+    }
 }
 
 /// The destruction itself, in the order that matters, and safe to repeat.
