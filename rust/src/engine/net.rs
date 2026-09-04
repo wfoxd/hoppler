@@ -398,13 +398,22 @@ impl Net {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(peer.to_string(), now + PING_DEADLINE);
-        if self.sessions.is_open(peer) {
-            return self
-                .send_frame(peer, FrameKind::Ping, Vec::new(), now)
-                .map_err(|e| e.to_string());
-        }
-        log::info!("ping to {peer} queued: no session yet, reaching");
-        self.reach(peer).map_err(|e| e.to_string())
+
+        let accepted = if self.sessions.is_open(peer) {
+            self.send_frame(peer, FrameKind::Ping, Vec::new(), now)
+                .map_err(|e| e.to_string())
+        } else {
+            log::info!("ping to {peer} queued: no session yet, reaching");
+            self.reach(peer).map_err(|e| e.to_string())
+        };
+
+        // The entry stays even when this returns `Err`, and that is deliberate:
+        // a `reach` that fails *is* the unreachable peer, and the deadline is
+        // how that gets reported — see `a_ping_to_an_unreachable_peer_reports_
+        // failure`. Dropping it here silences exactly the case R0-F10 needs to
+        // sound identical to a blocked one. What the caller must do instead is
+        // start the watcher regardless of this result; `engine::ping` does.
+        accepted
     }
 
     /// Give up on queued Pings whose deadline has passed, and say so.
