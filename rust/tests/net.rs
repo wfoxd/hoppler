@@ -568,6 +568,237 @@ fn a_block_stops_a_session_that_is_already_open() {
     );
 }
 
+/// A Pong that arrives after this device has given up must not contradict it.
+///
+/// `PingAcked` is what the UI renders as "Ping answered by <them>". Once the
+/// deadline has passed and the screen has been told the Ping could not be
+/// delivered, a late answer arriving would put both claims up, the wrong one
+/// last. So the answer counts only while the Ping it answers is still
+/// outstanding — which also means a Pong nobody asked for cannot make this
+/// phone claim it pinged somebody.
+#[test]
+fn a_pong_that_missed_its_deadline_does_not_undo_the_failure() {
+    let air = air();
+    let now = Instant::now();
+    let alice = node(&air, "alice", "Alice", now);
+    let bob = node(&air, "bob", "Bob", now);
+    bob.net.discovery().set_enabled(true, now).unwrap();
+    alice.net.discovery().set_enabled(true, now).unwrap();
+    alice.net.discovery().start_scanning().unwrap();
+    settle(&alice, &bob, now);
+    alice.net.reach(&bob.id).unwrap();
+    settle(&alice, &bob, now);
+
+    // Sent, then given up on before Bob's answer has been taken in.
+    alice.net.ping(&bob.id, now).unwrap();
+    let gave_up = alice.net.expire_pings(now + PING_DEADLINE);
+    assert!(
+        gave_up
+            .iter()
+            .any(|e| matches!(e, NetEvent::PingUndeliverable { peer, .. } if peer == &bob.id)),
+        "the Ping was not given up on, so nothing below is about a late answer"
+    );
+
+    // Bob's Pong lands now.
+    let (heard, _) = settle(&alice, &bob, now);
+    assert!(
+        !heard
+            .iter()
+            .any(|e| matches!(e, NetEvent::PingAcked { .. })),
+        "a Pong that missed the deadline was reported as an answer, leaving \
+         the screen saying both that the Ping failed and that it did not: \
+         {heard:?}"
+    );
+
+    // The control: an answer that arrives in time is still an answer, so the
+    // gate above has not simply switched the feature off.
+    alice.net.ping(&bob.id, now).unwrap();
+    let (answered, _) = settle(&alice, &bob, now);
+    assert!(
+        answered
+            .iter()
+            .any(|e| matches!(e, NetEvent::PingAcked { .. })),
+        "a Ping answered in time stopped being reported: {answered:?}"
+    );
+}
+
+/// A session that arrives after the Ping's deadline does not carry it.
+///
+/// The queued Ping is flushed when the session finally opens, and if that
+/// happens past the deadline the nudge is one this device has already given up
+/// on: sending it puts a frame on the air for nothing, and lets the answer be
+/// read as on time. The entry stays for `expire_pings`, which is what reports
+/// it.
+#[test]
+fn a_session_that_opens_too_late_does_not_carry_the_ping() {
+    let air = air();
+    let now = Instant::now();
+    let late = now + PING_DEADLINE;
+    let alice = node(&air, "alice", "Alice", now);
+    let bob = node(&air, "bob", "Bob", now);
+    bob.net.discovery().set_enabled(true, now).unwrap();
+    alice.net.discovery().set_enabled(true, now).unwrap();
+    alice.net.discovery().start_scanning().unwrap();
+    settle(&alice, &bob, now);
+
+    // Asked for with no session, so it queues — and every step Alice takes
+    // afterwards happens on a clock already past the deadline.
+    alice.net.ping(&bob.id, now).unwrap();
+    let mut bobs = Vec::new();
+    for _ in 0..12 {
+        while let Ok(e) = alice.rx.recv_timeout(Duration::from_millis(30)) {
+            alice.net.handle(e, late);
+        }
+        while let Ok(e) = bob.rx.recv_timeout(Duration::from_millis(30)) {
+            bobs.extend(bob.net.handle(e, now));
+        }
+    }
+
+    // The session did open — otherwise this proves nothing about the flush.
+    assert!(
+        alice.net.sessions().is_open(&bob.id),
+        "no session opened, so the flush never came up"
+    );
+    assert!(
+        !bobs.iter().any(|e| matches!(e, NetEvent::Pinged { .. })),
+        "a Ping this device had already given up on was still put on the air: \
+         {bobs:?}"
+    );
+    assert!(
+        alice
+            .net
+            .expire_pings(late)
+            .iter()
+            .any(|e| matches!(e, NetEvent::PingUndeliverable { peer, .. } if peer == &bob.id)),
+        "the unflushed Ping was never reported either"
+    );
+}
+
+/// Whether an answer was in time is decided by the deadline the Ping was
+/// given, not by whether a sweep has happened yet.
+///
+/// The watcher wakes a little after the deadline, so there is a gap in which a
+/// Ping is past its time and still on the books. Gating on the entry alone made
+/// a Pong landing in that gap count as on time — the verdict depended on thread
+/// scheduling. Here the Pong is delivered with a clock already past the
+/// deadline, which is that gap made deterministic.
+#[test]
+fn an_answer_is_late_by_the_deadline_not_by_the_sweep() {
+    let air = air();
+    let now = Instant::now();
+    let alice = node(&air, "alice", "Alice", now);
+    let bob = node(&air, "bob", "Bob", now);
+    bob.net.discovery().set_enabled(true, now).unwrap();
+    alice.net.discovery().set_enabled(true, now).unwrap();
+    alice.net.discovery().start_scanning().unwrap();
+    settle(&alice, &bob, now);
+    alice.net.reach(&bob.id).unwrap();
+    settle(&alice, &bob, now);
+
+    alice.net.ping(&bob.id, now).unwrap();
+    // Bob answers; Alice takes it in on a clock past the deadline, with the
+    // entry still on the books because nothing has swept it.
+    let late = now + PING_DEADLINE;
+    let mut heard = Vec::new();
+    for _ in 0..8 {
+        while let Ok(e) = bob.rx.recv_timeout(Duration::from_millis(30)) {
+            bob.net.handle(e, now);
+        }
+        while let Ok(e) = alice.rx.recv_timeout(Duration::from_millis(30)) {
+            heard.extend(alice.net.handle(e, late));
+        }
+    }
+
+    assert!(
+        !heard
+            .iter()
+            .any(|e| matches!(e, NetEvent::PingAcked { .. })),
+        "an answer past its deadline counted as on time because nothing had \
+         swept the entry yet: {heard:?}"
+    );
+    // And the failure it is owed is still reportable, because the late answer
+    // left the entry alone.
+    assert!(
+        alice
+            .net
+            .expire_pings(late)
+            .iter()
+            .any(|e| matches!(e, NetEvent::PingUndeliverable { peer, .. } if peer == &bob.id)),
+        "the late answer consumed the entry, so the Ping was never reported"
+    );
+}
+
+/// A Ping into a session the far side has stopped honouring must say so — in
+/// the same words an absent peer produces.
+///
+/// This is the gap `a_blocked_peer_is_indistinguishable_from_an_absent_one`
+/// leaves. That test blocks *before* a session exists, so no session opens and
+/// the deadline fires on its own. Block while one is open and the sender used
+/// to hear nothing at all — and silence, where every other peer reports, is
+/// precisely the signal that test exists to prevent. Found on hardware.
+#[test]
+fn a_ping_nobody_answers_says_so_even_over_a_live_session() {
+    let air = air();
+    let now = Instant::now();
+    let alice = node(&air, "alice", "Alice", now);
+    let bob = node(&air, "bob", "Bob", now);
+    bob.net.discovery().set_enabled(true, now).unwrap();
+    alice.net.discovery().set_enabled(true, now).unwrap();
+    alice.net.discovery().start_scanning().unwrap();
+    settle(&alice, &bob, now);
+    alice.net.reach(&bob.id).unwrap();
+    settle(&alice, &bob, now);
+
+    // What an absent peer says, to compare against.
+    let _ = alice.net.ping("ghost", now);
+    let absent_why = alice
+        .net
+        .expire_pings(now + PING_DEADLINE)
+        .into_iter()
+        .find_map(|e| match e {
+            NetEvent::PingUndeliverable { peer, why } if peer == "ghost" => Some(why),
+            _ => None,
+        })
+        .expect("an absent peer's Ping must be reported");
+
+    // The control: while the session is honoured, an answered Ping reports
+    // nothing at the deadline. Without this the assertion below would pass for
+    // an implementation that simply reports every Ping as undeliverable.
+    alice.net.ping(&bob.id, now).unwrap();
+    settle(&alice, &bob, now);
+    assert!(
+        alice
+            .net
+            .expire_pings(now + PING_DEADLINE)
+            .into_iter()
+            .all(|e| !matches!(e, NetEvent::PingUndeliverable { ref peer, .. } if peer == &bob.id)),
+        "an answered Ping reported itself undeliverable"
+    );
+
+    // Now Bob stops honouring the session — which is what a block does to it.
+    bob.net.sessions().close(&alice.id);
+    alice.net.ping(&bob.id, now).unwrap();
+    settle(&alice, &bob, now);
+
+    let why = alice
+        .net
+        .expire_pings(now + PING_DEADLINE)
+        .into_iter()
+        .find_map(|e| match e {
+            NetEvent::PingUndeliverable { peer, why } if peer == bob.id => Some(why),
+            _ => None,
+        })
+        .expect(
+            "a Ping into a session the far side has dropped was never reported — \
+             the sender is left with silence where every other peer reports, \
+             which is how they learn they were refused",
+        );
+    assert_eq!(
+        why, absent_why,
+        "unanswered and absent must read identically to the person holding the phone"
+    );
+}
+
 /// R0-F10's acceptance clause, the hard half: a blocked device that
 /// **regenerates its Layer-2 persona** is still refused.
 ///

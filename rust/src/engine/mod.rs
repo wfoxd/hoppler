@@ -1022,9 +1022,15 @@ pub fn ping(device_id: String) -> Result<(), String> {
     // It was also in the wrong order. `Net::ping` queues the Ping *before*
     // reaching, so that a pipe which opens immediately still finds it; reaching
     // first opens that window for no benefit.
-    net.ping(&device_id, std::time::Instant::now())?;
+    // The watcher goes up whatever the call says, and the order matters. A
+    // Ping refused at the pipe — the unreachable peer — still has a deadline
+    // recorded, because that deadline is how it gets reported at all. Starting
+    // the watcher only on `Ok` left that entry for some *later* Ping's watcher
+    // to sweep, so an absent peer was reported late or not at all, while a
+    // blocked one was reported on time. R0-F10 wants those identical.
+    let accepted = net.ping(&device_id, std::time::Instant::now());
     watch_for_an_undelivered_ping(net);
-    Ok(())
+    accepted
 }
 
 /// Wake up once, after the Ping deadline, to report anything still waiting.
