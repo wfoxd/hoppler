@@ -1365,12 +1365,31 @@ impl Net {
             }
         };
 
-        // Both handles. The static is the strong one — it is their pseudonym
-        // toward us, proven — and the persona key catches a block that was
-        // written before this device had ever dialled us and so had only the
-        // weaker handle to bind to.
-        let handles = [pending.pseudonym().0, pending.persona().l2_pub.0];
+        // All three handles a block can hold — see `crate::block::Handle`. The
+        // static is the strong one: their pseudonym toward us, proven. The
+        // persona key catches a block written before this device had ever been
+        // dialled by them. And the rung id, hashed, catches a block against
+        // somebody whose persona was never fetched at all, which until T18e was
+        // admitted here and could therefore never be upgraded either — a block
+        // that hid a row and stopped nothing.
+        //
+        // The last one only matches until their id rotates, which is exactly
+        // what a `Device` handle is worth. Asking with it is what lets this
+        // dial turn it into something that lasts.
+        let handles = [
+            pending.pseudonym().0,
+            pending.persona().l2_pub.0,
+            super::fake::placeholder_pseudonym(peer),
+        ];
         if self.blocked.ingress_gate(&handles) == Admit::Silence {
+            // Keep what this dial just proved. Half of all blocks are bound to
+            // a Layer-2 persona key — the durable pseudonym is only learnable
+            // from a handshake the peer opened — and R0-F10 says a block must
+            // survive that key being regenerated. This is the one moment the
+            // durable value is in our hands, and `read_first` has produced no
+            // bytes, so keeping it costs nothing and changes nothing on the
+            // wire. See T18e.
+            self.blocked.note_proved(&handles, pending.pseudonym().0);
             // Dropped. Not an error frame, not a close — nothing, so a blocked
             // device cannot tell this from us being out of range (R0-F10).
             // Not logged, and that is the point. A block is enforced by
@@ -1460,7 +1479,12 @@ impl Net {
         // asserts. Which role we take is a comparison of two rotating ids, so
         // for one person it flips every twelve minutes — and a gate asking only
         // for a pseudonym would admit a blocked device half the time.
-        if let Some(who) = self.sessions.handles(peer) {
+        if let Some([remote_static, l2_pub]) = self.sessions.handles(peer) {
+            let who = [
+                remote_static,
+                l2_pub,
+                super::fake::placeholder_pseudonym(peer),
+            ];
             if self.blocked.ingress_gate(&who) == Admit::Silence {
                 // Nothing, and no log line — the same silence as the handshake,
                 // for the same reason.

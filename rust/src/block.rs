@@ -135,6 +135,28 @@ pub enum Admit {
 #[derive(Default)]
 pub struct Blocklist {
     who: Mutex<HashSet<Pseudonym>>,
+    /// Pseudonyms learned while refusing a dial, waiting to be written down.
+    ///
+    /// An outbox rather than a callback, because the learning happens on the
+    /// transport pump thread inside `Net`, which has no store — and the two
+    /// other ways to get it out are worse. A `NetEvent` would do it, but
+    /// `NetEvent` derives `Debug` and is logged, so a variant announcing a
+    /// refused blocked dial would be the one artefact in the system that
+    /// distinguishes "blocked" from "absent". A callback into the store from
+    /// this lock would invert the lock order the rest of the crate keeps.
+    ///
+    /// Each entry pairs the handle that *matched* with the pseudonym now
+    /// proven: the first is how the engine finds which contact the block
+    /// belongs to, which `Net` has no way of knowing.
+    ///
+    /// **Lock order: `who` before `learned`, never the reverse.** The two are
+    /// needed together wherever a lesson and the set it came from must move as
+    /// one — learning it, and forgetting it on an unblock. Taking them one
+    /// after the other instead lets an unblock and a refused dial interleave,
+    /// and the row that gets written then names a contact whose block has just
+    /// been deleted: a block nothing on screen can show and no unblock can
+    /// reach.
+    learned: Mutex<Vec<(Pseudonym, Pseudonym)>>,
 }
 
 impl Blocklist {
@@ -235,6 +257,65 @@ impl Blocklist {
             .insert(who);
     }
 
+    /// Keep the pseudonym a refused dial just proved (R0-F10, T18e).
+    ///
+    /// Called on the refusal path with every handle the caller asked with and
+    /// the pseudonym the handshake proved. If the block that fired was bound to
+    /// something weaker — a Layer-2 persona key, which is what half of blocks
+    /// have, or a rotating device id — this is the moment the durable value
+    /// becomes available, and it is available *before any bytes go out*: that
+    /// is what `handshake::Responder::read_first` is split for.
+    ///
+    /// Adds it to the live set at once, because enforcement should not wait for
+    /// a disk write, and queues it for [`Self::take_learned`]. Does nothing if
+    /// the pseudonym is already known, so a peer that dials repeatedly is
+    /// learned once.
+    ///
+    /// Silent. No log line, here or at the call site — the refusal leaves no
+    /// artefact, and "upgraded a block" would be one.
+    pub fn note_proved(&self, asked_with: &[Pseudonym], proven: Pseudonym) {
+        if proven == [0u8; dh::PUBLIC_LEN] {
+            return;
+        }
+        // Both locks, in the stated order — see the note on `learned`.
+        let mut who = self.who.lock().unwrap_or_else(|e| e.into_inner());
+        let mut learned = self.learned.lock().unwrap_or_else(|e| e.into_inner());
+        // Already durable, or this was not a block at all.
+        if who.contains(&proven) {
+            return;
+        }
+        let Some(matched) = asked_with.iter().find(|h| who.contains(*h)) else {
+            return;
+        };
+        let pair = (*matched, proven);
+        who.insert(proven);
+        learned.push(pair);
+    }
+
+    /// Take what has been learned since the last call, for writing down.
+    ///
+    /// Draining rather than reading, so two drains cannot write the same row
+    /// twice. Anything the caller fails to persist must come back through
+    /// [`Self::relearn`] — an entry dropped on a store error is a block that
+    /// silently goes weak again at the next launch.
+    pub fn take_learned(&self) -> Vec<(Pseudonym, Pseudonym)> {
+        std::mem::take(&mut *self.learned.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Put back what could not be written.
+    ///
+    /// Prepended, so the order survives a partial drain: earlier lessons stay
+    /// earlier.
+    pub fn relearn(&self, entries: Vec<(Pseudonym, Pseudonym)>) {
+        if entries.is_empty() {
+            return;
+        }
+        let mut learned = self.learned.lock().unwrap_or_else(|e| e.into_inner());
+        let tail = std::mem::take(&mut *learned);
+        learned.extend(entries);
+        learned.extend(tail);
+    }
+
     /// Remove **one** handle from the set.
     ///
     /// Named for what it does, for the same reason `Store::unblock_handle` is:
@@ -244,11 +325,38 @@ impl Blocklist {
     ///
     /// Restores stranger-level status and nothing else — whatever the block
     /// revoked stays revoked (R0-F10). The screen for this is T18c.
-    pub fn unblock_handle(&self, who: &Pseudonym) {
-        self.who
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(who);
+    ///
+    /// # It also forgets what this handle taught
+    ///
+    /// A pseudonym learned from a refused dial (T18e) is in the live set
+    /// *before* it is on disk, and it is queued to be written. Lifting a block
+    /// without accounting for both leaves two ways for it to come back: the
+    /// queued entry gets written after the unblock, resurrecting the block, and
+    /// the live-set pseudonym is invisible to a caller working from stored rows
+    /// — so the person stays refused while the screen says they are not.
+    ///
+    /// So removing a handle also drops anything it taught: the queued entries
+    /// it produced, and the pseudonyms they carry.
+    pub fn unblock_handle(&self, handle: &Pseudonym) {
+        // Both locks, in the stated order — see the note on `learned`. Held
+        // together and not one after the other: a `note_proved` slipping
+        // between them would re-queue a lesson for the handle being lifted, and
+        // the row it later wrote would name a contact whose block has just been
+        // deleted.
+        let mut who = self.who.lock().unwrap_or_else(|e| e.into_inner());
+        let mut learned = self.learned.lock().unwrap_or_else(|e| e.into_inner());
+
+        let taught: Vec<Pseudonym> = learned
+            .iter()
+            .filter(|(matched, _)| matched == handle)
+            .map(|(_, proven)| *proven)
+            .collect();
+        learned.retain(|(matched, _)| matched != handle);
+
+        who.remove(handle);
+        for p in taught {
+            who.remove(&p);
+        }
     }
 }
 
@@ -323,6 +431,131 @@ mod tests {
             Handle::from_i64(3),
             None,
             "an unknown kind must not be guessed at"
+        );
+    }
+
+    /// The whole of T18e, at this layer: a block bound to a weak handle picks
+    /// up the durable one when a refused dial proves it.
+    #[test]
+    fn a_refused_dial_teaches_a_weak_block_the_durable_handle() {
+        const PERSONA_KEY: Pseudonym = [3u8; dh::PUBLIC_LEN];
+        const PROVEN: Pseudonym = [4u8; dh::PUBLIC_LEN];
+        let list = Blocklist::default();
+        list.block(PERSONA_KEY);
+
+        list.note_proved(&[PROVEN, PERSONA_KEY], PROVEN);
+
+        assert_eq!(
+            list.ingress_gate(&[PROVEN]),
+            Admit::Silence,
+            "the durable handle was not adopted, so regenerating a persona \
+             still evades this block"
+        );
+        assert_eq!(list.take_learned(), vec![(PERSONA_KEY, PROVEN)]);
+        assert!(
+            list.take_learned().is_empty(),
+            "draining twice handed the same lesson out twice"
+        );
+    }
+
+    /// Learning is not a way in. A pseudonym proved by somebody who is *not*
+    /// blocked must not end up on the list.
+    #[test]
+    fn a_stranger_who_dials_is_not_learned() {
+        let list = Blocklist::default();
+        list.block(ALICE);
+
+        list.note_proved(&[BOB], BOB);
+
+        assert_eq!(list.ingress_gate(&[BOB]), Admit::Yes);
+        assert!(list.take_learned().is_empty());
+    }
+
+    /// A blocked peer dials over and over. The lesson is recorded once.
+    #[test]
+    fn the_same_lesson_is_learned_once() {
+        const PERSONA_KEY: Pseudonym = [3u8; dh::PUBLIC_LEN];
+        const PROVEN: Pseudonym = [4u8; dh::PUBLIC_LEN];
+        let list = Blocklist::default();
+        list.block(PERSONA_KEY);
+
+        for _ in 0..5 {
+            list.note_proved(&[PROVEN, PERSONA_KEY], PROVEN);
+        }
+
+        assert_eq!(
+            list.take_learned().len(),
+            1,
+            "a peer that keeps dialling wrote a row per attempt"
+        );
+    }
+
+    /// The zero sentinel cannot arrive this way either.
+    #[test]
+    fn a_zero_pseudonym_is_not_learned() {
+        let list = Blocklist::default();
+        list.block(ALICE);
+        list.note_proved(&[ALICE], [0u8; dh::PUBLIC_LEN]);
+        assert_eq!(list.ingress_gate(&[[0u8; dh::PUBLIC_LEN]]), Admit::Yes);
+        assert!(list.take_learned().is_empty());
+    }
+
+    /// Lifting a block must take what that block *taught* with it.
+    ///
+    /// A learned pseudonym lives in two places before it reaches disk: the live
+    /// set, and the queue waiting to be written. An unblock that cleared
+    /// neither leaves the person refused by the live set while the screen says
+    /// they are not — and the queued entry writes the block back at the next
+    /// drain.
+    #[test]
+    fn unblocking_forgets_what_the_block_taught() {
+        const PERSONA_KEY: Pseudonym = [3u8; dh::PUBLIC_LEN];
+        const PROVEN: Pseudonym = [4u8; dh::PUBLIC_LEN];
+        let list = Blocklist::default();
+        list.block(PERSONA_KEY);
+        list.note_proved(&[PROVEN, PERSONA_KEY], PROVEN);
+
+        list.unblock_handle(&PERSONA_KEY);
+
+        assert_eq!(
+            list.ingress_gate(&[PERSONA_KEY]),
+            Admit::Yes,
+            "the handle itself survived the unblock"
+        );
+        assert_eq!(
+            list.ingress_gate(&[PROVEN]),
+            Admit::Yes,
+            "the learned pseudonym still refuses, so the person is blocked by \
+             something no screen can show and no unblock can reach"
+        );
+        assert!(
+            list.take_learned().is_empty(),
+            "a queued lesson outlived its block and will write it back"
+        );
+    }
+
+    /// What could not be written comes back, in order.
+    #[test]
+    fn a_lesson_that_could_not_be_written_is_not_lost() {
+        const A: Pseudonym = [3u8; dh::PUBLIC_LEN];
+        const B: Pseudonym = [4u8; dh::PUBLIC_LEN];
+        let list = Blocklist::default();
+        list.block(A);
+        list.block(B);
+        list.note_proved(&[A], [5u8; dh::PUBLIC_LEN]);
+        list.note_proved(&[B], [6u8; dh::PUBLIC_LEN]);
+
+        let taken = list.take_learned();
+        assert_eq!(taken.len(), 2);
+        // The caller managed the first and not the second.
+        list.relearn(taken[1..].to_vec());
+        list.note_proved(&[A], [7u8; dh::PUBLIC_LEN]);
+
+        let again = list.take_learned();
+        assert_eq!(
+            again,
+            vec![(B, [6u8; dh::PUBLIC_LEN]), (A, [7u8; dh::PUBLIC_LEN])],
+            "a returned lesson lost its place in the queue"
         );
     }
 

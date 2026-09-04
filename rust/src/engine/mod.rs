@@ -409,6 +409,10 @@ fn spawn_pump(
                 for out in net.handle(event, std::time::Instant::now()) {
                     on_net_event(&net, out);
                 }
+                // A refused dial produces no event at all — that is R0-F10 —
+                // so there is nothing to hang this off except the turn of the
+                // loop that handled it.
+                write_learned_blocks();
             }
         })
         .expect("core event pump");
@@ -448,6 +452,9 @@ fn spawn_clock(net: &Arc<net::Net>, interval: std::time::Duration) {
             for out in net.tick(std::time::Instant::now()) {
                 on_net_event(&net, out);
             }
+            // Belt to the pump's braces: a refusal that arrived while the pump
+            // was between events still lands within a tick.
+            write_learned_blocks();
         })
         // Loudly, like the pump. A dropped spawn error here is silent and total:
         // the id stops rotating and sessions stop expiring, which is precisely
@@ -758,6 +765,59 @@ fn finish_block(device_id: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
+/// Write down any pseudonym a refused dial proved (R0-F10, T18e).
+///
+/// `Net` learns these on the pump thread and has no store, so it queues them —
+/// see [`crate::block::Blocklist::note_proved`] for why not an event and not a
+/// callback. They are already in force in the live list by the time this runs;
+/// this is the part that survives a restart.
+///
+/// The matched handle is how the block's contact is found: `Net` knows a
+/// handle fired and nothing about who it belongs to. A learned pseudonym with
+/// no contact behind it is still written — the block is real either way, and a
+/// row that cannot be named is the same row the blocked list already skips.
+///
+/// Silent, like everything else on this path.
+fn write_learned_blocks() {
+    // **One hold of the core lock**, drain and write together. Splitting them
+    // let `unblock_person` interleave: it would delete the matched handle's row
+    // after the queue was emptied but before the pseudonym was written, and the
+    // row that landed then had no contact behind it — a block `blocked_people`
+    // skips and no unblock can reach, with the pseudonym still refusing in the
+    // live set. Both run under `with_core`, so holding it throughout is the
+    // whole of the fix.
+    let _ = with_core(|core| {
+        let learned = core.blocked.take_learned();
+        if learned.is_empty() {
+            return Ok(());
+        }
+        let mut left = Vec::new();
+        for (i, (matched, proven)) in learned.iter().enumerate() {
+            let write = (|| -> Result<(), StoreError> {
+                let contact = core
+                    .store
+                    .list_blocks()?
+                    .into_iter()
+                    .find(|b| &b.handle == matched)
+                    .and_then(|b| b.contact);
+                core.store
+                    .block(&[(*proven, Handle::Pseudonym)], contact, now_millis())?;
+                Ok(())
+            })();
+            // Anything that cannot be written goes back on the queue. Dropping
+            // it would be a block that silently goes weak again at the next
+            // launch, and a store error here is transient by nature — the disk
+            // is busy, not wrong.
+            if write.is_err() {
+                left.extend_from_slice(&learned[i..]);
+                break;
+            }
+        }
+        core.blocked.relearn(left);
+        Ok(())
+    });
+}
+
 /// Lift a block, restoring stranger-level status and nothing else (R0-F10).
 ///
 /// Takes the handles out of the live list as well as the store, and reads them
@@ -768,6 +828,13 @@ fn finish_block(device_id: Option<&str>) -> Result<(), String> {
 /// **The pairing does not come back.** It was revoked when the block was
 /// written and R0-F10 says so explicitly; pairing again costs two people and a
 /// code, which is the point.
+///
+/// Nothing is drained first, and that was tried. A lesson still queued when
+/// this runs is dealt with by `Blocklist::unblock_handle`, which drops the
+/// queued entries a handle produced along with the handle itself — and every
+/// queued entry's *matched* handle is one the live set held, which is one of
+/// this contact's stored rows. Draining first as well changed no test, because
+/// there is no case left for it to cover.
 pub fn unblock_person(contact_id: i64) -> Result<(), String> {
     with_core(|core| {
         let handles: Vec<[u8; 32]> = core
