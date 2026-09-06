@@ -312,6 +312,14 @@ fn harden(files: FileKeystore) -> Result<Arc<dyn Keystore>, String> {
     Ok(Arc::new(files))
 }
 
+/// The file whose existence means a wipe was started and not seen through.
+///
+/// A plain file rather than a row or a keystore entry, because it has to be
+/// readable when the database cannot be opened and when every secret is already
+/// gone — which is exactly the state it describes. It carries nothing; its
+/// existence is the whole message, so there is nothing in it to leak.
+const WIPE_MARKER: &str = ".wiping";
+
 fn open_store(support_dir: String) -> Result<Opened, String> {
     let dir = PathBuf::from(support_dir);
     let db = dir.join("hoppler.db");
@@ -324,7 +332,43 @@ fn open_store(support_dir: String) -> Result<Opened, String> {
     //
     // Which means the reset below has, until this line changed, run on every
     // single launch and never once in the situation it was written for.
+    // Asked before anything else, and with `metadata` rather than `exists`.
+    // `Path::exists` answers `false` for *any* I/O error, so a directory that
+    // cannot be read for a moment would read as "no wipe was interrupted" and
+    // this device would come up half wiped — the one outcome the marker is here
+    // to prevent. Not being able to tell is its own answer, and the safe one is
+    // to refuse rather than to guess.
+    //
+    // Same reasoning as `Store::master_is_sealed`, which treats a backend error
+    // as "sealed" rather than "absent" so a transient failure never leads a
+    // caller to destroy something.
+    let interrupted = match std::fs::metadata(dir.join(WIPE_MARKER)) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            return Err(format!(
+                "cannot tell whether a wipe finished, so this device will not start: {e}"
+            ))
+        }
+    };
+
     let keystore = platform_keystore(&dir)?;
+
+    // Finish a wipe that did not finish, before anything opens anything. Both
+    // halves are idempotent, so this is a redo from the top rather than a
+    // resumption that has to know how far the last attempt got — which is what
+    // keeps it from having failure modes of its own.
+    //
+    // It must run *here*, above the stale-database path below: that path was
+    // written to clear an unkeyable database and would happily repair a
+    // half-wiped device into a working one holding its old identity.
+    if interrupted {
+        log::warn!("a wipe did not finish; completing it before opening anything");
+        erase_everything(&dir, keystore.as_ref())?;
+        // And the marker goes, or every launch after this one wipes the device
+        // again — including the identity it is about to generate.
+        clear_wipe_marker(&dir)?;
+    }
 
     // Record whether a master already existed *before* open (open seals a fresh
     // one on first use). A stale DB is safe to reset only when no master
@@ -461,6 +505,147 @@ fn spawn_clock(net: &Arc<net::Net>, interval: std::time::Duration) {
         // the state this thread was added to end, restored without a trace. It
         // was written `let _ =` first, and review was right to call that out.
         .expect("core clock");
+}
+
+/// Destroy everything this device is (R0-F9).
+///
+/// A single guarded gesture, from the caller's side. Afterwards there is no
+/// identity, no database, no file store and no running core: the next `init` is
+/// a genuine first launch, generating a new Layer-1 and asking for a name.
+///
+/// # Why this does not re-initialise
+///
+/// Dart calls `init` again, exactly as it does at start-up. One path into a
+/// running core rather than two, and the alternative would mean building a
+/// transport in here to hand to a core nobody has asked for yet.
+///
+/// # Interruption
+///
+/// The marker goes down before anything is destroyed and comes up after
+/// everything is, so a wipe cut short at any point is finished by the next
+/// launch — see `open_store`. Without it either order leaves a usable half: the
+/// seeds first and the database is still readable under a surviving master; the
+/// master first and the existing stale-database path *repairs* the device into
+/// a working one wearing its old Layer-1.
+pub fn wipe(support_dir: String) -> Result<(), String> {
+    let dir = PathBuf::from(&support_dir);
+    let keystore = platform_keystore(&dir)?;
+
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot reach app storage: {e}"))?;
+    mark_wipe_started(&dir)?;
+
+    // The radio stops, then the core goes — both before anything is destroyed.
+    // Its `Store` holds an open handle on the database file and its `Net` is a
+    // live radio that would go on writing to both.
+    //
+    // Dropping `CORE` alone does not do it. The pump thread holds its own
+    // `Arc<Net>` and blocks on the transport's channel, whose sender lives
+    // inside the transport that same `Net` owns — so nothing ever closes, the
+    // pump never returns, and the last reference is never released. The device
+    // would keep advertising under the id it had, keep accepting pipes, and
+    // keep a clone of the identity in memory to answer persona requests with,
+    // after that identity has been destroyed. `shutdown` revokes the sink,
+    // which closes the channel, which lets the pump fall out of its loop.
+    {
+        let mut core = CORE.lock().map_err(|_| "core lock".to_string())?;
+        if let Some(net) = core.as_ref().and_then(|c| c.net.as_ref()) {
+            net.shutdown();
+        }
+        *core = None;
+    }
+
+    erase_everything(&dir, keystore.as_ref())?;
+    clear_wipe_marker(&dir)?;
+    log::warn!("wiped: identity, database and files are gone");
+    Ok(())
+}
+
+/// Record that a wipe has begun, durably.
+///
+/// The file is empty — its existence is the whole message — so what has to
+/// reach the disk is the *directory entry*, not any contents. Synced for the
+/// same reason `FileKeystore::seal` syncs: this exists to survive a power loss,
+/// and a marker still sitting in the page cache when the battery goes is a
+/// marker that was never written, which is the one failure it is here to
+/// prevent.
+///
+/// Neither fsync is covered by a test and neither can be — observing the
+/// difference needs the power cut — so a surviving mutant here reads as an
+/// untestable property rather than a hole to be filled by deleting the lines.
+fn mark_wipe_started(dir: &Path) -> Result<(), String> {
+    let path = dir.join(WIPE_MARKER);
+    let file = std::fs::File::create(&path)
+        .map_err(|e| format!("cannot record that a wipe started: {e}"))?;
+    file.sync_all()
+        .map_err(|e| format!("cannot record that a wipe started: {e}"))?;
+    if let Ok(parent) = std::fs::File::open(dir) {
+        let _ = parent.sync_all();
+    }
+    Ok(())
+}
+
+/// Take the marker down, treating an absent one as already done.
+///
+/// `NotFound` is success, and not merely tolerated: the marker's whole meaning
+/// is "a wipe is unfinished", so its absence *is* the finished state.
+///
+/// Both callers arrive believing it is there — `wipe` has just written it, and
+/// `open_store` has just been told by `metadata` that it exists — so a
+/// `NotFound` here means something removed it in between. Treating that as a
+/// failure would be a device that will not launch because a file it meant to
+/// delete was already gone, which is the state it wanted anyway.
+///
+/// Anything else is reported rather than swallowed. A marker that cannot be
+/// removed is a device that erases itself on every launch — including the
+/// identity it generated moments earlier — and that is not something to
+/// discover later.
+///
+/// The `NotFound` arm has no test and cannot have one: reaching it needs the
+/// marker to vanish between a caller writing or seeing it and this call, which
+/// no test here can arrange. Recorded like the fsyncs in `FileKeystore::seal`,
+/// so a surviving mutant reads as what it is — an untestable guard — rather
+/// than as a hole somebody later fills by deleting the line.
+fn clear_wipe_marker(dir: &Path) -> Result<(), String> {
+    match std::fs::remove_file(dir.join(WIPE_MARKER)) {
+        Ok(()) => {
+            // The removal is synced for the same reason the write is, and the
+            // asymmetry would have been the worse half: an unlink still in the
+            // page cache when the power goes brings the marker back, and the
+            // next launch erases a device that was already finished with —
+            // including the identity it generated in between.
+            //
+            // Best effort and untestable, like its counterpart in
+            // `mark_wipe_started` and the fsyncs in `FileKeystore::seal`.
+            if let Ok(parent) = std::fs::File::open(dir) {
+                let _ = parent.sync_all();
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!(
+            "the wipe finished, but the note saying it started could not be \
+             removed, so the next launch will erase again: {e}"
+        )),
+    }
+}
+
+/// The destruction itself, in the order that matters, and safe to repeat.
+///
+/// Identity before store. If both are going anyway, the identity is the one
+/// whose survival R0-F10 explicitly relies on being impossible — *evasion
+/// requires destroying the whole Layer-1 identity (R0-F9)* — so it is the one
+/// that must not be left behind by a half-run.
+///
+/// Every step is idempotent: `Keystore::wipe` is documented so, and the deletes
+/// are best effort. That is what lets the resumption be a plain redo.
+fn erase_everything(dir: &Path, keystore: &dyn Keystore) -> Result<(), String> {
+    for label in [Identity::LAYER1_LABEL, Identity::LAYER2_LABEL] {
+        keystore
+            .wipe(label)
+            .map_err(|e| format!("could not destroy this device's identity: {e}"))?;
+    }
+
+    Store::erase_at(keystore, &dir.join("hoppler.db"), &dir.join("files")).map_err(stringify)
 }
 
 /// A fresh node id for the rung: random, and carrying nothing derived from our

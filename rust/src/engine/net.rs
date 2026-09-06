@@ -361,6 +361,21 @@ impl Net {
         &self.sessions
     }
 
+    /// Go off the air and stay there.
+    ///
+    /// Stops advertising and scanning, closes every pipe and revokes the sink —
+    /// see [`Transport::shutdown`], whose guarantee is silence rather than
+    /// joined threads. Idempotent.
+    ///
+    /// Revoking the sink is also what lets this `Net` be dropped at all: the
+    /// engine's pump thread holds its own `Arc<Net>` and blocks on the
+    /// transport's channel, and the sender for that channel lives inside the
+    /// transport this `Net` owns. Nothing closes it from outside, so without
+    /// this the last reference is never released.
+    pub fn shutdown(&self) {
+        self.transport.shutdown();
+    }
+
     /// The list this `Net` and its `Discovery` both enforce.
     pub fn blocklist(&self) -> &Arc<Blocklist> {
         &self.blocked
