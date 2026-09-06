@@ -1215,7 +1215,22 @@ pub fn ping(device_id: String) -> Result<(), String> {
     // blocked one was reported on time. R0-F10 wants those identical.
     let accepted = net.ping(&device_id, std::time::Instant::now());
     watch_for_an_undelivered_ping(net);
-    accepted
+
+    // And the failure stops here. Handing it back made the screen show
+    // `Ping failed:` at once for a peer that is not there, while a peer that is
+    // there and refusing us produced nothing until the deadline — so the
+    // *speed* of the answer was the tell, whatever the words said. T13a made
+    // the two report identically inside `Net`; this is the same leak one layer
+    // up (T13b).
+    //
+    // Nothing is lost: the deadline reports every cause in the same words, and
+    // the watcher above is already running. Logged locally because a peer we
+    // could not reach is not a peer that refused us — this line says nothing
+    // about anybody's block.
+    if let Err(why) = accepted {
+        log::info!("ping to {device_id} was not accepted, waiting on the deadline: {why}");
+    }
+    Ok(())
 }
 
 /// Wake up once, after the Ping deadline, to report anything still waiting.

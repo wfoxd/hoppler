@@ -333,23 +333,6 @@ fn a_peer_with_no_persona_yet_is_still_listed() {
     );
 }
 
-#[test]
-fn ping_requires_discovery_and_a_reachable_peer() {
-    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let h = fresh();
-    let (_peer, _rx) = advertising_peer(&h.air, "peer-one");
-
-    assert!(
-        ping("peer-one".into()).is_err(),
-        "pinged with discovery off"
-    );
-
-    set_discovery(true).unwrap();
-    // A device that was never seen is not reachable, whatever its id — no wait
-    // needed, since nothing is expected to arrive.
-    assert!(ping("never-seen".into()).is_err());
-}
-
 /// A transport that records every dial, and otherwise gets out of the way.
 struct CountingDials {
     inner: Arc<dyn Transport>,
@@ -2136,6 +2119,59 @@ fn a_launch_that_cannot_read_the_marker_will_not_start() {
         "it failed for some other reason, so the marker was never the thing \
          that stopped it: {why}"
     );
+}
+
+/// Tapping Ping says nothing about whether anyone is there (T13b).
+///
+/// A failure handed straight back became `Ping failed:` on screen at once for a
+/// peer that is not there — while a peer that *is* there and refusing produces
+/// nothing until the deadline, because a blocked handshake is silent. The speed
+/// of the answer was the tell, whatever the words said, which is the R0-F10
+/// line arrived at from above `Net` instead of inside it.
+///
+/// Both calls must therefore look identical from here, and the deadline is left
+/// to say what happened.
+#[test]
+fn pinging_says_nothing_immediately_about_who_is_there() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = fresh();
+    let (_peer, _rx) = advertising_peer(&h.air, "peer-one");
+    set_discovery(true).unwrap();
+    until("the advertising peer to appear", || {
+        nearby_devices()
+            .map(|d| d.iter().any(|d| d.device_id.as_deref() == Some("peer-one")))
+            .unwrap_or(false)
+    });
+
+    assert!(
+        ping("peer-one".into()).is_ok(),
+        "a reachable peer should raise nothing"
+    );
+    assert!(
+        ping("nobody-at-all".into()).is_ok(),
+        "an unreachable peer raised something immediately, so a tap that goes \
+         quiet is a tap that reached somebody who chose not to answer"
+    );
+}
+
+/// Discovery being off is about *this* device, so it still says so at once.
+///
+/// Replaces the discovery half of `ping_requires_discovery_and_a_reachable_
+/// peer`, which also asserted that an unreachable peer errors — the contract
+/// T13b deliberately ends, because that error was the tell.
+///
+/// The point of T13b is that nothing about a *peer* leaks through the return
+/// value. A person who has closed Discovery is owed an answer now rather than
+/// in ten seconds, and that answer names nobody.
+#[test]
+fn ping_still_refuses_at_once_when_discovery_is_closed() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _h = fresh();
+    let why = match ping("anyone".into()) {
+        Err(why) => why,
+        Ok(()) => panic!("pinging with Discovery closed was accepted"),
+    };
+    assert!(why.contains("discovery"), "{why}");
 }
 
 /// A wipe takes the device off the air, not just out of the core.
