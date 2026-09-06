@@ -587,10 +587,13 @@ fn mark_wipe_started(dir: &Path) -> Result<(), String> {
 /// Take the marker down, treating an absent one as already done.
 ///
 /// `NotFound` is success, and not merely tolerated: the marker's whole meaning
-/// is "a wipe is unfinished", so its absence *is* the finished state. Both call
-/// sites reach here after an `exists` check, and turning the gap between the
-/// two into a startup failure would be a device that will not launch because a
-/// file it wanted to delete was already gone.
+/// is "a wipe is unfinished", so its absence *is* the finished state.
+///
+/// Both callers arrive believing it is there — `wipe` has just written it, and
+/// `open_store` has just been told by `metadata` that it exists — so a
+/// `NotFound` here means something removed it in between. Treating that as a
+/// failure would be a device that will not launch because a file it meant to
+/// delete was already gone, which is the state it wanted anyway.
 ///
 /// Anything else is reported rather than swallowed. A marker that cannot be
 /// removed is a device that erases itself on every launch — including the
@@ -598,10 +601,10 @@ fn mark_wipe_started(dir: &Path) -> Result<(), String> {
 /// discover later.
 ///
 /// The `NotFound` arm has no test and cannot have one: reaching it needs the
-/// file to vanish between the `exists` check and this call, which no test here
-/// can arrange. Recorded like the fsyncs in `FileKeystore::seal`, so a
-/// surviving mutant reads as what it is — an untestable guard — rather than as
-/// a hole somebody later fills by deleting the line.
+/// marker to vanish between a caller writing or seeing it and this call, which
+/// no test here can arrange. Recorded like the fsyncs in `FileKeystore::seal`,
+/// so a surviving mutant reads as what it is — an untestable guard — rather
+/// than as a hole somebody later fills by deleting the line.
 fn clear_wipe_marker(dir: &Path) -> Result<(), String> {
     match std::fs::remove_file(dir.join(WIPE_MARKER)) {
         Ok(()) => {
