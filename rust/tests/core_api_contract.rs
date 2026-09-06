@@ -2181,6 +2181,48 @@ fn ping_still_refuses_at_once_when_discovery_is_closed() {
     assert!(why.contains("discovery"), "{why}");
 }
 
+/// A rung that has stopped working is about *this* device, so it still says so
+/// at once.
+///
+/// The point of T13b is that nothing about a *peer* leaks through the return
+/// value. A radio switched off since start-up, or a permission revoked, names
+/// nobody — and a person is owed that now rather than in ten seconds. Swallowed
+/// with the rest, a dead radio would look exactly like a quiet friend.
+#[test]
+fn ping_still_refuses_at_once_when_the_radio_has_died() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let air = LoopbackNet::new();
+    let (tx, rx) = channel();
+    let tx = Mutex::new(tx);
+    let sink: Box<dyn Fn(TransportEvent) + Send + Sync> = Box::new(move |e| {
+        let _ = tx.lock().unwrap_or_else(|p| p.into_inner()).send(e);
+    });
+    let rung = Arc::new(air.join("core", sink));
+    let transport: Arc<dyn Transport> = rung.clone();
+    init_with_transport(
+        dir.path().to_str().unwrap().to_string(),
+        transport,
+        "core",
+        rx,
+    )
+    .unwrap();
+    set_discovery(true).unwrap();
+
+    // The radio goes. Every call into it now reports the rung unusable.
+    rung.shutdown();
+
+    let why = match ping("anyone".into()) {
+        Err(why) => why,
+        Ok(()) => panic!("a dead radio was reported as if it were a quiet peer"),
+    };
+    assert!(
+        why.contains("radio"),
+        "it failed for some other reason, so a dead rung is not what stopped \
+         it: {why}"
+    );
+}
+
 /// A wipe takes the device off the air, not just out of the core.
 ///
 /// Dropping `CORE` leaves the pump thread holding its own `Arc<Net>`, blocked

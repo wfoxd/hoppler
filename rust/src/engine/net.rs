@@ -401,7 +401,14 @@ impl Net {
     /// So a Ping with no session is queued and flushed when the session opens.
     /// `Ok` means accepted, as it already did — the peer's screen is still the
     /// only proof of delivery.
-    pub fn ping(&self, peer: &str, now: Instant) -> Result<(), String> {
+    ///
+    /// The error is returned in full rather than flattened to a string, because
+    /// the caller has to tell two kinds apart: a rung that is not usable at all
+    /// is about *this* device and is owed an immediate answer, while anything
+    /// peer-specific must wait for the deadline or the speed of the reply says
+    /// whether somebody was there (T13b). `Net` reports the fact; deciding what
+    /// a person is told belongs to the engine.
+    pub fn ping(&self, peer: &str, now: Instant) -> Result<(), TransportError> {
         // The deadline covers the whole life of the Ping, not just the wait for
         // a session. Recorded on both paths and cleared only by a Pong, because
         // "sent and never answered" is the case a person actually taps into —
@@ -415,11 +422,19 @@ impl Net {
             .insert(peer.to_string(), now + PING_DEADLINE);
 
         let accepted = if self.sessions.is_open(peer) {
+            // `SendError` has already flattened whatever the transport said, so
+            // an unusable rung cannot be told from a full pipe here. Reported
+            // as peer-specific, which is the conservative reading: the caller
+            // waits for the deadline instead of answering at once, and a
+            // deadline never says whether anybody was there. The cost is a
+            // slower message in the corner where the radio dies with a session
+            // already open; the alternative risks the speed of the answer being
+            // the answer (T13b).
             self.send_frame(peer, FrameKind::Ping, Vec::new(), now)
-                .map_err(|e| e.to_string())
+                .map_err(|e| TransportError::Io(e.to_string()))
         } else {
             log::info!("ping to {peer} queued: no session yet, reaching");
-            self.reach(peer).map_err(|e| e.to_string())
+            self.reach(peer)
         };
 
         // The entry stays even when this returns `Err`, and that is deliberate:
