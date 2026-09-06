@@ -27,7 +27,7 @@ use rust_lib_hoppler::pairing::sas::Sas;
 use rust_lib_hoppler::session::chat::ChatEnvelope;
 use rust_lib_hoppler::session::table::IDLE_TIMEOUT;
 use rust_lib_hoppler::transport::loopback::LoopbackNet;
-use rust_lib_hoppler::transport::{Transport, TransportEvent};
+use rust_lib_hoppler::transport::{Transport, TransportError, TransportEvent};
 
 struct Node {
     net: Net,
@@ -565,6 +565,40 @@ fn a_block_stops_a_session_that_is_already_open() {
             .any(|e| matches!(e, NetEvent::PingAcked { .. })),
         "the blocked sender was answered, which tells her the session is still \
          live and she is being ignored on purpose: {after_back:?}"
+    );
+}
+
+/// A Ping refused because the rung is unusable leaves no deadline behind.
+///
+/// That failure is the one reported to the caller at once (T13b), so an entry
+/// left on the books would answer a single tap twice — the radio now, and "could
+/// not reach that device" ten seconds later, in the wording that is supposed to
+/// mean a peer. It would also pile up one entry per tap for as long as the radio
+/// stayed down.
+#[test]
+fn a_ping_refused_by_a_dead_rung_leaves_nothing_to_expire() {
+    let air = air();
+    let now = Instant::now();
+    let alice = node(&air, "alice", "Alice", now);
+    let bob = node(&air, "bob", "Bob", now);
+    bob.net.discovery().set_enabled(true, now).unwrap();
+    settle(&alice, &bob, now);
+
+    alice.transport.shutdown();
+    for _ in 0..3 {
+        assert!(
+            matches!(
+                alice.net.ping(&bob.id, now),
+                Err(TransportError::Unavailable(_))
+            ),
+            "a dead rung should refuse a Ping outright"
+        );
+    }
+
+    assert!(
+        alice.net.expire_pings(now + PING_DEADLINE).is_empty(),
+        "a Ping the rung refused was also queued to be reported later, so one \
+         tap is answered twice and every tap leaves a deadline behind"
     );
 }
 

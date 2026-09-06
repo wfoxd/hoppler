@@ -437,12 +437,26 @@ impl Net {
             self.reach(peer)
         };
 
-        // The entry stays even when this returns `Err`, and that is deliberate:
-        // a `reach` that fails *is* the unreachable peer, and the deadline is
-        // how that gets reported — see `a_ping_to_an_unreachable_peer_reports_
-        // failure`. Dropping it here silences exactly the case R0-F10 needs to
-        // sound identical to a blocked one. What the caller must do instead is
-        // start the watcher regardless of this result; `engine::ping` does.
+        // The entry stays for a *peer-specific* failure, and that is
+        // deliberate: a `reach` that finds nobody **is** the unreachable peer,
+        // and the deadline is how that gets reported — see
+        // `a_ping_to_an_unreachable_peer_reports_failure`. Dropping it there
+        // would silence exactly the case R0-F10 needs to sound identical to a
+        // blocked one. The caller starts the watcher regardless of this result;
+        // `engine::ping` does.
+        //
+        // An unusable rung is the exception, because it is the one failure the
+        // caller reports *immediately* (T13b). Leaving its entry behind would
+        // have one tap answered twice — "the radio is not available" now and
+        // "could not reach that device" ten seconds later, the second in the
+        // very wording that is supposed to mean something else — and would pile
+        // up an entry per tap for as long as the radio stayed down.
+        if matches!(accepted, Err(TransportError::Unavailable(_))) {
+            self.pending_pings
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(peer);
+        }
         accepted
     }
 
