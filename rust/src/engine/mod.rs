@@ -514,10 +514,25 @@ pub fn wipe(support_dir: String) -> Result<(), String> {
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot reach app storage: {e}"))?;
     mark_wipe_started(&dir)?;
 
-    // The core goes first, and not for tidiness: its `Store` holds an open
-    // handle on the database file, and its `Net` is a live radio that would go
-    // on writing to both. Dropped here, before anything is destroyed.
-    *CORE.lock().map_err(|_| "core lock".to_string())? = None;
+    // The radio stops, then the core goes — both before anything is destroyed.
+    // Its `Store` holds an open handle on the database file and its `Net` is a
+    // live radio that would go on writing to both.
+    //
+    // Dropping `CORE` alone does not do it. The pump thread holds its own
+    // `Arc<Net>` and blocks on the transport's channel, whose sender lives
+    // inside the transport that same `Net` owns — so nothing ever closes, the
+    // pump never returns, and the last reference is never released. The device
+    // would keep advertising under the id it had, keep accepting pipes, and
+    // keep a clone of the identity in memory to answer persona requests with,
+    // after that identity has been destroyed. `shutdown` revokes the sink,
+    // which closes the channel, which lets the pump fall out of its loop.
+    {
+        let mut core = CORE.lock().map_err(|_| "core lock".to_string())?;
+        if let Some(net) = core.as_ref().and_then(|c| c.net.as_ref()) {
+            net.shutdown();
+        }
+        *core = None;
+    }
 
     erase_everything(&dir, keystore.as_ref())?;
     clear_wipe_marker(&dir)?;

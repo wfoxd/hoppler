@@ -2089,6 +2089,36 @@ fn a_wipe_makes_this_device_somebody_else() {
     );
 }
 
+/// A wipe takes the device off the air, not just out of the core.
+///
+/// Dropping `CORE` leaves the pump thread holding its own `Arc<Net>`, blocked
+/// on a channel whose sender lives inside the transport that `Net` owns —
+/// nothing closes it, so the radio keeps advertising under the id it had and
+/// keeps a clone of the identity in memory to answer persona requests with,
+/// after that identity has been destroyed.
+///
+/// Asserted by rejoining the airspace under the **same** id: the loopback rung
+/// holds one member per id and removes it on shutdown, so this only works if
+/// the transport really let go.
+#[test]
+fn a_wipe_takes_the_radio_off_the_air() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let air = LoopbackNet::new();
+    boot(&dir, &air, "core");
+    set_discovery(true).unwrap();
+
+    wipe(dir.path().to_str().unwrap().to_string()).unwrap();
+
+    // Would panic with "already in this airspace" if the old transport were
+    // still a member.
+    boot(&dir, &air, "core");
+    assert!(
+        launch_needs_name_for_test(dir.path().to_str().unwrap().to_string()).unwrap(),
+        "the device came back as somebody rather than as nobody"
+    );
+}
+
 /// R0-F9's acceptance read literally: *post-wipe inspection of app storage
 /// finds no key material*.
 ///
