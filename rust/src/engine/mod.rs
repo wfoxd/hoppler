@@ -604,7 +604,20 @@ fn mark_wipe_started(dir: &Path) -> Result<(), String> {
 /// a hole somebody later fills by deleting the line.
 fn clear_wipe_marker(dir: &Path) -> Result<(), String> {
     match std::fs::remove_file(dir.join(WIPE_MARKER)) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            // The removal is synced for the same reason the write is, and the
+            // asymmetry would have been the worse half: an unlink still in the
+            // page cache when the power goes brings the marker back, and the
+            // next launch erases a device that was already finished with —
+            // including the identity it generated in between.
+            //
+            // Best effort and untestable, like its counterpart in
+            // `mark_wipe_started` and the fsyncs in `FileKeystore::seal`.
+            if let Ok(parent) = std::fs::File::open(dir) {
+                let _ = parent.sync_all();
+            }
+            Ok(())
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(format!(
             "the wipe finished, but the note saying it started could not be \
