@@ -2131,6 +2131,12 @@ fn a_launch_that_cannot_read_the_marker_will_not_start() {
 ///
 /// Both calls must therefore look identical from here, and the deadline is left
 /// to say what happened.
+///
+/// Neither peer is "reachable" in the sense of answering: `advertising_peer`
+/// runs a `Discovery` and no session layer, so a Ping to it goes undelivered
+/// too. What differs is the only thing that used to matter — one has a sighting
+/// and a pipe that opens, the other has neither — and that is exactly the
+/// difference the return value must stop carrying.
 #[test]
 fn pinging_says_nothing_immediately_about_who_is_there() {
     let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -2145,12 +2151,13 @@ fn pinging_says_nothing_immediately_about_who_is_there() {
 
     assert!(
         ping("peer-one".into()).is_ok(),
-        "a reachable peer should raise nothing"
+        "a device Discovery has seen raised something immediately"
     );
     assert!(
         ping("nobody-at-all".into()).is_ok(),
-        "an unreachable peer raised something immediately, so a tap that goes \
-         quiet is a tap that reached somebody who chose not to answer"
+        "a device nothing has ever seen raised something immediately, so a tap \
+         that goes quiet instead is a tap whose pipe opened — which is to say, \
+         somebody who is there and chose not to answer"
     );
 }
 
