@@ -421,20 +421,38 @@ impl Net {
             .unwrap_or_else(|e| e.into_inner())
             .insert(peer.to_string(), now + PING_DEADLINE);
 
-        let accepted = if self.sessions.is_open(peer) {
-            // `SendError` has already flattened whatever the transport said, so
-            // an unusable rung cannot be told from a full pipe here. Reported
-            // as peer-specific, which is the conservative reading: the caller
-            // waits for the deadline instead of answering at once, and a
-            // deadline never says whether anybody was there. The cost is a
-            // slower message in the corner where the radio dies with a session
-            // already open; the alternative risks the speed of the answer being
-            // the answer (T13b).
-            self.send_frame(peer, FrameKind::Ping, Vec::new(), now)
-                .map_err(|e| TransportError::Io(e.to_string()))
+        // `None` means "not sent, try the long way round" — either there was no
+        // session to begin with, or the one we checked for had gone by the time
+        // the frame was built.
+        let sent = if self.sessions.is_open(peer) {
+            match self.send_frame(peer, FrameKind::Ping, Vec::new(), now) {
+                Ok(()) => Some(Ok(())),
+                // The session closed between that check and this send — both
+                // take the table's lock separately, so the gap is real. Not a
+                // failure: it is exactly the queue-and-reach case, and treating
+                // it as one dropped a Ping to a peer we could have reconnected
+                // to.
+                Err(SendError::NoSession) => None,
+                // `SendError` has already flattened whatever the transport
+                // said, so an unusable rung cannot be told from a full pipe
+                // here. Reported as peer-specific, which is the conservative
+                // reading: the caller waits for the deadline instead of
+                // answering at once, and a deadline never says whether anybody
+                // was there. The cost is a slower message in the corner where
+                // the radio dies with a session already open; the alternative
+                // risks the speed of the answer being the answer (T13b).
+                Err(e) => Some(Err(TransportError::Io(e.to_string()))),
+            }
         } else {
-            log::info!("ping to {peer} queued: no session yet, reaching");
-            self.reach(peer)
+            None
+        };
+
+        let accepted = match sent {
+            Some(outcome) => outcome,
+            None => {
+                log::info!("ping to {peer} queued: no session yet, reaching");
+                self.reach(peer)
+            }
         };
 
         // The entry stays for a *peer-specific* failure, and that is

@@ -1214,7 +1214,18 @@ pub fn ping(device_id: String) -> Result<(), String> {
     // to sweep, so an absent peer was reported late or not at all, while a
     // blocked one was reported on time. R0-F10 wants those identical.
     let accepted = net.ping(&device_id, std::time::Instant::now());
-    watch_for_an_undelivered_ping(net);
+
+    // The watcher goes up for anything that left a deadline behind, which is
+    // every outcome except an unusable rung — `Net::ping` takes that one's
+    // entry with it, because that failure is answered here and now. Spawning
+    // one anyway would be a thread per tap, each sleeping ten seconds to find
+    // nothing, for as long as the radio stayed down.
+    if !matches!(
+        accepted,
+        Err(crate::transport::TransportError::Unavailable(_))
+    ) {
+        watch_for_an_undelivered_ping(net);
+    }
 
     // What the caller is told depends on *whose* failure it is.
     //
