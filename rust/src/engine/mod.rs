@@ -332,6 +332,26 @@ fn open_store(support_dir: String) -> Result<Opened, String> {
     //
     // Which means the reset below has, until this line changed, run on every
     // single launch and never once in the situation it was written for.
+    // Asked before anything else, and with `metadata` rather than `exists`.
+    // `Path::exists` answers `false` for *any* I/O error, so a directory that
+    // cannot be read for a moment would read as "no wipe was interrupted" and
+    // this device would come up half wiped — the one outcome the marker is here
+    // to prevent. Not being able to tell is its own answer, and the safe one is
+    // to refuse rather than to guess.
+    //
+    // Same reasoning as `Store::master_is_sealed`, which treats a backend error
+    // as "sealed" rather than "absent" so a transient failure never leads a
+    // caller to destroy something.
+    let interrupted = match std::fs::metadata(dir.join(WIPE_MARKER)) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            return Err(format!(
+                "cannot tell whether a wipe finished, so this device will not start: {e}"
+            ))
+        }
+    };
+
     let keystore = platform_keystore(&dir)?;
 
     // Finish a wipe that did not finish, before anything opens anything. Both
@@ -342,7 +362,7 @@ fn open_store(support_dir: String) -> Result<Opened, String> {
     // It must run *here*, above the stale-database path below: that path was
     // written to clear an unkeyable database and would happily repair a
     // half-wiped device into a working one holding its old identity.
-    if dir.join(WIPE_MARKER).exists() {
+    if interrupted {
         log::warn!("a wipe did not finish; completing it before opening anything");
         erase_everything(&dir, keystore.as_ref())?;
         // And the marker goes, or every launch after this one wipes the device

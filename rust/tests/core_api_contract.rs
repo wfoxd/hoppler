@@ -2089,6 +2089,55 @@ fn a_wipe_makes_this_device_somebody_else() {
     );
 }
 
+/// A launch that cannot tell whether a wipe finished refuses to start.
+///
+/// `Path::exists` answers `false` for any I/O error, not only for absence, so
+/// checking the marker that way would read a directory it cannot momentarily
+/// open as "nothing was interrupted" — and come up on a half-wiped device,
+/// which is the single outcome the marker exists to prevent.
+///
+/// The error is asserted by its words, not merely by being an error: with the
+/// directory unreadable almost everything downstream fails too, so `is_err`
+/// alone would pass whether or not the marker is checked first.
+#[cfg(unix)]
+#[test]
+fn a_launch_that_cannot_read_the_marker_will_not_start() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let air = LoopbackNet::new();
+    boot(&dir, &air, "core");
+
+    // Not searchable, so nothing inside can even be stat'ed.
+    let restore = std::fs::metadata(dir.path()).unwrap().permissions();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let (tx, rx) = channel();
+    let tx = Mutex::new(tx);
+    let sink: Box<dyn Fn(TransportEvent) + Send + Sync> = Box::new(move |e| {
+        let _ = tx.lock().unwrap_or_else(|p| p.into_inner()).send(e);
+    });
+    let transport: Arc<dyn Transport> = Arc::new(air.join("core-after", sink));
+    let outcome = init_with_transport(
+        dir.path().to_str().unwrap().to_string(),
+        transport,
+        "core-after",
+        rx,
+    );
+
+    std::fs::set_permissions(dir.path(), restore).unwrap();
+    let why = match outcome {
+        Err(why) => why,
+        Ok(_) => panic!("a launch that could not read the marker started anyway"),
+    };
+    assert!(
+        why.contains("wipe"),
+        "it failed for some other reason, so the marker was never the thing \
+         that stopped it: {why}"
+    );
+}
+
 /// A wipe takes the device off the air, not just out of the core.
 ///
 /// Dropping `CORE` leaves the pump thread holding its own `Arc<Net>`, blocked
