@@ -1214,8 +1214,47 @@ pub fn ping(device_id: String) -> Result<(), String> {
     // to sweep, so an absent peer was reported late or not at all, while a
     // blocked one was reported on time. R0-F10 wants those identical.
     let accepted = net.ping(&device_id, std::time::Instant::now());
-    watch_for_an_undelivered_ping(net);
-    accepted
+
+    // The watcher goes up for anything that left a deadline behind, which is
+    // every outcome except an unusable rung — `Net::ping` takes that one's
+    // entry with it, because that failure is answered here and now. Spawning
+    // one anyway would be a thread per tap, each sleeping ten seconds to find
+    // nothing, for as long as the radio stayed down.
+    if !matches!(
+        accepted,
+        Err(crate::transport::TransportError::Unavailable(_))
+    ) {
+        watch_for_an_undelivered_ping(net);
+    }
+
+    // What the caller is told depends on *whose* failure it is.
+    //
+    // A rung that is not usable — radio switched off since start-up, permission
+    // revoked, no network — is about this device. It names nobody, and a person
+    // is owed that answer now rather than in ten seconds, so it goes straight
+    // back like the two checks above.
+    //
+    // Everything else is peer-specific and stops here. Handing those back made
+    // the screen show `Ping failed:` at once for a peer that is not there,
+    // while a peer that is there and refusing us produced nothing until the
+    // deadline — so the *speed* of the answer was the tell, whatever the words
+    // said. T13a made the two report identically inside `Net`; this is the same
+    // leak one layer up (T13b).
+    //
+    // Nothing is lost by the silence: the deadline reports every cause in the
+    // same words, and the watcher above is already running. Logged locally,
+    // because a peer we could not reach is not a peer that refused us — this
+    // line says nothing about anybody's block.
+    match accepted {
+        Ok(()) => Ok(()),
+        Err(crate::transport::TransportError::Unavailable(why)) => {
+            Err(format!("the radio is not available: {why}"))
+        }
+        Err(why) => {
+            log::info!("ping to {device_id} was not accepted, waiting on the deadline: {why}");
+            Ok(())
+        }
+    }
 }
 
 /// Wake up once, after the Ping deadline, to report anything still waiting.

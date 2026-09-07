@@ -401,7 +401,14 @@ impl Net {
     /// So a Ping with no session is queued and flushed when the session opens.
     /// `Ok` means accepted, as it already did — the peer's screen is still the
     /// only proof of delivery.
-    pub fn ping(&self, peer: &str, now: Instant) -> Result<(), String> {
+    ///
+    /// The error is returned in full rather than flattened to a string, because
+    /// the caller has to tell two kinds apart: a rung that is not usable at all
+    /// is about *this* device and is owed an immediate answer, while anything
+    /// peer-specific must wait for the deadline or the speed of the reply says
+    /// whether somebody was there (T13b). `Net` reports the fact; deciding what
+    /// a person is told belongs to the engine.
+    pub fn ping(&self, peer: &str, now: Instant) -> Result<(), TransportError> {
         // The deadline covers the whole life of the Ping, not just the wait for
         // a session. Recorded on both paths and cleared only by a Pong, because
         // "sent and never answered" is the case a person actually taps into —
@@ -414,20 +421,60 @@ impl Net {
             .unwrap_or_else(|e| e.into_inner())
             .insert(peer.to_string(), now + PING_DEADLINE);
 
-        let accepted = if self.sessions.is_open(peer) {
-            self.send_frame(peer, FrameKind::Ping, Vec::new(), now)
-                .map_err(|e| e.to_string())
+        // `None` means "not sent, try the long way round" — either there was no
+        // session to begin with, or the one we checked for had gone by the time
+        // the frame was built.
+        let sent = if self.sessions.is_open(peer) {
+            match self.send_frame(peer, FrameKind::Ping, Vec::new(), now) {
+                Ok(()) => Some(Ok(())),
+                // The session closed between that check and this send — both
+                // take the table's lock separately, so the gap is real. Not a
+                // failure: it is exactly the queue-and-reach case, and treating
+                // it as one dropped a Ping to a peer we could have reconnected
+                // to.
+                Err(SendError::NoSession) => None,
+                // `SendError` has already flattened whatever the transport
+                // said, so an unusable rung cannot be told from a full pipe
+                // here. Reported as peer-specific, which is the conservative
+                // reading: the caller waits for the deadline instead of
+                // answering at once, and a deadline never says whether anybody
+                // was there. The cost is a slower message in the corner where
+                // the radio dies with a session already open; the alternative
+                // risks the speed of the answer being the answer (T13b).
+                Err(e) => Some(Err(TransportError::Io(e.to_string()))),
+            }
         } else {
-            log::info!("ping to {peer} queued: no session yet, reaching");
-            self.reach(peer).map_err(|e| e.to_string())
+            None
         };
 
-        // The entry stays even when this returns `Err`, and that is deliberate:
-        // a `reach` that fails *is* the unreachable peer, and the deadline is
-        // how that gets reported — see `a_ping_to_an_unreachable_peer_reports_
-        // failure`. Dropping it here silences exactly the case R0-F10 needs to
-        // sound identical to a blocked one. What the caller must do instead is
-        // start the watcher regardless of this result; `engine::ping` does.
+        let accepted = match sent {
+            Some(outcome) => outcome,
+            None => {
+                log::info!("ping to {peer} queued: no session yet, reaching");
+                self.reach(peer)
+            }
+        };
+
+        // The entry stays for a *peer-specific* failure, and that is
+        // deliberate: a `reach` that finds nobody **is** the unreachable peer,
+        // and the deadline is how that gets reported — see
+        // `a_ping_to_an_unreachable_peer_reports_failure`. Dropping it there
+        // would silence exactly the case R0-F10 needs to sound identical to a
+        // blocked one. The caller starts the watcher regardless of this result;
+        // `engine::ping` does.
+        //
+        // An unusable rung is the exception, because it is the one failure the
+        // caller reports *immediately* (T13b). Leaving its entry behind would
+        // have one tap answered twice — "the radio is not available" now and
+        // "could not reach that device" ten seconds later, the second in the
+        // very wording that is supposed to mean something else — and would pile
+        // up an entry per tap for as long as the radio stayed down.
+        if matches!(accepted, Err(TransportError::Unavailable(_))) {
+            self.pending_pings
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(peer);
+        }
         accepted
     }
 

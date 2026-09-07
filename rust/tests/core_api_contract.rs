@@ -333,23 +333,6 @@ fn a_peer_with_no_persona_yet_is_still_listed() {
     );
 }
 
-#[test]
-fn ping_requires_discovery_and_a_reachable_peer() {
-    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let h = fresh();
-    let (_peer, _rx) = advertising_peer(&h.air, "peer-one");
-
-    assert!(
-        ping("peer-one".into()).is_err(),
-        "pinged with discovery off"
-    );
-
-    set_discovery(true).unwrap();
-    // A device that was never seen is not reachable, whatever its id — no wait
-    // needed, since nothing is expected to arrive.
-    assert!(ping("never-seen".into()).is_err());
-}
-
 /// A transport that records every dial, and otherwise gets out of the way.
 struct CountingDials {
     inner: Arc<dyn Transport>,
@@ -2135,6 +2118,108 @@ fn a_launch_that_cannot_read_the_marker_will_not_start() {
         why.contains("wipe"),
         "it failed for some other reason, so the marker was never the thing \
          that stopped it: {why}"
+    );
+}
+
+/// Tapping Ping says nothing about whether anyone is there (T13b).
+///
+/// A failure handed straight back became `Ping failed:` on screen at once for a
+/// peer that is not there — while a peer that *is* there and refusing produces
+/// nothing until the deadline, because a blocked handshake is silent. The speed
+/// of the answer was the tell, whatever the words said, which is the R0-F10
+/// line arrived at from above `Net` instead of inside it.
+///
+/// Both calls must therefore look identical from here, and the deadline is left
+/// to say what happened.
+///
+/// Neither peer is "reachable" in the sense of answering: `advertising_peer`
+/// runs a `Discovery` and no session layer, so a Ping to it goes undelivered
+/// too. What differs is the only thing that used to matter — one has a sighting
+/// and a pipe that opens, the other has neither — and that is exactly the
+/// difference the return value must stop carrying.
+#[test]
+fn pinging_says_nothing_immediately_about_who_is_there() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = fresh();
+    let (_peer, _rx) = advertising_peer(&h.air, "peer-one");
+    set_discovery(true).unwrap();
+    until("the advertising peer to appear", || {
+        nearby_devices()
+            .map(|d| d.iter().any(|d| d.device_id.as_deref() == Some("peer-one")))
+            .unwrap_or(false)
+    });
+
+    assert!(
+        ping("peer-one".into()).is_ok(),
+        "a device Discovery has seen raised something immediately"
+    );
+    assert!(
+        ping("nobody-at-all".into()).is_ok(),
+        "a device nothing has ever seen raised something immediately, so a tap \
+         that goes quiet instead is a tap whose pipe opened — which is to say, \
+         somebody who is there and chose not to answer"
+    );
+}
+
+/// Discovery being off is about *this* device, so it still says so at once.
+///
+/// Replaces the discovery half of `ping_requires_discovery_and_a_reachable_
+/// peer`, which also asserted that an unreachable peer errors — the contract
+/// T13b deliberately ends, because that error was the tell.
+///
+/// The point of T13b is that nothing about a *peer* leaks through the return
+/// value. A person who has closed Discovery is owed an answer now rather than
+/// in ten seconds, and that answer names nobody.
+#[test]
+fn ping_still_refuses_at_once_when_discovery_is_closed() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _h = fresh();
+    let why = match ping("anyone".into()) {
+        Err(why) => why,
+        Ok(()) => panic!("pinging with Discovery closed was accepted"),
+    };
+    assert!(why.contains("discovery"), "{why}");
+}
+
+/// A rung that has stopped working is about *this* device, so it still says so
+/// at once.
+///
+/// The point of T13b is that nothing about a *peer* leaks through the return
+/// value. A radio switched off since start-up, or a permission revoked, names
+/// nobody — and a person is owed that now rather than in ten seconds. Swallowed
+/// with the rest, a dead radio would look exactly like a quiet friend.
+#[test]
+fn ping_still_refuses_at_once_when_the_radio_has_died() {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let air = LoopbackNet::new();
+    let (tx, rx) = channel();
+    let tx = Mutex::new(tx);
+    let sink: Box<dyn Fn(TransportEvent) + Send + Sync> = Box::new(move |e| {
+        let _ = tx.lock().unwrap_or_else(|p| p.into_inner()).send(e);
+    });
+    let rung = Arc::new(air.join("core", sink));
+    let transport: Arc<dyn Transport> = rung.clone();
+    init_with_transport(
+        dir.path().to_str().unwrap().to_string(),
+        transport,
+        "core",
+        rx,
+    )
+    .unwrap();
+    set_discovery(true).unwrap();
+
+    // The radio goes. Every call into it now reports the rung unusable.
+    rung.shutdown();
+
+    let why = match ping("anyone".into()) {
+        Err(why) => why,
+        Ok(()) => panic!("a dead radio was reported as if it were a quiet peer"),
+    };
+    assert!(
+        why.contains("radio"),
+        "it failed for some other reason, so a dead rung is not what stopped \
+         it: {why}"
     );
 }
 
